@@ -31,13 +31,19 @@ def _discover_sandbox_id() -> str:
 # Resolve deployment ID: env var takes priority, then auto-discover from daemon log
 _resolved_deployment_id = NEO_DEPLOYMENT_ID or _discover_sandbox_id()
 
-# Capture working directory at server startup — this is where the user launched Claude Code from
+# Capture working directory at server startup — this is where the user launched the MCP client from
 _server_cwd = os.getcwd()
 
 if not NEO_API_KEY:
     raise ValueError("NEO_API_KEY environment variable is required but not set.")
 if not NEO_SECRET_KEY:
     raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
+if not _resolved_deployment_id:
+    raise ValueError(
+        "Could not determine deployment ID. "
+        "Set NEO_DEPLOYMENT_ID in your MCP client config. "
+        "Find it in ~/.neo/daemon/daemon.log on the machine running the Neo VS Code extension."
+    )
 
 app = Server("neo-mcp")
 
