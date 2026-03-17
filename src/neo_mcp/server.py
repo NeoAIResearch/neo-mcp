@@ -38,12 +38,6 @@ if not NEO_API_KEY:
     raise ValueError("NEO_API_KEY environment variable is required but not set.")
 if not NEO_SECRET_KEY:
     raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
-if not _resolved_deployment_id:
-    raise ValueError(
-        "Could not determine deployment ID. "
-        "Set NEO_DEPLOYMENT_ID in your MCP client config. "
-        "Find it in ~/.neo/daemon/daemon.log on the machine running the Neo VS Code extension."
-    )
 
 app = Server("neo-mcp")
 
@@ -184,6 +178,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=30.0) as client:
 
         if name == "neo_submit_task":
+            if not _resolved_deployment_id:
+                return [TextContent(type="text", text=(
+                    "No deployment ID found. Neo could not auto-discover your VS Code sandbox.\n"
+                    "Make sure the Neo VS Code extension is open and connected on this machine, "
+                    "or set NEO_DEPLOYMENT_ID in your MCP config.\n"
+                    "The deployment ID is found in ~/.neo/daemon/daemon.log on the machine running the extension."
+                ))]
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
             message = f"Working directory: {_server_cwd}\n\nCreate all files inside this directory.\n\n{description}"
