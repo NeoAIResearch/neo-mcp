@@ -22,17 +22,14 @@ Every Neo task follows this lifecycle. Your LLM client handles this automaticall
 ```
 You type a prompt
       ↓
-neo_submit_task        → Neo queues the task, returns thread_id
+neo_submit_task   → submits + polls internally → returns full result when done
       ↓
-neo_task_status        → poll every 10–15 seconds
-      ↓
-   RUNNING             → keep polling
+   COMPLETED      → full output returned directly (no extra tool call needed)
    WAITING_FOR_FEEDBACK → Neo has a question → neo_send_feedback
-   COMPLETED           → neo_get_messages → read the output
-   TERMINATED          → task failed or was stopped
+                          → then use neo_task_status to poll manually
+   TERMINATED     → task failed or was stopped
+   (timeout)      → still running after 20 min → use neo_task_status manually
 ```
-
-> Never poll faster than every 10 seconds. Tasks take minutes — polling every second wastes quota and doesn't speed anything up.
 
 ---
 
@@ -119,6 +116,7 @@ Open VS Code — the full output is in the Neo sidebar under the task thread.
 | Task starts but nothing happens in VS Code | Extension signed into wrong account | Check the account in Neo sidebar matches your API keys |
 | `neo-mcp` command not found | pip install didn't complete | Re-run `pip install git+...`, check your PATH |
 | Docker sandbox ID not found | `.neo` volume not mounted | Add `-v ~/.neo:/root/.neo:ro` to the Docker run command |
+| Task appears complete but no output returned | Timed out during auto-poll | Use `neo_task_status` + `neo_get_messages` manually |
 
 ---
 
@@ -225,11 +223,9 @@ Use Neo to list the files in my current workspace.
 ```
 
 Expected flow:
-1. Claude calls `neo_submit_task` → returns `thread_id`
-2. Claude calls `neo_task_status` → `RUNNING`
-3. Claude waits 10–15 seconds, polls again (not every second)
-4. Status → `COMPLETED`
-5. Claude calls `neo_get_messages` → shows output
+1. Claude calls `neo_submit_task` → polls internally → returns full output when done
+2. If Neo needs input mid-task, returns `WAITING_FOR_FEEDBACK` with the `thread_id`
+3. On timeout (>20 min), returns the `thread_id` for manual follow-up with `neo_task_status`
 
 ---
 

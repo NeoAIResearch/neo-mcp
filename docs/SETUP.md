@@ -35,8 +35,10 @@ pip install git+https://github.com/NeoResearchAI/MCPServer.git#subdirectory=neo-
 This installs a `neo-mcp` command globally. Verify:
 
 ```bash
-neo-mcp --help   # should start without errors (will fail without keys set)
+neo-mcp
 ```
+
+(Starts the server; Ctrl+C to exit. It will fail immediately without keys set, which confirms it is installed correctly.)
 
 ---
 
@@ -249,3 +251,4 @@ Edit `~/.continue/config.json`:
 | `NEO_DEPLOYMENT_ID` | *(auto-discovered)* | Override the auto-discovered sandbox ID |
 | `NEO_API_URL` | `https://master.heyneo.so` | Override backend URL |
 | `NEO_READ_ONLY` | `false` | `true` to expose only status + read tools |
+| `NEO_WORKSPACE_DIR` | *(auto: CWD)* | Override working directory sent to Neo (useful in Docker) |

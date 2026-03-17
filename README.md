@@ -26,14 +26,16 @@ export NEO_SECRET_KEY=sk-v1-... # secret key from Neo dashboard
 ## Install — Python
 
 ```bash
-pip install mcp httpx
+pip install git+https://github.com/NeoResearchAI/MCPServer.git#subdirectory=neo-mcp
 ```
 
 ```bash
-claude mcp add --scope user neo -- python /absolute/path/to/neo-mcp/server.py
+claude mcp add --scope user neo \
+  -e NEO_API_KEY=your-access-key -e NEO_SECRET_KEY=your-secret-key \
+  -- neo-mcp
 ```
 
-Set `NEO_API_KEY` in your environment before starting Claude Code.
+Set both `NEO_API_KEY` and `NEO_SECRET_KEY` in your environment before starting Claude Code.
 
 ## Configuration scopes
 
@@ -47,7 +49,7 @@ Set `NEO_API_KEY` in your environment before starting Claude Code.
 
 | Tool                | Description                                                        |
 |---------------------|--------------------------------------------------------------------|
-| `neo_submit_task`   | Submit a task to Neo. Returns a `thread_id`.                       |
+| `neo_submit_task`   | Submit a task to Neo. Blocks until complete and returns the full result. |
 | `neo_task_status`   | Poll task status. Poll every 10–15 s while `RUNNING`.              |
 | `neo_get_messages`  | Read the full output once status is `COMPLETED`.                   |
 | `neo_send_feedback` | Reply to Neo when status is `WAITING_FOR_FEEDBACK`.                |
@@ -68,6 +70,8 @@ In a Claude Code session, try:
 Set `NEO_READ_ONLY=true` to expose only `neo_task_status` and `neo_get_messages`.
 Write tools (`neo_submit_task`, `neo_send_feedback`, `neo_pause_task`, `neo_resume_task`, `neo_stop_task`) will not be registered.
 
+Set `NEO_WORKSPACE_DIR=/your/project` when running in Docker so Neo knows the correct path to your project files.
+
 ```bash
-docker run -i --rm -e NEO_API_KEY -e NEO_READ_ONLY=true ghcr.io/heyneo/neo-mcp-server
+docker run -i --rm -e NEO_API_KEY -e NEO_SECRET_KEY -e NEO_READ_ONLY=true ghcr.io/heyneo/neo-mcp-server
 ```
