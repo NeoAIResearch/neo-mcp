@@ -27,14 +27,18 @@ neo-mcp/
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the server directly (requires both keys)
-NEO_API_KEY=your-key NEO_SECRET_KEY=your-secret python3 -m neo_mcp.server
+# Set keys first (avoids split-line issues)
+export NEO_API_KEY=your-access-key
+export NEO_SECRET_KEY=your-secret-key
+
+# Run the server directly
+python3 src/neo_mcp/server.py
 
 # Or after pip install:
-NEO_API_KEY=your-key NEO_SECRET_KEY=your-secret neo-mcp
+neo-mcp
 
 # Test backend connectivity
-NEO_API_KEY=your-key NEO_SECRET_KEY=your-secret python3 tests/test_connection.py
+python3 tests/test_connection.py
 
 # Build Docker image
 docker build -t neo-mcp-test .

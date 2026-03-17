@@ -4,7 +4,7 @@ import re
 
 import httpx
 from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.stdio import stdio_server  # used as async context manager
 from mcp.types import Tool, TextContent
 from mcp import types
 
@@ -314,8 +314,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
+async def _run():
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(read_stream, write_stream, app.create_initialization_options())
+
+
 def main():
-    asyncio.run(stdio_server(app).run())
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

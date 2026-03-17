@@ -50,7 +50,9 @@ pip install -r requirements.txt
 
 Run directly:
 ```bash
-NEO_API_KEY=your-key NEO_SECRET_KEY=your-secret python3 server.py
+export NEO_API_KEY=your-access-key
+export NEO_SECRET_KEY=your-secret-key
+python3 src/neo_mcp/server.py
 ```
 
 ---
@@ -72,29 +74,17 @@ The server auto-discovers your VS Code sandbox ID from `~/.neo/daemon/daemon.log
 
 **Docker**
 ```bash
-claude mcp add --scope user neo \
-  -e NEO_API_KEY=your-access-key \
-  -e NEO_SECRET_KEY=your-secret-key \
-  -- docker run -i --rm \
-     -e NEO_API_KEY -e NEO_SECRET_KEY \
-     -v ~/.neo:/root/.neo:ro \
-     ghcr.io/heyneo/neo-mcp-server
+claude mcp add --scope user neo -e NEO_API_KEY=your-access-key -e NEO_SECRET_KEY=your-secret-key -- docker run -i --rm -e NEO_API_KEY -e NEO_SECRET_KEY -v ~/.neo:/root/.neo:ro ghcr.io/heyneo/neo-mcp-server
 ```
 
 **pip install**
 ```bash
-claude mcp add --scope user neo \
-  -e NEO_API_KEY=your-access-key \
-  -e NEO_SECRET_KEY=your-secret-key \
-  -- neo-mcp
+claude mcp add --scope user neo -e NEO_API_KEY=your-access-key -e NEO_SECRET_KEY=your-secret-key -- neo-mcp
 ```
 
 **Clone**
 ```bash
-claude mcp add --scope user neo \
-  -e NEO_API_KEY=your-access-key \
-  -e NEO_SECRET_KEY=your-secret-key \
-  -- python3 /absolute/path/to/MCPServer/neo-mcp/server.py
+claude mcp add --scope user neo -e NEO_API_KEY=your-access-key -e NEO_SECRET_KEY=your-secret-key -- python3 /absolute/path/to/MCPServer/src/neo_mcp/server.py
 ```
 
 **Scopes — where your config is saved and who can see it:**
