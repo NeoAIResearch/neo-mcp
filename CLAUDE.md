@@ -6,29 +6,53 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 7 tools to Claude Code so users can submit ML tasks, poll status, read output, and control task lifecycle — all via stdio transport.
 
+## Project structure
+
+```
+neo-mcp/
+├── src/neo_mcp/server.py   # MCP server — all 7 tools
+├── docs/
+│   ├── SETUP.md            # registration for all MCP clients
+│   └── USAGE.md            # user guide + deployment steps
+├── tests/test_connection.py
+├── .github/workflows/publish-mcp.yml
+├── Dockerfile
+├── pyproject.toml
+└── requirements.txt
+```
+
 ## Commands
 
 ```bash
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the server directly (requires NEO_API_KEY)
-NEO_API_KEY=your-key python server.py
+# Run the server directly (requires both keys)
+NEO_API_KEY=your-key NEO_SECRET_KEY=your-secret python3 -m neo_mcp.server
+
+# Or after pip install:
+NEO_API_KEY=your-key NEO_SECRET_KEY=your-secret neo-mcp
 
 # Test backend connectivity
-NEO_API_KEY=your-key python test_connection.py
+NEO_API_KEY=your-key NEO_SECRET_KEY=your-secret python3 tests/test_connection.py
 
 # Build Docker image
 docker build -t neo-mcp-test .
 
 # Run via Docker
-docker run -i --rm -e NEO_API_KEY=your-key neo-mcp-test
+docker run -i --rm -e NEO_API_KEY=your-key -e NEO_SECRET_KEY=your-secret \
+  -v ~/.neo:/root/.neo:ro neo-mcp-test
 
-# Register with Claude Code (Python)
-claude mcp add --scope user neo -- python /absolute/path/to/server.py
+# Register with Claude Code (pip install)
+claude mcp add --scope user neo \
+  -e NEO_API_KEY=your-key -e NEO_SECRET_KEY=your-secret \
+  -- neo-mcp
 
 # Register with Claude Code (Docker, after publish)
-claude mcp add --scope user neo -- docker run -i --rm -e NEO_API_KEY ghcr.io/heyneo/neo-mcp-server
+claude mcp add --scope user neo \
+  -e NEO_API_KEY=your-key -e NEO_SECRET_KEY=your-secret \
+  -- docker run -i --rm -e NEO_API_KEY -e NEO_SECRET_KEY \
+     -v ~/.neo:/root/.neo:ro ghcr.io/heyneo/neo-mcp-server
 
 # View MCP server logs
 claude mcp logs neo
@@ -36,7 +60,7 @@ claude mcp logs neo
 
 ## Architecture
 
-**`server.py`** is the entire server — no submodules.
+**`src/neo_mcp/server.py`** is the entire server — no submodules.
 
 Key design points:
 - `NEO_API_KEY` is validated at import time; missing key raises `ValueError` immediately.
