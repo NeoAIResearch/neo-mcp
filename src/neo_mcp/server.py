@@ -16,20 +16,51 @@ NEO_DEPLOYMENT_ID = os.environ.get("NEO_DEPLOYMENT_ID", "")  # optional, overrid
 
 
 def _discover_sandbox_id() -> str:
-    """Read the most recent sandboxId from the Neo daemon log (~/.neo/daemon/daemon.log).
-    Returns empty string if not found or unreadable."""
-    log_path = os.path.expanduser("~/.neo/daemon/daemon.log")
+    """Try multiple sources to find the active Neo sandbox/deployment ID.
+
+    Priority:
+    1. daemon.log  — most recent sandboxId (works when VS Code / Cursor extension is running)
+    2. thread-workspaces.json — match current working directory to a sandbox ID
+    Returns empty string if nothing found.
+    """
+    cwd = os.getcwd()
+
+    # 1. daemon log — works for VS Code and Cursor Neo extensions
+    for log_name in ("daemon.log", "daemon.log.1"):
+        log_path = os.path.expanduser(f"~/.neo/daemon/{log_name}")
+        try:
+            with open(log_path, "r", errors="ignore") as f:
+                content = f.read()
+            matches = re.findall(r'"sandboxId"\s*:\s*"([a-f0-9\-]{36})"', content)
+            if matches:
+                return matches[-1]
+        except OSError:
+            pass
+
+    # 2. thread-workspaces.json — maps sandbox IDs to workspace paths
+    ws_path = os.path.expanduser("~/.neo/daemon/thread-workspaces.json")
     try:
-        with open(log_path, "r", errors="ignore") as f:
-            content = f.read()
-        matches = re.findall(r'"sandboxId"\s*:\s*"([a-f0-9\-]{36})"', content)
-        return matches[-1] if matches else ""
-    except OSError:
-        return ""
+        import json
+        with open(ws_path, "r", errors="ignore") as f:
+            workspaces: dict = json.load(f)
+        # Prefer exact CWD match, then parent match
+        for sandbox_id, ws_dir in reversed(list(workspaces.items())):
+            if cwd == ws_dir or cwd.startswith(ws_dir.rstrip("/") + "/"):
+                return sandbox_id
+        # Fallback: return the most recent entry
+        if workspaces:
+            return list(workspaces.keys())[-1]
+    except (OSError, ValueError):
+        pass
+
+    return ""
 
 
-# Resolve deployment ID: env var takes priority, then auto-discover from daemon log
-_resolved_deployment_id = NEO_DEPLOYMENT_ID or _discover_sandbox_id()
+def _get_deployment_id() -> str:
+    """Return deployment ID — re-discovers each call so extensions that start
+    after the MCP server are picked up automatically."""
+    return NEO_DEPLOYMENT_ID or _discover_sandbox_id()
+
 
 # Capture working directory at server startup — this is where the user launched the MCP client from
 _server_cwd = os.getcwd()
@@ -40,7 +71,6 @@ if not NEO_SECRET_KEY:
     raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
 
 app = Server("neo-mcp")
-
 
 def handle_error(status_code: int) -> str:
     messages = {
@@ -178,13 +208,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=30.0) as client:
 
         if name == "neo_submit_task":
-            if not _resolved_deployment_id:
-                return [TextContent(type="text", text=(
-                    "No deployment ID found. Neo could not auto-discover your VS Code sandbox.\n"
-                    "Make sure the Neo VS Code extension is open and connected on this machine, "
-                    "or set NEO_DEPLOYMENT_ID in your MCP config.\n"
-                    "The deployment ID is found in ~/.neo/daemon/daemon.log on the machine running the extension."
-                ))]
+            deployment_id = _get_deployment_id()
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
             message = f"Working directory: {_server_cwd}\n\nCreate all files inside this directory.\n\n{description}"
@@ -195,7 +219,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "message": message,
                     "deployment_type": "vscode",
                     "auto_mode": auto_mode,
-                    **({"deployment_id": _resolved_deployment_id} if _resolved_deployment_id else {}),
+                    **({"deployment_id": deployment_id} if deployment_id else {}),
                 },
             )
             if resp.status_code != 200:
