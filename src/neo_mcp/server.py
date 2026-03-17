@@ -31,6 +31,9 @@ def _discover_sandbox_id() -> str:
 # Resolve deployment ID: env var takes priority, then auto-discover from daemon log
 _resolved_deployment_id = NEO_DEPLOYMENT_ID or _discover_sandbox_id()
 
+# Capture working directory at server startup — this is where the user launched Claude Code from
+_server_cwd = os.getcwd()
+
 if not NEO_API_KEY:
     raise ValueError("NEO_API_KEY environment variable is required but not set.")
 if not NEO_SECRET_KEY:
@@ -56,6 +59,7 @@ def _headers() -> dict:
         "Authorization": f"Bearer {NEO_SECRET_KEY}",
         "x-access-key": NEO_API_KEY,
     }
+
 
 
 @app.list_tools()
@@ -176,11 +180,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if name == "neo_submit_task":
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
+            message = f"Working directory: {_server_cwd}\n\nCreate all files inside this directory.\n\n{description}"
             resp = await client.post(
                 "/v2/thread/init-chat-direct",
                 headers=_headers(),
                 json={
-                    "message": description,
+                    "message": message,
                     "deployment_type": "vscode",
                     "auto_mode": auto_mode,
                     **({"deployment_id": _resolved_deployment_id} if _resolved_deployment_id else {}),
@@ -209,10 +214,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return [TextContent(type="text", text=handle_error(resp.status_code))]
             data = resp.json()
             status = data.get("status", "UNKNOWN")
+
+            if status == "COMPLETED":
+                msg = "Status: COMPLETED. Call neo_get_messages to read the output."
+                return [TextContent(type="text", text=msg)]
+
             hints = {
                 "RUNNING": "Status: RUNNING. Wait 10–15 seconds then poll again.",
                 "WAITING_FOR_FEEDBACK": "Status: WAITING_FOR_FEEDBACK. Neo has a question. Call neo_send_feedback now.",
-                "COMPLETED": "Status: COMPLETED. Call neo_get_messages to read the output.",
                 "PAUSED": "Status: PAUSED. Call neo_resume_task to continue.",
                 "TERMINATED": "Status: TERMINATED. Task was stopped or hit a fatal error.",
             }
