@@ -12,8 +12,7 @@ NEO_API_URL = os.environ.get("NEO_API_URL", "https://master.heyneo.so")
 NEO_API_KEY = os.environ.get("NEO_API_KEY", "")      # access key (ak-v1-...)
 NEO_SECRET_KEY = os.environ.get("NEO_SECRET_KEY", "") # secret key (sk-v1-...)
 NEO_READ_ONLY = os.environ.get("NEO_READ_ONLY", "").lower() == "true"
-NEO_DEPLOYMENT_TYPE = os.environ.get("NEO_DEPLOYMENT_TYPE", "vscode")  # "vscode" or "cloud"
-NEO_DEPLOYMENT_ID = os.environ.get("NEO_DEPLOYMENT_ID", "")  # optional, pin to a specific deployment
+NEO_DEPLOYMENT_ID = os.environ.get("NEO_DEPLOYMENT_ID", "")  # optional, override auto-discovered sandbox ID
 
 
 def _discover_sandbox_id() -> str:
@@ -182,7 +181,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 headers=_headers(),
                 json={
                     "message": description,
-                    "deployment_type": NEO_DEPLOYMENT_TYPE,
+                    "deployment_type": "vscode",
                     "auto_mode": auto_mode,
                     **({"deployment_id": _resolved_deployment_id} if _resolved_deployment_id else {}),
                 },
@@ -315,5 +314,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
-if __name__ == "__main__":
+def main():
     asyncio.run(stdio_server(app).run())
+
+
+if __name__ == "__main__":
+    main()
