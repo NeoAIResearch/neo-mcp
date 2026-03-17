@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 7 tools to Claude Code so users can submit ML tasks, poll status, read output, and control task lifecycle — all via stdio transport.
+A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 8 tools to Claude Code so users can submit ML tasks, poll status, read output, sync produced files to disk, and control task lifecycle — all via stdio transport.
 
 ## Project structure
 
 ```
 neo-mcp/
-├── src/neo_mcp/server.py   # MCP server — all 7 tools
+├── src/neo_mcp/server.py   # MCP server — all 8 tools
 ├── docs/
 │   ├── SETUP.md            # registration for all MCP clients
 │   └── USAGE.md            # user guide + deployment steps
@@ -71,6 +71,7 @@ Key design points:
 - `NEO_READ_ONLY=true` strips all write tools at `list_tools()` time — only `neo_task_status` and `neo_get_messages` are registered.
 - `handle_error(status_code)` is the single error-mapping function; every tool must call it on non-200 responses.
 - `neo_get_messages` paginates using `before=<earliest message timestamp>` and hard-caps output at 80 000 characters (~20 000 tokens) to stay under Claude Code's output limit.
+- `neo_task_status` auto-syncs files when status is COMPLETED: calls `_sync_files()` which hits `/v2/thread/{thread_id}/files`, downloads every file from its presigned S3 URL directly to `NEO_SYNC_DIR/{thread_id}/`. No extra tool call needed — files appear automatically.
 - Transport: `stdio_server` from `mcp.server.stdio` — no HTTP port needed.
 
 ## Tool → route mapping
@@ -84,6 +85,7 @@ Key design points:
 | `neo_pause_task` | POST | `/v2/thread/control/{thread_id}` (signal: PAUSE) |
 | `neo_resume_task` | POST | `/v2/thread/control/{thread_id}` (signal: RESUME) |
 | `neo_stop_task` | DELETE | `/v2/thread/cleanup-direct/{thread_id}` |
+| *(auto on COMPLETED)* | GET | `/v2/thread/{thread_id}/files` + S3 presigned URLs |
 
 Auth header on every request: `x-access-key: $NEO_API_KEY`
 
