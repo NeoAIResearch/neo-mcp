@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 
@@ -13,6 +14,7 @@ NEO_API_KEY = os.environ.get("NEO_API_KEY", "")      # access key (ak-v1-...)
 NEO_SECRET_KEY = os.environ.get("NEO_SECRET_KEY", "") # secret key (sk-v1-...)
 NEO_READ_ONLY = os.environ.get("NEO_READ_ONLY", "").lower() == "true"
 NEO_DEPLOYMENT_ID = os.environ.get("NEO_DEPLOYMENT_ID", "")  # optional, override auto-discovered sandbox ID
+NEO_WORKSPACE_DIR = os.environ.get("NEO_WORKSPACE_DIR", "")  # optional, override CWD (useful in Docker)
 
 
 def _discover_sandbox_id() -> str:
@@ -40,7 +42,6 @@ def _discover_sandbox_id() -> str:
     # 2. thread-workspaces.json — maps sandbox IDs to workspace paths
     ws_path = os.path.expanduser("~/.neo/daemon/thread-workspaces.json")
     try:
-        import json
         with open(ws_path, "r", errors="ignore") as f:
             workspaces: dict = json.load(f)
         # Prefer exact CWD match, then parent match
@@ -63,12 +64,13 @@ def _get_deployment_id() -> str:
 
 
 # Capture working directory at server startup — this is where the user launched the MCP client from
-_server_cwd = os.getcwd()
+_server_cwd = NEO_WORKSPACE_DIR or os.getcwd()
 
-if not NEO_API_KEY:
-    raise ValueError("NEO_API_KEY environment variable is required but not set.")
-if not NEO_SECRET_KEY:
-    raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
+def _check_config():
+    if not NEO_API_KEY:
+        raise ValueError("NEO_API_KEY environment variable is required but not set.")
+    if not NEO_SECRET_KEY:
+        raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
 
 app = Server("neo-mcp")
 
@@ -79,7 +81,11 @@ def handle_error(status_code: int) -> str:
         402: "Your Neo account has insufficient credits.",
         403: "Your Neo trial or quota has ended.",
         404: "Thread or user not found.",
+        429: "Too many requests. Wait a moment and try again.",
         500: "Neo backend error. Please try again.",
+        502: "Neo backend unavailable. Please try again.",
+        503: "Neo backend unavailable. Please try again.",
+        504: "Neo backend timed out. Please try again.",
     }
     return messages.get(status_code, f"Unexpected error (HTTP {status_code}).")
 
@@ -150,7 +156,8 @@ async def list_tools() -> list[Tool]:
             name="neo_send_feedback",
             description=(
                 "Send a reply to Neo when it is waiting for your input. "
-                "Only call this when neo_task_status returns WAITING_FOR_FEEDBACK."
+                "Only call this when neo_task_status returns WAITING_FOR_FEEDBACK. "
+                "After sending feedback, use neo_task_status to poll for completion."
             ),
             inputSchema={
                 "type": "object",
@@ -227,22 +234,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             if resp.status_code != 200:
                 return [TextContent(type="text", text=handle_error(resp.status_code))]
-            thread_id = resp.json().get("thread_id", resp.json().get("id", "unknown"))
+            data = resp.json()
+            thread_id = data.get("thread_id", data.get("id", "unknown"))
 
             # Poll until terminal state (max 20 minutes)
-            poll_client = httpx.AsyncClient(base_url=NEO_API_URL, timeout=30.0)
             status = "RUNNING"
-            try:
+            async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=30.0) as poll_client:
                 for _ in range(80):
                     await asyncio.sleep(15)
                     sr = await poll_client.get(f"/v2/thread/status/{thread_id}", headers=_headers())
                     if sr.status_code != 200:
-                        break
+                        continue  # transient error — keep polling
                     status = sr.json().get("status", "UNKNOWN")
                     if status in ("COMPLETED", "WAITING_FOR_FEEDBACK", "TERMINATED"):
                         break
-            finally:
-                await poll_client.aclose()
 
             if status == "COMPLETED":
                 # Fetch and return the messages directly
@@ -413,12 +418,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 async def _run():
+    _check_config()
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
 
 def main():
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except ValueError as e:
+        import sys
+        print(f"Neo MCP configuration error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
