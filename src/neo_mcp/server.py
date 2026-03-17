@@ -129,8 +129,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="neo_submit_task",
             description=(
-                "Submit a Neo ML task. After calling this, poll neo_task_status every 10–15 seconds "
-                "until status is COMPLETED or WAITING_FOR_FEEDBACK. Never poll faster than every 10 seconds."
+                "Submit a Neo task and wait for it to complete. "
+                "Handles polling automatically — returns the full result when done. "
+                "If Neo needs input mid-task, returns WAITING_FOR_FEEDBACK with the thread_id."
             ),
             inputSchema={
                 "type": "object",
@@ -212,6 +213,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
             message = f"Working directory: {_server_cwd}\n\nCreate all files inside this directory.\n\n{description}"
+
+            # Submit
             resp = await client.post(
                 "/v2/thread/init-chat-direct",
                 headers=_headers(),
@@ -224,16 +227,71 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             if resp.status_code != 200:
                 return [TextContent(type="text", text=handle_error(resp.status_code))]
-            data = resp.json()
-            thread_id = data.get("thread_id", data.get("id", "unknown"))
-            return [TextContent(
-                type="text",
-                text=(
-                    f"Task submitted. thread_id: {thread_id}. "
-                    "Poll neo_task_status every 10–15 seconds. "
-                    "Do not poll faster than every 10 seconds — tasks take minutes, not seconds."
-                ),
-            )]
+            thread_id = resp.json().get("thread_id", resp.json().get("id", "unknown"))
+
+            # Poll until terminal state (max 20 minutes)
+            poll_client = httpx.AsyncClient(base_url=NEO_API_URL, timeout=30.0)
+            status = "RUNNING"
+            try:
+                for _ in range(80):
+                    await asyncio.sleep(15)
+                    sr = await poll_client.get(f"/v2/thread/status/{thread_id}", headers=_headers())
+                    if sr.status_code != 200:
+                        break
+                    status = sr.json().get("status", "UNKNOWN")
+                    if status in ("COMPLETED", "WAITING_FOR_FEEDBACK", "TERMINATED"):
+                        break
+            finally:
+                await poll_client.aclose()
+
+            if status == "COMPLETED":
+                # Fetch and return the messages directly
+                all_messages: list[dict] = []
+                total_chars = 0
+                char_cap = 80000
+                before = None
+                capped = False
+                while True:
+                    params: dict = {"thread_id": thread_id, "limit": 100}
+                    if before is not None:
+                        params["before"] = before
+                    mr = await client.get("/v2/thread/thread-messages", headers=_headers(), params=params)
+                    if mr.status_code != 200:
+                        break
+                    mdata = mr.json()
+                    msgs = mdata.get("messages", [])
+                    for msg in msgs:
+                        content = msg.get("content", "")
+                        if total_chars + len(content) > char_cap:
+                            capped = True
+                            break
+                        all_messages.append(msg)
+                        total_chars += len(content)
+                    if capped or not mdata.get("has_more") or not msgs:
+                        break
+                    before = msgs[-1].get("created_at") or msgs[-1].get("timestamp")
+                    if before is None:
+                        break
+                formatted = [f"[{m.get('role','?').upper()}]\n{m.get('content','')}" for m in all_messages]
+                output = "\n---\n".join(formatted)
+                if capped:
+                    output += "\n---\n[Output truncated. Full output available in VS Code.]"
+                return [TextContent(type="text", text=f"Task completed. thread_id: {thread_id}\n\n{output or 'No messages.'}")]
+
+            if status == "WAITING_FOR_FEEDBACK":
+                return [TextContent(type="text", text=(
+                    f"Neo is waiting for your input. thread_id: {thread_id}\n"
+                    "Use neo_send_feedback to reply, then neo_task_status to resume polling."
+                ))]
+
+            if status == "TERMINATED":
+                return [TextContent(type="text", text=f"Task terminated. thread_id: {thread_id}")]
+
+            # Still running after timeout
+            return [TextContent(type="text", text=(
+                f"Task is still running after 20 minutes. thread_id: {thread_id}\n"
+                "Use neo_task_status to keep checking."
+            ))]
 
         elif name == "neo_task_status":
             thread_id = arguments["thread_id"]
