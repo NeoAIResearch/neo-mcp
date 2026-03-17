@@ -16,6 +16,41 @@ NEO_READ_ONLY = os.environ.get("NEO_READ_ONLY", "").lower() == "true"
 NEO_DEPLOYMENT_ID = os.environ.get("NEO_DEPLOYMENT_ID", "")  # optional, override auto-discovered sandbox ID
 NEO_WORKSPACE_DIR = os.environ.get("NEO_WORKSPACE_DIR", "")  # optional, override CWD (useful in Docker)
 
+_THREAD_ID_FILE = os.path.expanduser("~/.neo/active_thread_id")
+
+
+def _save_thread_id(thread_id: str) -> None:
+    """Persist thread_id so follow-up tools can recover it if the caller loses it."""
+    try:
+        os.makedirs(os.path.dirname(_THREAD_ID_FILE), exist_ok=True)
+        with open(_THREAD_ID_FILE, "w") as f:
+            f.write(thread_id)
+    except OSError:
+        pass
+
+
+def _load_thread_id() -> str:
+    """Return the last saved thread_id, or empty string if none."""
+    try:
+        with open(_THREAD_ID_FILE, "r") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _resolve_thread_id(arguments: dict) -> tuple[str, bool]:
+    """Return (thread_id, was_recovered).
+
+    Uses the caller-supplied value first; falls back to the persisted value.
+    """
+    tid = arguments.get("thread_id", "").strip()
+    if tid and tid != "unknown":
+        return tid, False
+    stored = _load_thread_id()
+    if stored:
+        return stored, True
+    return "", False
+
 
 def _discover_sandbox_id() -> str:
     """Try multiple sources to find the active Neo sandbox/deployment ID.
@@ -110,9 +145,9 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID returned by neo_submit_task."},
+                    "thread_id": {"type": "string", "description": "The thread ID returned by neo_submit_task. Omit to use the last active thread."},
                 },
-                "required": ["thread_id"],
+                "required": [],
             },
         ),
         Tool(
@@ -121,9 +156,9 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID to retrieve messages for."},
+                    "thread_id": {"type": "string", "description": "The thread ID to retrieve messages for. Omit to use the last active thread."},
                 },
-                "required": ["thread_id"],
+                "required": [],
             },
         ),
     ]
@@ -162,10 +197,10 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID."},
+                    "thread_id": {"type": "string", "description": "The thread ID. Omit to use the last active thread."},
                     "message": {"type": "string", "description": "Your reply to Neo."},
                 },
-                "required": ["thread_id", "message"],
+                "required": ["message"],
             },
         ),
         Tool(
@@ -174,9 +209,9 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID to pause."},
+                    "thread_id": {"type": "string", "description": "The thread ID to pause. Omit to use the last active thread."},
                 },
-                "required": ["thread_id"],
+                "required": [],
             },
         ),
         Tool(
@@ -185,9 +220,9 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID to resume."},
+                    "thread_id": {"type": "string", "description": "The thread ID to resume. Omit to use the last active thread."},
                 },
-                "required": ["thread_id"],
+                "required": [],
             },
         ),
         Tool(
@@ -196,14 +231,14 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID to stop."},
+                    "thread_id": {"type": "string", "description": "The thread ID to stop. Omit to use the last active thread."},
                     "delete_remote_artifacts": {
                         "type": "boolean",
                         "description": "Whether to delete remote artifacts (default: false).",
                         "default": False,
                     },
                 },
-                "required": ["thread_id"],
+                "required": [],
             },
         ),
     ]
@@ -235,7 +270,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if resp.status_code != 200:
                 return [TextContent(type="text", text=handle_error(resp.status_code))]
             data = resp.json()
-            thread_id = data.get("thread_id", data.get("id", "unknown"))
+            thread_id = (
+                data.get("thread_id")
+                or data.get("threadId")
+                or data.get("id")
+                or "unknown"
+            )
+            _save_thread_id(thread_id)
 
             # Poll until terminal state (max 20 minutes)
             status = "RUNNING"
@@ -299,7 +340,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             ))]
 
         elif name == "neo_task_status":
-            thread_id = arguments["thread_id"]
+            thread_id, recovered = _resolve_thread_id(arguments)
+            if not thread_id:
+                return [TextContent(type="text", text="No thread_id provided and no active thread found. Submit a task first.")]
             resp = await client.get(
                 f"/v2/thread/status/{thread_id}",
                 headers=_headers(),
@@ -310,19 +353,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             status = data.get("status", "UNKNOWN")
 
             if status == "COMPLETED":
-                msg = "Status: COMPLETED. Call neo_get_messages to read the output."
+                recovery_note = f" (thread_id recovered from storage: {thread_id})" if recovered else ""
+                msg = f"Status: COMPLETED. thread_id: {thread_id}{recovery_note}\nCall neo_get_messages to read the output."
                 return [TextContent(type="text", text=msg)]
 
+            recovery_note = f" (thread_id recovered from storage: {thread_id})" if recovered else ""
             hints = {
-                "RUNNING": "Status: RUNNING. Wait 10–15 seconds then poll again.",
-                "WAITING_FOR_FEEDBACK": "Status: WAITING_FOR_FEEDBACK. Neo has a question. Call neo_send_feedback now.",
-                "PAUSED": "Status: PAUSED. Call neo_resume_task to continue.",
-                "TERMINATED": "Status: TERMINATED. Task was stopped or hit a fatal error.",
+                "RUNNING": f"Status: RUNNING. thread_id: {thread_id}{recovery_note}\nWait 10–15 seconds then poll again.",
+                "WAITING_FOR_FEEDBACK": f"Status: WAITING_FOR_FEEDBACK. thread_id: {thread_id}{recovery_note}\nNeo has a question. Call neo_send_feedback now.",
+                "PAUSED": f"Status: PAUSED. thread_id: {thread_id}{recovery_note}\nCall neo_resume_task to continue.",
+                "TERMINATED": f"Status: TERMINATED. thread_id: {thread_id}{recovery_note}\nTask was stopped or hit a fatal error.",
             }
-            return [TextContent(type="text", text=hints.get(status, f"Status: {status}."))]
+            return [TextContent(type="text", text=hints.get(status, f"Status: {status}. thread_id: {thread_id}{recovery_note}"))]
 
         elif name == "neo_get_messages":
-            thread_id = arguments["thread_id"]
+            thread_id, recovered = _resolve_thread_id(arguments)
+            if not thread_id:
+                return [TextContent(type="text", text="No thread_id provided and no active thread found. Submit a task first.")]
             all_messages: list[dict] = []
             total_chars = 0
             char_cap = 80000
@@ -368,7 +415,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=output or "No messages found.")]
 
         elif name == "neo_send_feedback":
-            thread_id = arguments["thread_id"]
+            thread_id, _ = _resolve_thread_id(arguments)
+            if not thread_id:
+                return [TextContent(type="text", text="No thread_id provided and no active thread found. Submit a task first.")]
             message = arguments["message"]
             resp = await client.post(
                 f"/v2/thread/feedback/{thread_id}",
@@ -380,7 +429,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text="Feedback sent. Neo is continuing the task.")]
 
         elif name == "neo_pause_task":
-            thread_id = arguments["thread_id"]
+            thread_id, _ = _resolve_thread_id(arguments)
+            if not thread_id:
+                return [TextContent(type="text", text="No thread_id provided and no active thread found. Submit a task first.")]
             resp = await client.post(
                 f"/v2/thread/control/{thread_id}",
                 headers=_headers(),
@@ -391,7 +442,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=f"Task {thread_id} paused.")]
 
         elif name == "neo_resume_task":
-            thread_id = arguments["thread_id"]
+            thread_id, _ = _resolve_thread_id(arguments)
+            if not thread_id:
+                return [TextContent(type="text", text="No thread_id provided and no active thread found. Submit a task first.")]
             resp = await client.post(
                 f"/v2/thread/control/{thread_id}",
                 headers=_headers(),
@@ -402,7 +455,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=f"Task {thread_id} resumed.")]
 
         elif name == "neo_stop_task":
-            thread_id = arguments["thread_id"]
+            thread_id, _ = _resolve_thread_id(arguments)
+            if not thread_id:
+                return [TextContent(type="text", text="No thread_id provided and no active thread found. Submit a task first.")]
             delete_remote_artifacts = arguments.get("delete_remote_artifacts", False)
             resp = await client.delete(
                 f"/v2/thread/cleanup-direct/{thread_id}",
