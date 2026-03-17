@@ -18,6 +18,14 @@ NEO_WORKSPACE_DIR = os.environ.get("NEO_WORKSPACE_DIR", "")  # optional, overrid
 
 _THREAD_ID_FILE = os.path.expanduser("~/.neo/active_thread_id")
 
+# In-memory poll state: { thread_id: { "status": str, "messages": list|None, "capped": bool } }
+# Populated and updated by background asyncio tasks; read by neo_task_status / neo_get_messages.
+_active_polls: dict[str, dict] = {}
+
+
+# ---------------------------------------------------------------------------
+# Thread-id persistence
+# ---------------------------------------------------------------------------
 
 def _save_thread_id(thread_id: str) -> None:
     """Persist thread_id so follow-up tools can recover it if the caller loses it."""
@@ -51,6 +59,10 @@ def _resolve_thread_id(arguments: dict) -> tuple[str, bool]:
         return stored, True
     return "", False
 
+
+# ---------------------------------------------------------------------------
+# Sandbox / deployment ID discovery
+# ---------------------------------------------------------------------------
 
 def _discover_sandbox_id() -> str:
     """Try multiple sources to find the active Neo sandbox/deployment ID.
@@ -101,13 +113,16 @@ def _get_deployment_id() -> str:
 # Capture working directory at server startup — this is where the user launched the MCP client from
 _server_cwd = NEO_WORKSPACE_DIR or os.getcwd()
 
+
 def _check_config():
     if not NEO_API_KEY:
         raise ValueError("NEO_API_KEY environment variable is required but not set.")
     if not NEO_SECRET_KEY:
         raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
 
+
 app = Server("neo-mcp")
+
 
 def handle_error(status_code: int) -> str:
     messages = {
@@ -132,6 +147,96 @@ def _headers() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Background poller
+# ---------------------------------------------------------------------------
+
+async def _fetch_messages_pages(client: httpx.AsyncClient, thread_id: str) -> tuple[list[dict], bool]:
+    """Fetch all message pages for *thread_id*.  Returns (messages, capped)."""
+    all_messages: list[dict] = []
+    total_chars = 0
+    char_cap = 80_000
+    before = None
+
+    while True:
+        params: dict = {"thread_id": thread_id, "limit": 100}
+        if before is not None:
+            params["before"] = before
+        try:
+            mr = await client.get("/v2/thread/thread-messages", headers=_headers(), params=params)
+        except Exception:
+            break
+        if mr.status_code != 200:
+            break
+        mdata = mr.json()
+        msgs = mdata.get("messages", [])
+        for msg in msgs:
+            content = msg.get("content", "")
+            if total_chars + len(content) > char_cap:
+                return all_messages, True  # capped
+            all_messages.append(msg)
+            total_chars += len(content)
+        if not mdata.get("has_more") or not msgs:
+            break
+        before = msgs[-1].get("created_at") or msgs[-1].get("timestamp")
+        if before is None:
+            break
+
+    return all_messages, False
+
+
+async def _poll_task_bg(thread_id: str) -> None:
+    """Background asyncio task that keeps polling until a terminal state.
+
+    Updates _active_polls[thread_id] in place so other tool calls can read
+    the latest status at any time without blocking.
+
+    Polling schedule: starts at 3 s, ramps up to 15 s max.
+    Does NOT stop on WAITING_FOR_FEEDBACK — it keeps polling so the task
+    auto-resumes (and status updates) after neo_send_feedback is called.
+
+    Max runtime: ~400 iterations × 15 s ≈ 100 minutes.
+    """
+    _active_polls[thread_id] = {"status": "RUNNING", "messages": None, "capped": False}
+    delay = 3.0
+
+    async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=30.0) as client:
+        for _ in range(400):
+            await asyncio.sleep(delay)
+            try:
+                sr = await client.get(f"/v2/thread/status/{thread_id}", headers=_headers())
+                if sr.status_code != 200:
+                    delay = min(delay * 1.5, 15)
+                    continue
+                status = sr.json().get("status", "UNKNOWN")
+            except Exception:
+                delay = min(delay * 1.5, 15)
+                continue
+
+            _active_polls[thread_id]["status"] = status
+
+            if status == "COMPLETED":
+                msgs, capped = await _fetch_messages_pages(client, thread_id)
+                _active_polls[thread_id]["messages"] = msgs
+                _active_polls[thread_id]["capped"] = capped
+                break
+
+            if status == "TERMINATED":
+                break
+
+            if status == "WAITING_FOR_FEEDBACK":
+                # Keep polling — will naturally catch the transition back to RUNNING
+                # once the user sends feedback via neo_send_feedback.
+                delay = 5.0
+                continue
+
+            # RUNNING / PAUSED / unknown — ramp delay up to 15 s
+            delay = min(delay * 1.3, 15)
+
+
+# ---------------------------------------------------------------------------
+# Tool registry
+# ---------------------------------------------------------------------------
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
@@ -139,24 +244,35 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="neo_task_status",
             description=(
-                "Check Neo task status. Wait 10–15 seconds between calls when status is RUNNING. "
-                "Act immediately on WAITING_FOR_FEEDBACK or COMPLETED."
+                "Check the current status of a Neo task. "
+                "Returns instantly from in-memory state if a background poller is active, "
+                "otherwise hits the API. Status values: RUNNING, WAITING_FOR_FEEDBACK, "
+                "PAUSED, COMPLETED, TERMINATED."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID returned by neo_submit_task. Omit to use the last active thread."},
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread ID from neo_submit_task. Omit to use the last active thread.",
+                    },
                 },
                 "required": [],
             },
         ),
         Tool(
             name="neo_get_messages",
-            description="Read the full output of a completed Neo task. Call after neo_task_status returns COMPLETED.",
+            description=(
+                "Read the full output of a completed Neo task. "
+                "Returns cached messages if available; otherwise fetches from the API."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID to retrieve messages for. Omit to use the last active thread."},
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread ID to retrieve messages for. Omit to use the last active thread.",
+                    },
                 },
                 "required": [],
             },
@@ -170,9 +286,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="neo_submit_task",
             description=(
-                "Submit a Neo task and wait for it to complete. "
-                "Handles polling automatically — returns the full result when done. "
-                "If Neo needs input mid-task, returns WAITING_FOR_FEEDBACK with the thread_id."
+                "Submit a task to Neo. Returns immediately with the thread_id — "
+                "polling runs in the background so you can call neo_task_status, "
+                "neo_pause_task, or neo_send_feedback at any time without waiting."
             ),
             inputSchema={
                 "type": "object",
@@ -190,14 +306,17 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="neo_send_feedback",
             description=(
-                "Send a reply to Neo when it is waiting for your input. "
-                "Only call this when neo_task_status returns WAITING_FOR_FEEDBACK. "
-                "After sending feedback, use neo_task_status to poll for completion."
+                "Send a reply to Neo when it is WAITING_FOR_FEEDBACK. "
+                "The background poller will automatically detect when the task resumes — "
+                "call neo_task_status to check progress."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID. Omit to use the last active thread."},
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread ID. Omit to use the last active thread.",
+                    },
                     "message": {"type": "string", "description": "Your reply to Neo."},
                 },
                 "required": ["message"],
@@ -209,7 +328,10 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID to pause. Omit to use the last active thread."},
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread ID to pause. Omit to use the last active thread.",
+                    },
                 },
                 "required": [],
             },
@@ -220,7 +342,10 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID to resume. Omit to use the last active thread."},
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread ID to resume. Omit to use the last active thread.",
+                    },
                 },
                 "required": [],
             },
@@ -231,7 +356,10 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "thread_id": {"type": "string", "description": "The thread ID to stop. Omit to use the last active thread."},
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread ID to stop. Omit to use the last active thread.",
+                    },
                     "delete_remote_artifacts": {
                         "type": "boolean",
                         "description": "Whether to delete remote artifacts (default: false).",
@@ -246,17 +374,23 @@ async def list_tools() -> list[Tool]:
     return write_tools + read_tools
 
 
+# ---------------------------------------------------------------------------
+# Tool handlers
+# ---------------------------------------------------------------------------
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=30.0) as client:
 
+        # ------------------------------------------------------------------ #
+        # neo_submit_task — fire-and-forget; polling runs in background       #
+        # ------------------------------------------------------------------ #
         if name == "neo_submit_task":
             deployment_id = _get_deployment_id()
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
             message = f"Working directory: {_server_cwd}\n\nCreate all files inside this directory.\n\n{description}"
 
-            # Submit
             resp = await client.post(
                 "/v2/thread/init-chat-direct",
                 headers=_headers(),
@@ -269,6 +403,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             if resp.status_code != 200:
                 return [TextContent(type="text", text=handle_error(resp.status_code))]
+
             data = resp.json()
             thread_id = (
                 data.get("thread_id")
@@ -278,142 +413,112 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             _save_thread_id(thread_id)
 
-            # Poll until terminal state (max 20 minutes)
-            status = "RUNNING"
-            async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=30.0) as poll_client:
-                for _ in range(80):
-                    await asyncio.sleep(15)
-                    sr = await poll_client.get(f"/v2/thread/status/{thread_id}", headers=_headers())
-                    if sr.status_code != 200:
-                        continue  # transient error — keep polling
-                    status = sr.json().get("status", "UNKNOWN")
-                    if status in ("COMPLETED", "WAITING_FOR_FEEDBACK", "TERMINATED"):
-                        break
+            # Start background poller — does not block this response
+            asyncio.create_task(_poll_task_bg(thread_id))
 
-            if status == "COMPLETED":
-                # Fetch and return the messages directly
-                all_messages: list[dict] = []
-                total_chars = 0
-                char_cap = 80000
-                before = None
-                capped = False
-                while True:
-                    params: dict = {"thread_id": thread_id, "limit": 100}
-                    if before is not None:
-                        params["before"] = before
-                    mr = await client.get("/v2/thread/thread-messages", headers=_headers(), params=params)
-                    if mr.status_code != 200:
-                        break
-                    mdata = mr.json()
-                    msgs = mdata.get("messages", [])
-                    for msg in msgs:
-                        content = msg.get("content", "")
-                        if total_chars + len(content) > char_cap:
-                            capped = True
-                            break
-                        all_messages.append(msg)
-                        total_chars += len(content)
-                    if capped or not mdata.get("has_more") or not msgs:
-                        break
-                    before = msgs[-1].get("created_at") or msgs[-1].get("timestamp")
-                    if before is None:
-                        break
-                formatted = [f"[{m.get('role','?').upper()}]\n{m.get('content','')}" for m in all_messages]
-                output = "\n---\n".join(formatted)
-                if capped:
-                    output += "\n---\n[Output truncated. Full output available in VS Code.]"
-                return [TextContent(type="text", text=f"Task completed. thread_id: {thread_id}\n\n{output or 'No messages.'}")]
-
-            if status == "WAITING_FOR_FEEDBACK":
-                return [TextContent(type="text", text=(
-                    f"Neo is waiting for your input. thread_id: {thread_id}\n"
-                    "Use neo_send_feedback to reply, then neo_task_status to resume polling."
-                ))]
-
-            if status == "TERMINATED":
-                return [TextContent(type="text", text=f"Task terminated. thread_id: {thread_id}")]
-
-            # Still running after timeout
             return [TextContent(type="text", text=(
-                f"Task is still running after 20 minutes. thread_id: {thread_id}\n"
-                "Use neo_task_status to keep checking."
+                f"Task submitted. thread_id: {thread_id}\n\n"
+                "Polling is running in the background.\n"
+                "• neo_task_status — check progress at any time\n"
+                "• neo_pause_task  — pause while it's running\n"
+                "• neo_send_feedback — reply if it asks a question\n"
+                "• neo_stop_task   — cancel and clean up"
             ))]
 
+        # ------------------------------------------------------------------ #
+        # neo_task_status — reads in-memory state first, falls back to API   #
+        # ------------------------------------------------------------------ #
         elif name == "neo_task_status":
             thread_id, recovered = _resolve_thread_id(arguments)
             if not thread_id:
                 return [TextContent(type="text", text="No thread_id provided and no active thread found. Submit a task first.")]
-            resp = await client.get(
-                f"/v2/thread/status/{thread_id}",
-                headers=_headers(),
-            )
+
+            recovery_note = f"\n(thread_id recovered from storage)" if recovered else ""
+
+            # Fast path: background poller has current state in memory
+            if thread_id in _active_polls:
+                state = _active_polls[thread_id]
+                status = state["status"]
+                hints = {
+                    "RUNNING": (
+                        f"Status: RUNNING. thread_id: {thread_id}{recovery_note}\n"
+                        "Background poller is active — call neo_task_status again to refresh."
+                    ),
+                    "WAITING_FOR_FEEDBACK": (
+                        f"Status: WAITING_FOR_FEEDBACK. thread_id: {thread_id}{recovery_note}\n"
+                        "Neo has a question. Call neo_send_feedback to reply."
+                    ),
+                    "PAUSED": (
+                        f"Status: PAUSED. thread_id: {thread_id}{recovery_note}\n"
+                        "Call neo_resume_task to continue."
+                    ),
+                    "COMPLETED": (
+                        f"Status: COMPLETED. thread_id: {thread_id}{recovery_note}\n"
+                        "Call neo_get_messages to read the output."
+                    ),
+                    "TERMINATED": (
+                        f"Status: TERMINATED. thread_id: {thread_id}{recovery_note}\n"
+                        "Task was stopped or hit a fatal error."
+                    ),
+                }
+                return [TextContent(type="text", text=hints.get(status, f"Status: {status}. thread_id: {thread_id}{recovery_note}"))]
+
+            # Slow path: no background poller active — hit the API directly
+            resp = await client.get(f"/v2/thread/status/{thread_id}", headers=_headers())
             if resp.status_code != 200:
                 return [TextContent(type="text", text=handle_error(resp.status_code))]
-            data = resp.json()
-            status = data.get("status", "UNKNOWN")
+            status = resp.json().get("status", "UNKNOWN")
 
-            if status == "COMPLETED":
-                recovery_note = f" (thread_id recovered from storage: {thread_id})" if recovered else ""
-                msg = f"Status: COMPLETED. thread_id: {thread_id}{recovery_note}\nCall neo_get_messages to read the output."
-                return [TextContent(type="text", text=msg)]
-
-            recovery_note = f" (thread_id recovered from storage: {thread_id})" if recovered else ""
             hints = {
-                "RUNNING": f"Status: RUNNING. thread_id: {thread_id}{recovery_note}\nWait 10–15 seconds then poll again.",
-                "WAITING_FOR_FEEDBACK": f"Status: WAITING_FOR_FEEDBACK. thread_id: {thread_id}{recovery_note}\nNeo has a question. Call neo_send_feedback now.",
-                "PAUSED": f"Status: PAUSED. thread_id: {thread_id}{recovery_note}\nCall neo_resume_task to continue.",
-                "TERMINATED": f"Status: TERMINATED. thread_id: {thread_id}{recovery_note}\nTask was stopped or hit a fatal error.",
+                "RUNNING": (
+                    f"Status: RUNNING. thread_id: {thread_id}{recovery_note}\n"
+                    "No background poller active — call neo_task_status again to refresh."
+                ),
+                "WAITING_FOR_FEEDBACK": (
+                    f"Status: WAITING_FOR_FEEDBACK. thread_id: {thread_id}{recovery_note}\n"
+                    "Neo has a question. Call neo_send_feedback to reply."
+                ),
+                "PAUSED": (
+                    f"Status: PAUSED. thread_id: {thread_id}{recovery_note}\n"
+                    "Call neo_resume_task to continue."
+                ),
+                "COMPLETED": (
+                    f"Status: COMPLETED. thread_id: {thread_id}{recovery_note}\n"
+                    "Call neo_get_messages to read the output."
+                ),
+                "TERMINATED": (
+                    f"Status: TERMINATED. thread_id: {thread_id}{recovery_note}\n"
+                    "Task was stopped or hit a fatal error."
+                ),
             }
             return [TextContent(type="text", text=hints.get(status, f"Status: {status}. thread_id: {thread_id}{recovery_note}"))]
 
+        # ------------------------------------------------------------------ #
+        # neo_get_messages — returns cached messages if poller already fetched #
+        # ------------------------------------------------------------------ #
         elif name == "neo_get_messages":
             thread_id, recovered = _resolve_thread_id(arguments)
             if not thread_id:
                 return [TextContent(type="text", text="No thread_id provided and no active thread found. Submit a task first.")]
-            all_messages: list[dict] = []
-            total_chars = 0
-            char_cap = 80000
-            before = None
-            capped = False
 
-            while True:
-                params: dict = {"thread_id": thread_id, "limit": 100}
-                if before is not None:
-                    params["before"] = before
-                resp = await client.get("/v2/thread/thread-messages", headers=_headers(), params=params)
-                if resp.status_code != 200:
-                    return [TextContent(type="text", text=handle_error(resp.status_code))]
-                data = resp.json()
-                messages = data.get("messages", [])
-                has_more = data.get("has_more", False)
+            # Use cached messages from the background poller if available
+            state = _active_polls.get(thread_id, {})
+            if state.get("messages") is not None:
+                msgs = state["messages"]
+                capped = state.get("capped", False)
+            else:
+                # Fetch from API
+                msgs, capped = await _fetch_messages_pages(client, thread_id)
 
-                for msg in messages:
-                    content = msg.get("content", "")
-                    if total_chars + len(content) > char_cap:
-                        capped = True
-                        break
-                    all_messages.append(msg)
-                    total_chars += len(content)
-
-                if capped or not has_more or not messages:
-                    break
-
-                # Use the earliest message timestamp for the next page
-                before = messages[-1].get("created_at") or messages[-1].get("timestamp")
-                if before is None:
-                    break
-
-            formatted = []
-            for msg in all_messages:
-                role = msg.get("role", "unknown").upper()
-                content = msg.get("content", "")
-                formatted.append(f"[{role}]\n{content}")
-
+            formatted = [f"[{m.get('role','?').upper()}]\n{m.get('content','')}" for m in msgs]
             output = "\n---\n".join(formatted)
             if capped:
                 output += "\n---\n[Output truncated at ~20 000 tokens. Full output available in VS Code.]"
             return [TextContent(type="text", text=output or "No messages found.")]
 
+        # ------------------------------------------------------------------ #
+        # neo_send_feedback                                                    #
+        # ------------------------------------------------------------------ #
         elif name == "neo_send_feedback":
             thread_id, _ = _resolve_thread_id(arguments)
             if not thread_id:
@@ -426,8 +531,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             if resp.status_code != 200:
                 return [TextContent(type="text", text=handle_error(resp.status_code))]
-            return [TextContent(type="text", text="Feedback sent. Neo is continuing the task.")]
+            # Update in-memory status so next neo_task_status poll reflects the resumed state
+            if thread_id in _active_polls:
+                _active_polls[thread_id]["status"] = "RUNNING"
+            return [TextContent(type="text", text=(
+                "Feedback sent. Neo is continuing the task.\n"
+                "The background poller will pick up the new status automatically — "
+                "call neo_task_status to check progress."
+            ))]
 
+        # ------------------------------------------------------------------ #
+        # neo_pause_task                                                       #
+        # ------------------------------------------------------------------ #
         elif name == "neo_pause_task":
             thread_id, _ = _resolve_thread_id(arguments)
             if not thread_id:
@@ -439,8 +554,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             if resp.status_code != 200:
                 return [TextContent(type="text", text=handle_error(resp.status_code))]
+            if thread_id in _active_polls:
+                _active_polls[thread_id]["status"] = "PAUSED"
             return [TextContent(type="text", text=f"Task {thread_id} paused.")]
 
+        # ------------------------------------------------------------------ #
+        # neo_resume_task                                                      #
+        # ------------------------------------------------------------------ #
         elif name == "neo_resume_task":
             thread_id, _ = _resolve_thread_id(arguments)
             if not thread_id:
@@ -452,8 +572,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             if resp.status_code != 200:
                 return [TextContent(type="text", text=handle_error(resp.status_code))]
-            return [TextContent(type="text", text=f"Task {thread_id} resumed.")]
+            if thread_id in _active_polls:
+                _active_polls[thread_id]["status"] = "RUNNING"
+            return [TextContent(type="text", text=(
+                f"Task {thread_id} resumed.\n"
+                "Background poller will continue tracking it — call neo_task_status to check."
+            ))]
 
+        # ------------------------------------------------------------------ #
+        # neo_stop_task                                                        #
+        # ------------------------------------------------------------------ #
         elif name == "neo_stop_task":
             thread_id, _ = _resolve_thread_id(arguments)
             if not thread_id:
@@ -466,6 +594,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             if resp.status_code != 200:
                 return [TextContent(type="text", text=handle_error(resp.status_code))]
+            # Remove from in-memory state; background poller will exit on next TERMINATED poll
+            _active_polls.pop(thread_id, None)
             return [TextContent(type="text", text=f"Task {thread_id} stopped and cleaned up.")]
 
         else:
