@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import os
 import re
@@ -15,6 +16,9 @@ NEO_SECRET_KEY = os.environ.get("NEO_SECRET_KEY", "") # secret key (sk-v1-...)
 NEO_READ_ONLY = os.environ.get("NEO_READ_ONLY", "").lower() == "true"
 NEO_DEPLOYMENT_ID = os.environ.get("NEO_DEPLOYMENT_ID", "")  # optional, override auto-discovered sandbox ID
 NEO_WORKSPACE_DIR = os.environ.get("NEO_WORKSPACE_DIR", "")  # optional, override CWD (useful in Docker)
+NEO_TRANSPORT = os.environ.get("NEO_TRANSPORT", "stdio").lower()  # "stdio" or "http"
+NEO_HTTP_PORT = int(os.environ.get("NEO_HTTP_PORT", "8000"))
+NEO_HTTP_HOST = os.environ.get("NEO_HTTP_HOST", "0.0.0.0")
 
 _THREAD_ID_FILE = os.path.expanduser("~/.neo/active_thread_id")
 
@@ -115,10 +119,12 @@ _server_cwd = NEO_WORKSPACE_DIR or os.getcwd()
 
 
 def _check_config():
-    if not NEO_API_KEY:
-        raise ValueError("NEO_API_KEY environment variable is required but not set.")
-    if not NEO_SECRET_KEY:
-        raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
+    # In HTTP mode, keys can be supplied per-request via headers — env vars are optional
+    if NEO_TRANSPORT == "stdio":
+        if not NEO_API_KEY:
+            raise ValueError("NEO_API_KEY environment variable is required but not set.")
+        if not NEO_SECRET_KEY:
+            raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
 
 
 app = Server(
@@ -160,10 +166,18 @@ def handle_error(status_code: int) -> str:
     return messages.get(status_code, f"Unexpected error (HTTP {status_code}).")
 
 
+# Per-request key context vars — safe for concurrent async HTTP requests
+_ctx_api_key: contextvars.ContextVar[str] = contextvars.ContextVar("api_key", default="")
+_ctx_secret_key: contextvars.ContextVar[str] = contextvars.ContextVar("secret_key", default="")
+
+
 def _headers() -> dict:
+    """Build Neo auth headers. Per-request context vars take priority over env vars."""
+    api_key = _ctx_api_key.get() or NEO_API_KEY
+    secret_key = _ctx_secret_key.get() or NEO_SECRET_KEY
     return {
-        "Authorization": f"Bearer {NEO_SECRET_KEY}",
-        "x-access-key": NEO_API_KEY,
+        "Authorization": f"Bearer {secret_key}",
+        "x-access-key": api_key,
     }
 
 
@@ -625,15 +639,74 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
-async def _run():
+async def _run_stdio():
     _check_config()
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
 
+async def _run_http():
+    from mcp.server.streamable_http import StreamableHTTPServerTransport
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, Response
+    from starlette.routing import Mount, Route
+    import uvicorn
+
+    async def handle_mcp(request: Request) -> Response:
+        """Single endpoint for all MCP streamable-HTTP traffic (POST / GET / DELETE)."""
+        # Extract per-request Neo keys from headers; fall back to env vars
+        api_key = request.headers.get("x-access-key", "")
+        secret_key = request.headers.get("authorization", "")
+        if secret_key.lower().startswith("bearer "):
+            secret_key = secret_key[7:]
+
+        if not api_key or not secret_key:
+            return JSONResponse(
+                {"error": "Missing auth headers. Provide x-access-key and Authorization: Bearer <secret>."},
+                status_code=401,
+            )
+
+        # Set context vars so _headers() picks them up for this request's async context
+        _ctx_api_key.set(api_key)
+        _ctx_secret_key.set(secret_key)
+
+        transport = StreamableHTTPServerTransport(mcp_session_id=None, is_json_response_enabled=False)
+        async with transport.connect() as (read_stream, write_stream):
+            async def run_server():
+                await app.run(read_stream, write_stream, app.create_initialization_options())
+
+            import anyio
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(run_server)
+                response = await transport.handle_request(request.scope, request.receive, request._send)  # noqa: SLF001
+                tg.cancel_scope.cancel()
+
+        return response
+
+    async def health(_: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok", "server": "neo-mcp", "transport": "http"})
+
+    starlette_app = Starlette(
+        routes=[
+            Route("/health", health, methods=["GET"]),
+            Route("/mcp", handle_mcp, methods=["GET", "POST", "DELETE"]),
+        ]
+    )
+
+    config = uvicorn.Config(starlette_app, host=NEO_HTTP_HOST, port=NEO_HTTP_PORT, log_level="info")
+    server = uvicorn.Server(config)
+    print(f"Neo MCP HTTP server listening on {NEO_HTTP_HOST}:{NEO_HTTP_PORT}", flush=True)
+    await server.serve()
+
+
 def main():
     try:
-        asyncio.run(_run())
+        _check_config()
+        if NEO_TRANSPORT == "http":
+            asyncio.run(_run_http())
+        else:
+            asyncio.run(_run_stdio())
     except ValueError as e:
         import sys
         print(f"Neo MCP configuration error: {e}", file=sys.stderr)
