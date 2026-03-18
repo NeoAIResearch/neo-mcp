@@ -1,4 +1,4 @@
-name: Publish Neo MCP Docker image
+name: Publish Neo MCP
 
 on:
   push:
@@ -9,6 +9,8 @@ on:
       - "Dockerfile"
       - "pyproject.toml"
       - "requirements.txt"
+    tags:
+      - "v*"
 
 jobs:
   build-and-push:
@@ -36,3 +38,41 @@ jobs:
           tags: |
             ghcr.io/heyneo/neo-mcp-server:latest
             ghcr.io/heyneo/neo-mcp-server:${{ github.sha }}
+
+      - name: Deploy to VPS
+        if: github.ref == 'refs/heads/main'
+        uses: appleboy/ssh-action@v1
+        continue-on-error: true
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: bash /etc/neo-mcp/deploy.sh
+
+  publish-pypi:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build distribution
+        run: python -m build
+        working-directory: neo-mcp
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: neo-mcp/dist/

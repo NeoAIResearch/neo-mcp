@@ -1,77 +1,188 @@
 # Neo MCP Server
 
-> ⚠️ **REQUIREMENT: The Neo VS Code extension must be open and connected before using this MCP server.**
-> If VS Code is not running, tasks will appear to start but will not execute.
+Run AI/ML tasks on Neo's remote backend directly from Claude Code, Cursor, Windsurf, Zed, VS Code, Continue.dev, and OpenAI Codex CLI.
 
-## Prerequisites
+---
 
-- Neo account with `x-access-key` (get from the Neo dashboard)
-- Docker (recommended) **or** Python 3.11+
-- Neo VS Code extension installed and connected
-
-## Install — Docker (recommended)
+## Quickstart — zero to working in under 5 minutes
 
 ```bash
-claude mcp add --scope user neo -- docker run -i --rm \
-  -e NEO_API_KEY -e NEO_SECRET_KEY ghcr.io/heyneo/neo-mcp-server
+pip install neo-mcp
+neo-mcp setup
 ```
 
-Set both keys in your environment before starting Claude Code:
+The setup wizard detects your editors, prompts for your Neo API keys, and writes all config files automatically. Restart your editor and the 7 Neo tools will be available.
 
+---
+
+## Quickstart (no install) — hosted endpoint
+
+For Cursor, Windsurf, and VS Code you can skip `pip install` entirely and point directly at the hosted server:
+
+| Field | Value |
+|---|---|
+| URL | `https://mcp.heyneo.so/mcp` |
+| Header | `x-access-key: ak-v1-...` |
+| Header | `Authorization: Bearer sk-v1-...` |
+
+Get your keys from the **Neo dashboard**.
+
+---
+
+## What you need
+
+- Neo account with API keys (`ak-v1-...` and `sk-v1-...`)
+- Neo VS Code extension installed and connected (required for task execution)
+- Python 3.11+ **or** Docker
+
+---
+
+## How to use Neo once it's connected
+
+You don't call the tools directly — you just talk to your AI assistant in plain language. It decides when to route work to Neo and handles all the tool calls automatically.
+
+### What Neo is for
+
+Neo runs AI/ML work on a remote backend so it doesn't block your local machine:
+
+- Training or fine-tuning models (classification, regression, NLP, computer vision, …)
+- Building AI agents or multi-agent workflows
+- RAG pipelines and vector search systems
+- LLM integrations and prompt engineering pipelines
+- ML data preprocessing and feature engineering
+
+For general coding (web apps, scripts, CRUD backends) your assistant will work locally as normal — it only routes to Neo for AI/ML tasks.
+
+---
+
+### What a typical session looks like
+
+```
+You:       "Use Neo to train a fraud detection model on fraud.csv"
+
+Assistant: Submitting your task to Neo now...
+           [calls neo_submit_task — returns thread_id, starts background polling]
+
+Neo asks:  "I see fraud.csv has 50k rows. Should I handle class imbalance
+           with SMOTE or class weights?"
+
+You:       "Use class weights"
+
+Assistant: Sending your reply to Neo...
+           [calls neo_send_feedback — Neo resumes automatically]
+
+You:       "Is it done yet?"
+
+Assistant: Status: COMPLETED. Reading the output...
+           [calls neo_get_messages]
+
+           Neo trained a Random Forest + XGBoost ensemble.
+           Recall: 0.91 on the test set.
+           Model saved to ./models/fraud_model.pkl
+```
+
+---
+
+### Example prompts to try
+
+**Submit a task**
+> "Use Neo to build a churn prediction model on my `churn.csv`, optimise for recall"
+
+> "Ask Neo to build a RAG pipeline for the PDF documents in my `/docs` folder"
+
+> "Use Neo to fine-tune a sentiment classifier on `train.jsonl`"
+
+**Check progress**
+> "What's the status of the Neo task?"
+
+> "Is Neo done yet?"
+
+**Reply to a question**
+
+Neo sometimes pauses and asks a clarifying question. Your assistant shows what Neo asked. Reply naturally:
+
+> "Tell Neo to use XGBoost and target the `churned` column"
+
+**Read the output**
+> "Show me what Neo built"
+
+> "Get the results from the Neo task"
+
+**Control a running task**
+> "Pause the Neo task"
+
+> "Stop the Neo task and clean up"
+
+---
+
+## Available tools
+
+| Tool | Description |
+|---|---|
+| `neo_submit_task` | Submit an AI/ML task. Returns a thread_id; background polling tracks progress. |
+| `neo_task_status` | Check task status: RUNNING, WAITING_FOR_FEEDBACK, PAUSED, COMPLETED, TERMINATED. |
+| `neo_get_messages` | Read the full output once the task is COMPLETED. |
+| `neo_send_feedback` | Reply to Neo when it asks a question (WAITING_FOR_FEEDBACK). |
+| `neo_pause_task` | Pause a running task. |
+| `neo_resume_task` | Resume a paused task. |
+| `neo_stop_task` | Stop and clean up a task. |
+
+---
+
+## Manual install options
+
+### pip (PyPI)
 ```bash
-export NEO_API_KEY=ak-v1-...    # access key from Neo dashboard
-export NEO_SECRET_KEY=sk-v1-... # secret key from Neo dashboard
+pip install neo-mcp
 ```
 
-## Install — Python
+### Docker
+```bash
+docker pull ghcr.io/heyneo/neo-mcp-server
+```
 
+### pip from GitHub
 ```bash
 pip install git+https://github.com/NeoResearchAI/MCPServer.git#subdirectory=neo-mcp
 ```
 
+---
+
+## Manual Claude Code registration
+
+If you prefer not to use the wizard:
+
 ```bash
+# Local (stdio)
 claude mcp add --scope user neo \
-  -e NEO_API_KEY=your-access-key -e NEO_SECRET_KEY=your-secret-key \
+  -e NEO_API_KEY=ak-v1-... -e NEO_SECRET_KEY=sk-v1-... \
   -- neo-mcp
+
+# Remote (no local install required)
+claude mcp add --transport http neo https://mcp.heyneo.so/mcp \
+  --header "x-access-key: ak-v1-..." \
+  --header "Authorization: Bearer sk-v1-..."
 ```
 
-Set both `NEO_API_KEY` and `NEO_SECRET_KEY` in your environment before starting Claude Code.
+See [docs/SETUP.md](docs/SETUP.md) for all clients and options.
 
-## Configuration scopes
+---
 
-| Scope     | Flag              | When to use                                      |
-|-----------|-------------------|--------------------------------------------------|
-| `user`    | `--scope user`    | Personal use across all projects (recommended)   |
-| `project` | `--scope project` | Share with your team via `.mcp.json` in the repo |
-| `local`   | *(default)*       | One project, not committed                       |
+## Configuration scopes (Claude Code)
 
-## Available tools
+| Scope | Flag | Saved to | When to use |
+|---|---|---|---|
+| `user` | `--scope user` | `~/.claude/settings.json` | Personal use across all projects |
+| `project` | `--scope project` | `.mcp.json` in repo | Team-shared setup |
+| `local` | *(default)* | `.claude/settings.local.json` | One project, not committed |
 
-| Tool                | Description                                                        |
-|---------------------|--------------------------------------------------------------------|
-| `neo_submit_task`   | Submit a task to Neo. Blocks until complete and returns the full result. |
-| `neo_task_status`   | Poll task status. Poll every 10–15 s while `RUNNING`.              |
-| `neo_get_messages`  | Read the full output once status is `COMPLETED`.                   |
-| `neo_send_feedback` | Reply to Neo when status is `WAITING_FOR_FEEDBACK`.                |
-| `neo_pause_task`    | Pause a running task.                                              |
-| `neo_resume_task`   | Resume a paused task.                                              |
-| `neo_stop_task`     | Stop and clean up a task.                                          |
-
-## Example usage
-
-In a Claude Code session, try:
-
-- `"Use Neo to build a churn model on my churn.csv, optimise for recall"`
-- `"Check the status of Neo task thr_abc123"`
-- `"Ask Neo to analyse my dataset and suggest the best model"`
+---
 
 ## Read-only mode
 
 Set `NEO_READ_ONLY=true` to expose only `neo_task_status` and `neo_get_messages`.
-Write tools (`neo_submit_task`, `neo_send_feedback`, `neo_pause_task`, `neo_resume_task`, `neo_stop_task`) will not be registered.
-
-Set `NEO_WORKSPACE_DIR=/your/project` when running in Docker so Neo knows the correct path to your project files.
 
 ```bash
-docker run -i --rm -e NEO_API_KEY -e NEO_SECRET_KEY -e NEO_READ_ONLY=true ghcr.io/heyneo/neo-mcp-server
+docker run -i --rm -e NEO_API_KEY -e NEO_SECRET_KEY -e NEO_READ_ONLY=true \
+  ghcr.io/heyneo/neo-mcp-server
 ```
