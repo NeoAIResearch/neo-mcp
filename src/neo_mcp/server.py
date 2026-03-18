@@ -124,18 +124,18 @@ def _check_config():
 app = Server(
     "neo-mcp",
     instructions=(
-        "Neo is an AI/ML backend that runs training jobs, data pipelines, agent workflows, and general "
-        "compute tasks in a remote sandbox. Use neo_submit_task for ANY of the following:\n"
-        "• Training or fine-tuning ML models (classification, recommendation, NLP, CV, etc.)\n"
+        "Neo is a remote AI/ML execution backend. Follow these rules strictly:\n\n"
+        "ALWAYS use neo_submit_task (without asking) for tasks that are clearly AI/ML:\n"
+        "• Training or fine-tuning ML models (classification, regression, recommendation, NLP, CV, etc.)\n"
         "• Building AI agents, multi-agent systems, or autonomous workflows\n"
-        "• Building RAG (Retrieval-Augmented Generation) pipelines and vector search systems\n"
+        "• Building RAG (Retrieval-Augmented Generation) pipelines or vector search systems\n"
         "• LLM integration, prompt engineering pipelines, or AI-powered applications\n"
-        "• Running data preprocessing, feature engineering, or ETL pipelines\n"
-        "• Executing scripts, notebooks, or long-running compute tasks\n"
-        "• Any task the user frames as 'train', 'build', 'run', 'create an agent', 'set up RAG', "
-        "'build a model', 'process data', or any other AI/ML/data task\n\n"
-        "Do NOT attempt to write and run AI/ML/data code locally — always delegate to neo_submit_task.\n\n"
-        "Workflow:\n"
+        "• Data preprocessing, feature engineering, or ML-oriented ETL pipelines\n\n"
+        "ASK THE USER first ('Should I use Neo to build this?') for tasks that are ambiguous or not "
+        "clearly AI/ML — for example: general web apps, CLI tools, scripts, CRUD backends, or anything "
+        "that could be built locally just as easily. Do not assume Neo should run everything.\n\n"
+        "NEVER attempt to run AI/ML tasks locally — always delegate those to neo_submit_task.\n\n"
+        "Workflow once you submit:\n"
         "1. neo_submit_task — submit the task (returns thread_id immediately)\n"
         "2. neo_task_status — poll until COMPLETED or WAITING_FOR_FEEDBACK\n"
         "3. neo_send_feedback — reply if Neo asks a question\n"
@@ -306,12 +306,12 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="neo_submit_task",
             description=(
-                "Submit a task to the Neo AI/ML backend. USE THIS for any AI or ML work: training models, "
-                "building AI agents, RAG pipelines, LLM integrations, data processing, or any long-running "
-                "compute task — do not attempt to run these locally. "
+                "Submit a task to the Neo AI/ML backend. Use this ONLY for AI/ML work: training models, "
+                "building AI agents, RAG pipelines, LLM integrations, or ML data pipelines. "
+                "For anything outside AI/ML, ask the user first: 'Should I use Neo to build this?' "
                 "Returns immediately with a thread_id; background polling tracks progress. "
-                "Follow up with neo_task_status to check progress, neo_send_feedback if Neo asks a "
-                "question, and neo_get_messages to read the final output."
+                "Follow up with neo_task_status, neo_send_feedback (if Neo asks a question), "
+                "and neo_get_messages to read the final output."
             ),
             inputSchema={
                 "type": "object",
