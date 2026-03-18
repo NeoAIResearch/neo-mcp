@@ -121,7 +121,27 @@ def _check_config():
         raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
 
 
-app = Server("neo-mcp")
+app = Server(
+    "neo-mcp",
+    instructions=(
+        "Neo is an AI/ML backend that runs training jobs, data pipelines, agent workflows, and general "
+        "compute tasks in a remote sandbox. Use neo_submit_task for ANY of the following:\n"
+        "• Training or fine-tuning ML models (classification, recommendation, NLP, CV, etc.)\n"
+        "• Building AI agents, multi-agent systems, or autonomous workflows\n"
+        "• Building RAG (Retrieval-Augmented Generation) pipelines and vector search systems\n"
+        "• LLM integration, prompt engineering pipelines, or AI-powered applications\n"
+        "• Running data preprocessing, feature engineering, or ETL pipelines\n"
+        "• Executing scripts, notebooks, or long-running compute tasks\n"
+        "• Any task the user frames as 'train', 'build', 'run', 'create an agent', 'set up RAG', "
+        "'build a model', 'process data', or any other AI/ML/data task\n\n"
+        "Do NOT attempt to write and run AI/ML/data code locally — always delegate to neo_submit_task.\n\n"
+        "Workflow:\n"
+        "1. neo_submit_task — submit the task (returns thread_id immediately)\n"
+        "2. neo_task_status — poll until COMPLETED or WAITING_FOR_FEEDBACK\n"
+        "3. neo_send_feedback — reply if Neo asks a question\n"
+        "4. neo_get_messages — read the final output when COMPLETED"
+    ),
+)
 
 
 def handle_error(status_code: int) -> str:
@@ -286,9 +306,12 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="neo_submit_task",
             description=(
-                "Submit a task to Neo. Returns immediately with the thread_id — "
-                "polling runs in the background so you can call neo_task_status, "
-                "neo_pause_task, or neo_send_feedback at any time without waiting."
+                "Submit a task to the Neo AI/ML backend. USE THIS for any AI or ML work: training models, "
+                "building AI agents, RAG pipelines, LLM integrations, data processing, or any long-running "
+                "compute task — do not attempt to run these locally. "
+                "Returns immediately with a thread_id; background polling tracks progress. "
+                "Follow up with neo_task_status to check progress, neo_send_feedback if Neo asks a "
+                "question, and neo_get_messages to read the final output."
             ),
             inputSchema={
                 "type": "object",
