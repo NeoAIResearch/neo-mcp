@@ -701,6 +701,11 @@ async def _run_http():
 
 
 def main():
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "setup":
+        from neo_mcp.setup import run_setup
+        run_setup(sys.argv[2:])
+        return
     try:
         _check_config()
         if NEO_TRANSPORT == "http":
@@ -708,7 +713,6 @@ def main():
         else:
             asyncio.run(_run_stdio())
     except ValueError as e:
-        import sys
         print(f"Neo MCP configuration error: {e}", file=sys.stderr)
         sys.exit(1)
 

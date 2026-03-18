@@ -4,13 +4,39 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neo-mcp"
-version = "0.1.0"
-description = "MCP server for the Neo AI backend"
+version = "0.2.0"
+description = "MCP server for the Neo AI/ML backend — submit tasks, poll status, read output"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
+keywords = ["mcp", "ai", "ml", "neo", "llm", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.26.0",
     "httpx>=0.27.0",
 ]
+
+[project.optional-dependencies]
+http = [
+    "starlette>=0.40.0",
+    "uvicorn>=0.30.0",
+    "anyio>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://heyneo.so"
+Repository = "https://github.com/NeoResearchAI/MCPServer"
+Documentation = "https://github.com/NeoResearchAI/MCPServer/blob/main/neo-mcp/docs/SETUP.md"
+"Bug Tracker" = "https://github.com/NeoResearchAI/MCPServer/issues"
 
 [project.scripts]
 neo-mcp = "neo_mcp.server:main"
