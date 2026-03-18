@@ -10,7 +10,7 @@ Before sending any task:
 
 - [ ] Neo account with API keys (from [Neo dashboard](https://app.heyneo.so))
 - [ ] Neo VS Code extension installed and showing **Connected** in the sidebar
-- [ ] MCP server registered in your LLM client (see `SETUP.md`)
+- [ ] MCP server registered in your LLM client (see `CLIENTS.md`)
 - [ ] `NEO_API_KEY` and `NEO_SECRET_KEY` set in the MCP config
 
 ---
