@@ -503,8 +503,9 @@ async def _daemon_poll_loop() -> None:
                     await asyncio.sleep(30)
                     continue
                 if r.status_code == 404:
-                    # Deployment unknown to backend yet — backend learns about it on first submit
-                    await asyncio.sleep(30)
+                    # Deployment not yet known to backend — poll frequently so it becomes
+                    # available quickly once the first task is submitted with this ID.
+                    await asyncio.sleep(2)
                     continue
                 if r.status_code != 200:
                     raise RuntimeError(f"HTTP {r.status_code}")
@@ -691,7 +692,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # neo_submit_task — fire-and-forget; polling runs in background       #
         # ------------------------------------------------------------------ #
         if name == "neo_submit_task":
+            # If the daemon hasn't written its ID yet (race on first startup), wait up to 5 s.
             deployment_id = _get_deployment_id()
+            if not deployment_id:
+                for _ in range(10):
+                    await asyncio.sleep(0.5)
+                    deployment_id = _get_deployment_id()
+                    if deployment_id:
+                        break
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
             message = f"Working directory: {_server_cwd}\n\nCreate all files inside this directory.\n\n{description}"
