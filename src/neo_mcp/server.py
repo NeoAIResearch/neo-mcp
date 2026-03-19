@@ -707,15 +707,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 },
             )
             if resp.status_code != 200:
-                return [TextContent(type="text", text=handle_error(resp.status_code))]
+                # Include actual backend response body to aid debugging
+                try:
+                    detail = resp.json().get("detail") or resp.json().get("error") or resp.text
+                except Exception:
+                    detail = resp.text
+                return [TextContent(type="text", text=(
+                    f"{handle_error(resp.status_code)}\n"
+                    f"HTTP {resp.status_code} — {detail}\n"
+                    f"deployment_id used: {deployment_id or '(none)'}"
+                ))]
 
             data = resp.json()
             thread_id = (
                 data.get("thread_id")
                 or data.get("threadId")
                 or data.get("id")
-                or "unknown"
             )
+            if not thread_id:
+                return [TextContent(type="text", text=(
+                    f"Backend returned 200 but no thread_id found in response.\n"
+                    f"Response: {data}\n"
+                    f"deployment_id used: {deployment_id or '(none)'}"
+                ))]
+
             _save_thread_id(thread_id)
 
             # Start background poller — does not block this response
