@@ -3,6 +3,7 @@ import contextvars
 import json
 import os
 import re
+import uuid
 
 import httpx
 from mcp.server import Server
@@ -17,7 +18,7 @@ NEO_READ_ONLY = os.environ.get("NEO_READ_ONLY", "").lower() == "true"
 NEO_DEPLOYMENT_ID = os.environ.get("NEO_DEPLOYMENT_ID", "")  # optional, override auto-discovered sandbox ID
 NEO_WORKSPACE_DIR = os.environ.get("NEO_WORKSPACE_DIR", "")  # optional, override CWD (useful in Docker)
 NEO_TRANSPORT = os.environ.get("NEO_TRANSPORT", "stdio").lower()  # "stdio" or "http"
-NEO_HTTP_PORT = int(os.environ.get("NEO_HTTP_PORT", "8000"))
+NEO_HTTP_PORT = int(os.environ.get("NEO_HTTP_PORT") or os.environ.get("PORT", "8000"))
 NEO_HTTP_HOST = os.environ.get("NEO_HTTP_HOST", "0.0.0.0")
 
 _THREAD_ID_FILE = os.path.expanduser("~/.neo/active_thread_id")
@@ -152,7 +153,7 @@ app = Server(
 
 def handle_error(status_code: int) -> str:
     messages = {
-        400: "No available deployment. Ensure the Neo VS Code extension is open and connected.",
+        400: "No available deployment. The built-in daemon may still be starting — retry in a few seconds.",
         401: "Invalid API key. Check your NEO_API_KEY configuration.",
         402: "Your Neo account has insufficient credits.",
         403: "Your Neo trial or quota has ended.",
@@ -266,6 +267,273 @@ async def _poll_task_bg(thread_id: str) -> None:
 
             # RUNNING / PAUSED / unknown — ramp delay up to 15 s
             delay = min(delay * 1.3, 15)
+
+
+# ---------------------------------------------------------------------------
+# Built-in daemon — polls backend and executes commands locally
+# Eliminates the VS Code extension requirement: the MCP server IS the daemon.
+# ---------------------------------------------------------------------------
+
+_STANDALONE_ID_FILE = os.path.expanduser("~/.neo/daemon/standalone_deployment_id")
+
+# Active subprocess jobs: { job_id: {"stdout": str, "stderr": str, "exit_code": int|None, "proc": Process|None} }
+_daemon_jobs: dict[str, dict] = {}
+
+
+def _get_or_create_deployment_id() -> str:
+    """Load a stable deployment UUID or generate one on first run."""
+    try:
+        os.makedirs(os.path.dirname(_STANDALONE_ID_FILE), exist_ok=True)
+        if os.path.exists(_STANDALONE_ID_FILE):
+            uid = open(_STANDALONE_ID_FILE).read().strip()
+            if uid:
+                return uid
+        uid = str(uuid.uuid4())
+        with open(_STANDALONE_ID_FILE, "w") as f:
+            f.write(uid)
+        return uid
+    except OSError:
+        return str(uuid.uuid4())
+
+
+def _write_sandbox_log_entry(deployment_id: str) -> None:
+    """Append sandboxId entry so _discover_sandbox_id() auto-detects it."""
+    log_path = os.path.expanduser("~/.neo/daemon/daemon.log")
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(json.dumps({"sandboxId": deployment_id, "source": "python-daemon"}) + "\n")
+    except OSError:
+        pass
+
+
+def _safe_resolve(path_str: str, workspace: str) -> str | None:
+    """Return realpath if within workspace or /tmp, else None."""
+    if os.path.isabs(path_str):
+        resolved = os.path.realpath(path_str)
+    else:
+        resolved = os.path.realpath(os.path.join(workspace, path_str))
+    norm_ws = os.path.realpath(workspace)
+    if resolved == norm_ws or resolved.startswith(norm_ws + os.sep):
+        return resolved
+    if resolved == "/tmp" or resolved.startswith("/tmp/"):
+        return resolved
+    return None
+
+
+async def _run_job(job_id: str, shell_cmd: str, workspace: str) -> None:
+    """Run a shell command and capture output into _daemon_jobs."""
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            shell_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workspace,
+        )
+        _daemon_jobs[job_id]["proc"] = proc
+        out, err = await proc.communicate()
+        _daemon_jobs[job_id]["stdout"] = out.decode(errors="replace")
+        _daemon_jobs[job_id]["stderr"] = err.decode(errors="replace")
+        _daemon_jobs[job_id]["exit_code"] = proc.returncode
+    except Exception as exc:
+        _daemon_jobs[job_id]["stderr"] = str(exc)
+        _daemon_jobs[job_id]["exit_code"] = 1
+
+
+async def _handle_daemon_command(cmd: dict, workspace: str) -> dict:
+    """Route one backend command and return the response payload."""
+    action = cmd.get("action", "")
+    request_id = cmd.get("request_id", "")
+    thread_id = cmd.get("thread_id")
+    deployment_id = cmd.get("deployment_id", "")
+
+    def resp(status: str, **kw) -> dict:
+        r: dict = {"request_id": request_id, "sandbox_id": deployment_id, "status": status}
+        if thread_id:
+            r["thread_id"] = thread_id
+        rqn = cmd.get("response_queue_name")
+        if rqn:
+            r["response_queue_name"] = rqn
+        r.update(kw)
+        return r
+
+    if action == "create_session":
+        sid = (cmd.get("payload") or {}).get("session_id") or cmd.get("session_id")
+        if not sid:
+            return resp("error", error="Missing session_id")
+        return resp("success", data={"coding_session_id": sid})
+
+    elif action == "write_code":
+        filename = cmd.get("filename")
+        code = cmd.get("code")
+        workdir = cmd.get("workdir", "")
+        if not filename or code is None:
+            return resp("error", error="Missing filename or code")
+        base = os.path.join(workspace, workdir) if workdir else workspace
+        raw = filename if os.path.isabs(filename) else os.path.join(base, filename)
+        safe = _safe_resolve(raw, workspace)
+        if safe is None:
+            return resp("error", error="Path outside workspace/tmp not allowed")
+        try:
+            os.makedirs(os.path.dirname(safe), exist_ok=True)
+            with open(safe, "w") as f:
+                f.write(code)
+            return resp("success", data={"file_path": safe, "workdir": workdir})
+        except OSError as e:
+            return resp("error", error=str(e))
+
+    elif action == "get_file":
+        file_path = cmd.get("file_path")
+        if not file_path:
+            return resp("error", error="Missing file_path")
+        raw = file_path if os.path.isabs(file_path) else os.path.join(workspace, file_path)
+        safe = _safe_resolve(raw, workspace)
+        if safe is None:
+            return resp("error", error="Path not allowed")
+        if not os.path.isfile(safe):
+            return resp("error", error="File not found")
+        try:
+            with open(safe) as f:
+                content = f.read()
+            return resp("success", data={"file_content": content, "file_path": safe})
+        except OSError as e:
+            return resp("error", error=str(e))
+
+    elif action == "run_subprocess":
+        shell_cmd = cmd.get("command")
+        if not shell_cmd:
+            return resp("error", error="Missing command")
+        job_id = str(uuid.uuid4())
+        _daemon_jobs[job_id] = {"stdout": "", "stderr": "", "exit_code": None, "proc": None}
+        asyncio.create_task(_run_job(job_id, shell_cmd, workspace))
+        return resp("success", data={"job_id": job_id, "detached": True, "message": "Job started"})
+
+    elif action == "get_job_status":
+        job_id = cmd.get("job_id")
+        if not job_id or job_id not in _daemon_jobs:
+            return resp("error", error="Job not found")
+        job = _daemon_jobs[job_id]
+        done = job["exit_code"] is not None
+        return resp("completed" if done else "pending", data={
+            "job_id": job_id,
+            "stdout": job["stdout"],
+            "stderr": job["stderr"],
+            "exit_code": job["exit_code"],
+            "completed": done,
+        })
+
+    elif action == "terminate_job":
+        job_id = cmd.get("job_id")
+        if not job_id or job_id not in _daemon_jobs:
+            return resp("error", error="Job not found")
+        proc = _daemon_jobs[job_id].get("proc")
+        if proc and _daemon_jobs[job_id]["exit_code"] is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        return resp("success", data={"job_id": job_id, "terminated": True})
+
+    elif action == "list_files":
+        payload = cmd.get("payload") or {}
+        directory = cmd.get("directory") or payload.get("directory") or workspace
+        max_depth = cmd.get("max_depth") or payload.get("max_depth") or 10
+        include_hidden = cmd.get("include_hidden") or payload.get("include_hidden") or False
+        raw = directory if os.path.isabs(directory) else os.path.join(workspace, directory)
+        safe = _safe_resolve(raw, workspace)
+        if safe is None:
+            return resp("error", error="Directory not allowed")
+        if not os.path.isdir(safe):
+            return resp("error", error="Directory not found")
+        _EXCLUDED = {"venv", "node_modules", "env", ".venv"}
+        lines: list[str] = []
+        base_depth = safe.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(safe, topdown=True):
+            depth = dirpath.count(os.sep) - base_depth
+            if max_depth > 0 and depth >= max_depth:
+                dirnames.clear()
+                continue
+            if not include_hidden:
+                dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+                filenames = sorted(f for f in filenames if not f.startswith("."))
+            else:
+                dirnames.sort()
+                filenames = sorted(filenames)
+            for d in dirnames:
+                lines.append(f"{os.path.join(dirpath, d)}|d|0")
+            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED]
+            for fname in filenames:
+                fp = os.path.join(dirpath, fname)
+                try:
+                    lines.append(f"{fp}|f|{os.path.getsize(fp)}")
+                except OSError:
+                    pass
+        return resp("success", data={"stdout": "\n".join(lines), "file_count": len(lines), "directory": safe})
+
+    else:
+        return resp("error", error=f"Unknown action: {action}")
+
+
+async def _daemon_poll_loop() -> None:
+    """Background coroutine: poll the Neo backend for commands and execute them locally.
+
+    Runs inside the MCP server's asyncio event loop — no Node.js, no VS Code extension needed.
+    Generates a stable deployment UUID on first run; subsequent runs reuse it.
+    The deployment ID is written to ~/.neo/daemon/daemon.log so _discover_sandbox_id()
+    picks it up automatically for neo_submit_task.
+    """
+    deployment_id = _get_or_create_deployment_id()
+    _write_sandbox_log_entry(deployment_id)
+    workspace = _server_cwd
+
+    base_interval = 2.0
+    max_interval = 60.0
+    interval = base_interval
+    consecutive_errors = 0
+
+    async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=12.0) as client:
+        while True:
+            try:
+                r = await client.get(
+                    f"/v2/poll/{deployment_id}",
+                    headers=_headers(),
+                    params={"max_messages": 10, "wait_time": 5},
+                )
+                if r.status_code == 401:
+                    await asyncio.sleep(30)
+                    continue
+                if r.status_code == 404:
+                    # Deployment unknown to backend yet — backend learns about it on first submit
+                    await asyncio.sleep(30)
+                    continue
+                if r.status_code != 200:
+                    raise RuntimeError(f"HTTP {r.status_code}")
+
+                data = r.json()
+                commands: list[dict] = data if isinstance(data, list) else data.get("messages", [])
+
+                for cmd in commands:
+                    response = await _handle_daemon_command(cmd, workspace)
+                    try:
+                        await client.post(
+                            "/v2/poll/response",
+                            headers=_headers(),
+                            json=response,
+                            timeout=10.0,
+                        )
+                    except Exception:
+                        pass  # don't let a send failure stop the loop
+
+                consecutive_errors = 0
+                interval = base_interval
+                await asyncio.sleep(interval)
+
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                consecutive_errors += 1
+                interval = min(base_interval * (1.5 ** min(consecutive_errors, 6)), max_interval)
+                await asyncio.sleep(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +909,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 async def _run_stdio():
     _check_config()
+    asyncio.create_task(_daemon_poll_loop())
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
@@ -697,6 +966,7 @@ async def _run_http():
     config = uvicorn.Config(starlette_app, host=NEO_HTTP_HOST, port=NEO_HTTP_PORT, log_level="info")
     server = uvicorn.Server(config)
     print(f"Neo MCP HTTP server listening on {NEO_HTTP_HOST}:{NEO_HTTP_PORT}", flush=True)
+    asyncio.create_task(_daemon_poll_loop())
     await server.serve()
 
 

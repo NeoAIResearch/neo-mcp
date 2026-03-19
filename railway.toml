@@ -1,0 +1,18 @@
+[build]
+  builder = "dockerfile"
+  dockerfilePath = "Dockerfile"
+
+[deploy]
+  healthcheckPath = "/health"
+  healthcheckTimeout = 10
+  restartPolicyType = "on_failure"
+
+# Environment variables to set in the Railway dashboard:
+#   NEO_TRANSPORT = http
+#   NEO_HTTP_HOST = 0.0.0.0
+#
+# NEO_HTTP_PORT is read from Railway's injected PORT variable automatically.
+# NEO_API_KEY and NEO_SECRET_KEY are NOT needed server-side.
+# Keys are per-user — each MCP client passes them via request headers:
+#   x-access-key: ak-v1-...
+#   Authorization: Bearer sk-v1-...
