@@ -7,4 +7,4 @@ build/
 .env
 .claude/
 vscode_extension/
-.tmp/
+.tmp/demo-test/
