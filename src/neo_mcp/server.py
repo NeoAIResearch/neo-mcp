@@ -220,15 +220,22 @@ async def _poll_task_bg(thread_id: str) -> None:
     the latest status at any time without blocking. Also stores current_plan
     steps so neo_task_plan can return live progress without fetching messages.
 
-    Polling schedule: starts at 3 s, ramps up to 15 s max.
-    Does NOT stop on WAITING_FOR_FEEDBACK — keeps polling so status updates
-    after neo_send_feedback is called.
+    Adaptive polling schedule:
+    - Starts fast (3 s) to catch quick completions immediately.
+    - If status hasn't changed for 5 consecutive polls, doubles the delay
+      (status-stale backoff) up to a max of 60 s — avoids hammering the API
+      during long-running tasks.
+    - Any status change resets the delay back to 3 s so transitions are
+      caught quickly.
+    - WAITING_FOR_FEEDBACK resets to 5 s (user reply could come any time).
 
-    Max runtime: ~400 iterations × 15 s ≈ 100 minutes.
+    Max runtime: ~400 iterations (well over 100 min at max interval).
     """
     if thread_id not in _active_polls:
         _active_polls[thread_id] = {"status": "RUNNING", "messages": None, "capped": False, "plan": []}
     delay = 3.0
+    last_status = ""
+    same_status_streak = 0
 
     async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=30.0) as client:
         for _ in range(400):
@@ -236,16 +243,15 @@ async def _poll_task_bg(thread_id: str) -> None:
             try:
                 sr = await client.get(f"/v2/thread/status/{thread_id}", headers=_headers())
                 if sr.status_code != 200:
-                    delay = min(delay * 1.5, 15)
+                    delay = min(delay * 1.5, 60)
                     continue
                 data = sr.json()
                 status = data.get("status", "UNKNOWN")
             except Exception:
-                delay = min(delay * 1.5, 15)
+                delay = min(delay * 1.5, 60)
                 continue
 
             _active_polls[thread_id]["status"] = status
-            # Store plan steps for neo_task_plan
             if data.get("current_plan"):
                 _active_polls[thread_id]["plan"] = data["current_plan"]
 
@@ -259,11 +265,23 @@ async def _poll_task_bg(thread_id: str) -> None:
                 break
 
             if status == "WAITING_FOR_FEEDBACK":
+                # Reset fast — user reply could arrive any moment
                 delay = 5.0
+                same_status_streak = 0
+                last_status = status
                 continue
 
-            # RUNNING / PAUSED / unknown — ramp delay up to 15 s
-            delay = min(delay * 1.3, 15)
+            if status == last_status:
+                # Status unchanged — increment streak and back off if stale
+                same_status_streak += 1
+                if same_status_streak >= 5:
+                    delay = min(delay * 2, 60)
+            else:
+                # Status changed — snap back to fast polling
+                delay = 3.0
+                same_status_streak = 0
+
+            last_status = status
 
 
 async def _reconnect_inflight_task() -> None:
