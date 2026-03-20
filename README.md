@@ -15,7 +15,20 @@ The setup wizard detects your editors, prompts for your Neo secret key, and writ
 
 ---
 
-## No-install option — hosted endpoint
+## Web connector — Claude.ai & ChatGPT (no install)
+
+Connect Neo directly from **claude.ai** or **chatgpt.com** with no installation:
+
+1. Open **Settings → Integrations** (Claude.ai) or **Settings → Connectors** (ChatGPT)
+2. Add connector URL: `https://mcp.heyneo.so/mcp`
+3. Complete the OAuth flow — enter your `sk-v1-...` key when prompted
+
+Neo tools appear instantly in every conversation. See [docs/CONNECTORS.md](docs/CONNECTORS.md) for
+a full walkthrough and troubleshooting guide.
+
+---
+
+## No-install option — hosted endpoint (CLI editors)
 
 Point any MCP client directly at the hosted server:
 

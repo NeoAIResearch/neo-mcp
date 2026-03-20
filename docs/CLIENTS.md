@@ -12,6 +12,26 @@ Manual steps are documented below for reference.
 
 ---
 
+## Claude.ai Web (no install)
+
+1. Settings → **Integrations** → Add custom connector
+2. URL: `https://mcp.heyneo.so/mcp`
+3. Complete the OAuth flow — enter your `sk-v1-...` key when prompted
+
+Full walkthrough: [docs/CONNECTORS.md](CONNECTORS.md)
+
+---
+
+## ChatGPT Web (no install)
+
+1. Settings → **Connectors** → Add connector → Custom
+2. URL: `https://mcp.heyneo.so/mcp`
+3. Complete the OAuth flow — enter your `sk-v1-...` key when prompted
+
+Full walkthrough: [docs/CONNECTORS.md](CONNECTORS.md)
+
+---
+
 ## Claude Code
 
 ### Remote (no local install)
@@ -251,15 +271,17 @@ Config file: `~/.codex/config.json`
 
 ## Summary — transport support per editor
 
-| Editor | Local stdio | Remote HTTP |
-|---|---|---|
-| Claude Code | ✅ | ✅ native |
-| Cursor | ✅ | ✅ native |
-| Windsurf | ✅ | ✅ native |
-| Zed | ✅ | ✅ via `mcp-remote` proxy |
-| VS Code Copilot | ✅ | ✅ native (v1.99+) |
-| Continue.dev | ✅ | ⚠️ stdio only for now |
-| OpenAI Codex CLI | ✅ | ❌ stdio only |
+| Editor | Local stdio | Remote HTTP | Web OAuth |
+|---|---|---|---|
+| Claude.ai Web | — | — | ✅ built-in |
+| ChatGPT Web | — | — | ✅ built-in |
+| Claude Code | ✅ | ✅ native | — |
+| Cursor | ✅ | ✅ native | — |
+| Windsurf | ✅ | ✅ native | — |
+| Zed | ✅ | ✅ via `mcp-remote` proxy | — |
+| VS Code Copilot | ✅ | ✅ native (v1.99+) | — |
+| Continue.dev | ✅ | ⚠️ stdio only for now | — |
+| OpenAI Codex CLI | ✅ | ❌ stdio only | — |
 
 ---
 
