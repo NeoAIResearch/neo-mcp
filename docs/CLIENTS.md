@@ -7,17 +7,16 @@ pip install neo-mcp
 neo-mcp setup
 ```
 
-The wizard auto-detects installed editors, prompts for your keys, and writes all configs.
+The wizard auto-detects installed editors, prompts for your secret key, and writes all configs.
 Manual steps are documented below for reference.
 
 ---
 
 ## Claude Code
 
-### Remote (recommended — no local install)
+### Remote (no local install)
 ```bash
 claude mcp add --transport http neo https://mcp.heyneo.so/mcp \
-  --header "x-access-key: YOUR_NEO_API_KEY" \
   --header "Authorization: Bearer YOUR_NEO_SECRET_KEY"
 ```
 
@@ -25,15 +24,15 @@ claude mcp add --transport http neo https://mcp.heyneo.so/mcp \
 ```bash
 pip install neo-mcp
 claude mcp add --scope user neo \
-  -e NEO_API_KEY=ak-v1-... -e NEO_SECRET_KEY=sk-v1-... \
+  -e NEO_SECRET_KEY=sk-v1-... \
   -- neo-mcp
 ```
 
 ### Local — Docker
 ```bash
 claude mcp add --scope user neo \
-  -e NEO_API_KEY=ak-v1-... -e NEO_SECRET_KEY=sk-v1-... \
-  -- docker run -i --rm -e NEO_API_KEY -e NEO_SECRET_KEY \
+  -e NEO_SECRET_KEY=sk-v1-... \
+  -- docker run -i --rm -e NEO_SECRET_KEY \
      ghcr.io/heyneo/neo-mcp-server
 ```
 
@@ -51,7 +50,6 @@ Config file: `~/.cursor/mcp.json`
     "neo": {
       "url": "https://mcp.heyneo.so/mcp",
       "headers": {
-        "x-access-key": "YOUR_NEO_API_KEY",
         "Authorization": "Bearer YOUR_NEO_SECRET_KEY"
       }
     }
@@ -66,7 +64,6 @@ Config file: `~/.cursor/mcp.json`
     "neo": {
       "command": "neo-mcp",
       "env": {
-        "NEO_API_KEY": "ak-v1-...",
         "NEO_SECRET_KEY": "sk-v1-..."
       }
     }
@@ -82,12 +79,10 @@ Config file: `~/.cursor/mcp.json`
       "command": "docker",
       "args": [
         "run", "-i", "--rm",
-        "-e", "NEO_API_KEY",
         "-e", "NEO_SECRET_KEY",
         "ghcr.io/heyneo/neo-mcp-server"
       ],
       "env": {
-        "NEO_API_KEY": "ak-v1-...",
         "NEO_SECRET_KEY": "sk-v1-..."
       }
     }
@@ -108,7 +103,6 @@ Config file: `~/.codeium/windsurf/mcp_config.json`
     "neo": {
       "serverUrl": "https://mcp.heyneo.so/mcp",
       "headers": {
-        "x-access-key": "YOUR_NEO_API_KEY",
         "Authorization": "Bearer YOUR_NEO_SECRET_KEY"
       }
     }
@@ -123,7 +117,6 @@ Config file: `~/.codeium/windsurf/mcp_config.json`
     "neo": {
       "command": "neo-mcp",
       "env": {
-        "NEO_API_KEY": "ak-v1-...",
         "NEO_SECRET_KEY": "sk-v1-..."
       }
     }
@@ -148,7 +141,6 @@ Config file: `~/.config/zed/settings.json` — add under the `"context_servers"`
         "args": [
           "-y", "mcp-remote",
           "https://mcp.heyneo.so/mcp",
-          "--header", "x-access-key:YOUR_NEO_API_KEY",
           "--header", "Authorization:Bearer YOUR_NEO_SECRET_KEY"
         ]
       }
@@ -169,7 +161,6 @@ Config file: `~/.config/zed/settings.json` — add under the `"context_servers"`
         "path": "neo-mcp",
         "args": [],
         "env": {
-          "NEO_API_KEY": "ak-v1-...",
           "NEO_SECRET_KEY": "sk-v1-..."
         }
       }
@@ -194,7 +185,6 @@ Workspace config `.vscode/mcp.json`:
       "type": "http",
       "url": "https://mcp.heyneo.so/mcp",
       "headers": {
-        "x-access-key": "YOUR_NEO_API_KEY",
         "Authorization": "Bearer YOUR_NEO_SECRET_KEY"
       }
     }
@@ -210,7 +200,6 @@ Workspace config `.vscode/mcp.json`:
       "type": "stdio",
       "command": "neo-mcp",
       "env": {
-        "NEO_API_KEY": "ak-v1-...",
         "NEO_SECRET_KEY": "sk-v1-..."
       }
     }
@@ -231,7 +220,6 @@ Config file: `~/.continue/config.json` — add under `"mcpServers"`:
         "type": "stdio",
         "command": "neo-mcp",
         "env": {
-          "NEO_API_KEY": "ak-v1-...",
           "NEO_SECRET_KEY": "sk-v1-..."
         }
       }
@@ -252,7 +240,6 @@ Config file: `~/.codex/config.json`
     "neo": {
       "command": "neo-mcp",
       "env": {
-        "NEO_API_KEY": "ak-v1-...",
         "NEO_SECRET_KEY": "sk-v1-..."
       }
     }
@@ -262,9 +249,9 @@ Config file: `~/.codex/config.json`
 
 ---
 
-## Summary — transport support per tool
+## Summary — transport support per editor
 
-| Tool | Local stdio | Remote HTTP |
+| Editor | Local stdio | Remote HTTP |
 |---|---|---|
 | Claude Code | ✅ | ✅ native |
 | Cursor | ✅ | ✅ native |
@@ -278,6 +265,5 @@ Config file: `~/.codex/config.json`
 
 ## Where are the keys?
 
-Get your Neo API keys from the **Neo dashboard**:
-- `NEO_API_KEY` → access key (starts with `ak-v1-`)
-- `NEO_SECRET_KEY` → secret key (starts with `sk-v1-`)
+Get your Neo secret key from the **Neo dashboard**:
+- `NEO_SECRET_KEY` — secret key (starts with `sk-v1-`)

@@ -3,7 +3,6 @@ import contextvars
 import json
 import os
 import re
-import uuid
 
 import httpx
 from mcp.server import Server
@@ -12,8 +11,8 @@ from mcp.types import Tool, TextContent
 from mcp import types
 
 NEO_API_URL = os.environ.get("NEO_API_URL", "https://master.heyneo.so")
-NEO_API_KEY = os.environ.get("NEO_API_KEY", "")      # access key (ak-v1-...)
-NEO_SECRET_KEY = os.environ.get("NEO_SECRET_KEY", "") # secret key (sk-v1-...)
+NEO_API_KEY = os.environ.get("NEO_API_KEY", "")      # access key (optional, legacy)
+NEO_SECRET_KEY = os.environ.get("NEO_SECRET_KEY", "") # secret key (sk-v1-...) — sole auth token
 NEO_READ_ONLY = os.environ.get("NEO_READ_ONLY", "").lower() == "true"
 NEO_DEPLOYMENT_ID = os.environ.get("NEO_DEPLOYMENT_ID", "")  # optional, override auto-discovered sandbox ID
 NEO_WORKSPACE_DIR = os.environ.get("NEO_WORKSPACE_DIR", "")  # optional, override CWD (useful in Docker)
@@ -70,37 +69,36 @@ def _resolve_thread_id(arguments: dict) -> tuple[str, bool]:
 # ---------------------------------------------------------------------------
 
 def _discover_sandbox_id() -> str:
-    """Try multiple sources to find the active Neo sandbox/deployment ID.
+    """Find the active deployment ID from the VS Code/Cursor extension daemon.
 
-    Priority:
-    1. daemon.log  — most recent sandboxId (works when VS Code / Cursor extension is running)
-    2. thread-workspaces.json — match current working directory to a sandbox ID
-    Returns empty string if nothing found.
+    Sources (in priority order):
+    1. daemon.log — sandboxId entries written by the extension
+    2. thread-workspaces.json — sandbox-to-workspace mapping
     """
     cwd = os.getcwd()
 
-    # 1. daemon log — works for VS Code and Cursor Neo extensions
     for log_name in ("daemon.log", "daemon.log.1"):
         log_path = os.path.expanduser(f"~/.neo/daemon/{log_name}")
         try:
             with open(log_path, "r", errors="ignore") as f:
-                content = f.read()
-            matches = re.findall(r'"sandboxId"\s*:\s*"([a-f0-9\-]{36})"', content)
-            if matches:
-                return matches[-1]
+                lines = f.readlines()
+            best = ""
+            for line in lines:
+                m = re.search(r'"sandboxId"\s*:\s*"([a-f0-9\-]{36})"', line)
+                if m:
+                    best = m.group(1)
+            if best:
+                return best
         except OSError:
             pass
 
-    # 2. thread-workspaces.json — maps sandbox IDs to workspace paths
     ws_path = os.path.expanduser("~/.neo/daemon/thread-workspaces.json")
     try:
         with open(ws_path, "r", errors="ignore") as f:
             workspaces: dict = json.load(f)
-        # Prefer exact CWD match, then parent match
         for sandbox_id, ws_dir in reversed(list(workspaces.items())):
             if cwd == ws_dir or cwd.startswith(ws_dir.rstrip("/") + "/"):
                 return sandbox_id
-        # Fallback: return the most recent entry
         if workspaces:
             return list(workspaces.keys())[-1]
     except (OSError, ValueError):
@@ -110,8 +108,7 @@ def _discover_sandbox_id() -> str:
 
 
 def _get_deployment_id() -> str:
-    """Return deployment ID — re-discovers each call so extensions that start
-    after the MCP server are picked up automatically."""
+    """Return deployment ID: env var override → extension's active daemon ID."""
     return NEO_DEPLOYMENT_ID or _discover_sandbox_id()
 
 
@@ -122,8 +119,6 @@ _server_cwd = NEO_WORKSPACE_DIR or os.getcwd()
 def _check_config():
     # In HTTP mode, keys can be supplied per-request via headers — env vars are optional
     if NEO_TRANSPORT == "stdio":
-        if not NEO_API_KEY:
-            raise ValueError("NEO_API_KEY environment variable is required but not set.")
         if not NEO_SECRET_KEY:
             raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
 
@@ -154,7 +149,7 @@ app = Server(
 def handle_error(status_code: int) -> str:
     messages = {
         400: "No available deployment. The built-in daemon may still be starting — retry in a few seconds.",
-        401: "Invalid API key. Check your NEO_API_KEY configuration.",
+        401: "Invalid API key. Check your NEO_SECRET_KEY configuration.",
         402: "Your Neo account has insufficient credits.",
         403: "Your Neo trial or quota has ended.",
         404: "Thread or user not found.",
@@ -173,12 +168,10 @@ _ctx_secret_key: contextvars.ContextVar[str] = contextvars.ContextVar("secret_ke
 
 
 def _headers() -> dict:
-    """Build Neo auth headers. Per-request context vars take priority over env vars."""
-    api_key = _ctx_api_key.get() or NEO_API_KEY
+    """Build Neo auth headers. Secret key as sole Bearer token."""
     secret_key = _ctx_secret_key.get() or NEO_SECRET_KEY
     return {
         "Authorization": f"Bearer {secret_key}",
-        "x-access-key": api_key,
     }
 
 
@@ -224,15 +217,17 @@ async def _poll_task_bg(thread_id: str) -> None:
     """Background asyncio task that keeps polling until a terminal state.
 
     Updates _active_polls[thread_id] in place so other tool calls can read
-    the latest status at any time without blocking.
+    the latest status at any time without blocking. Also stores current_plan
+    steps so neo_task_plan can return live progress without fetching messages.
 
     Polling schedule: starts at 3 s, ramps up to 15 s max.
-    Does NOT stop on WAITING_FOR_FEEDBACK — it keeps polling so the task
-    auto-resumes (and status updates) after neo_send_feedback is called.
+    Does NOT stop on WAITING_FOR_FEEDBACK — keeps polling so status updates
+    after neo_send_feedback is called.
 
     Max runtime: ~400 iterations × 15 s ≈ 100 minutes.
     """
-    _active_polls[thread_id] = {"status": "RUNNING", "messages": None, "capped": False}
+    if thread_id not in _active_polls:
+        _active_polls[thread_id] = {"status": "RUNNING", "messages": None, "capped": False, "plan": []}
     delay = 3.0
 
     async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=30.0) as client:
@@ -243,12 +238,16 @@ async def _poll_task_bg(thread_id: str) -> None:
                 if sr.status_code != 200:
                     delay = min(delay * 1.5, 15)
                     continue
-                status = sr.json().get("status", "UNKNOWN")
+                data = sr.json()
+                status = data.get("status", "UNKNOWN")
             except Exception:
                 delay = min(delay * 1.5, 15)
                 continue
 
             _active_polls[thread_id]["status"] = status
+            # Store plan steps for neo_task_plan
+            if data.get("current_plan"):
+                _active_polls[thread_id]["plan"] = data["current_plan"]
 
             if status == "COMPLETED":
                 msgs, capped = await _fetch_messages_pages(client, thread_id)
@@ -260,8 +259,6 @@ async def _poll_task_bg(thread_id: str) -> None:
                 break
 
             if status == "WAITING_FOR_FEEDBACK":
-                # Keep polling — will naturally catch the transition back to RUNNING
-                # once the user sends feedback via neo_send_feedback.
                 delay = 5.0
                 continue
 
@@ -269,272 +266,29 @@ async def _poll_task_bg(thread_id: str) -> None:
             delay = min(delay * 1.3, 15)
 
 
-# ---------------------------------------------------------------------------
-# Built-in daemon — polls backend and executes commands locally
-# Eliminates the VS Code extension requirement: the MCP server IS the daemon.
-# ---------------------------------------------------------------------------
+async def _reconnect_inflight_task() -> None:
+    """On server startup, re-attach background poller to any in-flight thread.
 
-_STANDALONE_ID_FILE = os.path.expanduser("~/.neo/daemon/standalone_deployment_id")
-
-# Active subprocess jobs: { job_id: {"stdout": str, "stderr": str, "exit_code": int|None, "proc": Process|None} }
-_daemon_jobs: dict[str, dict] = {}
-
-
-def _get_or_create_deployment_id() -> str:
-    """Load a stable deployment UUID or generate one on first run."""
+    Reads the last saved thread_id and checks its status. If still active
+    (RUNNING / PAUSED / WAITING_FOR_FEEDBACK), re-starts _poll_task_bg so
+    neo_task_status returns live state without the user re-submitting.
+    """
+    thread_id = _load_thread_id()
+    if not thread_id:
+        return
     try:
-        os.makedirs(os.path.dirname(_STANDALONE_ID_FILE), exist_ok=True)
-        if os.path.exists(_STANDALONE_ID_FILE):
-            uid = open(_STANDALONE_ID_FILE).read().strip()
-            if uid:
-                return uid
-        uid = str(uuid.uuid4())
-        with open(_STANDALONE_ID_FILE, "w") as f:
-            f.write(uid)
-        return uid
-    except OSError:
-        return str(uuid.uuid4())
-
-
-def _write_sandbox_log_entry(deployment_id: str) -> None:
-    """Append sandboxId entry so _discover_sandbox_id() auto-detects it."""
-    log_path = os.path.expanduser("~/.neo/daemon/daemon.log")
-    try:
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        with open(log_path, "a") as f:
-            f.write(json.dumps({"sandboxId": deployment_id, "source": "python-daemon"}) + "\n")
-    except OSError:
+        async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=10.0) as client:
+            sr = await client.get(f"/v2/thread/status/{thread_id}", headers=_headers())
+            if sr.status_code != 200:
+                return
+            status = sr.json().get("status", "")
+            if status in ("RUNNING", "PAUSED", "WAITING_FOR_FEEDBACK"):
+                _active_polls[thread_id] = {"status": status, "messages": None, "capped": False, "plan": sr.json().get("current_plan", [])}
+                asyncio.create_task(_poll_task_bg(thread_id))
+    except Exception:
         pass
 
 
-def _safe_resolve(path_str: str, workspace: str) -> str | None:
-    """Return realpath if within workspace or /tmp, else None."""
-    if os.path.isabs(path_str):
-        resolved = os.path.realpath(path_str)
-    else:
-        resolved = os.path.realpath(os.path.join(workspace, path_str))
-    norm_ws = os.path.realpath(workspace)
-    if resolved == norm_ws or resolved.startswith(norm_ws + os.sep):
-        return resolved
-    if resolved == "/tmp" or resolved.startswith("/tmp/"):
-        return resolved
-    return None
-
-
-async def _run_job(job_id: str, shell_cmd: str, workspace: str) -> None:
-    """Run a shell command and capture output into _daemon_jobs."""
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            shell_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=workspace,
-        )
-        _daemon_jobs[job_id]["proc"] = proc
-        out, err = await proc.communicate()
-        _daemon_jobs[job_id]["stdout"] = out.decode(errors="replace")
-        _daemon_jobs[job_id]["stderr"] = err.decode(errors="replace")
-        _daemon_jobs[job_id]["exit_code"] = proc.returncode
-    except Exception as exc:
-        _daemon_jobs[job_id]["stderr"] = str(exc)
-        _daemon_jobs[job_id]["exit_code"] = 1
-
-
-async def _handle_daemon_command(cmd: dict, workspace: str) -> dict:
-    """Route one backend command and return the response payload."""
-    action = cmd.get("action", "")
-    request_id = cmd.get("request_id", "")
-    thread_id = cmd.get("thread_id")
-    deployment_id = cmd.get("deployment_id", "")
-
-    def resp(status: str, **kw) -> dict:
-        r: dict = {"request_id": request_id, "sandbox_id": deployment_id, "status": status}
-        if thread_id:
-            r["thread_id"] = thread_id
-        rqn = cmd.get("response_queue_name")
-        if rqn:
-            r["response_queue_name"] = rqn
-        r.update(kw)
-        return r
-
-    if action == "create_session":
-        sid = (cmd.get("payload") or {}).get("session_id") or cmd.get("session_id")
-        if not sid:
-            return resp("error", error="Missing session_id")
-        return resp("success", data={"coding_session_id": sid})
-
-    elif action == "write_code":
-        filename = cmd.get("filename")
-        code = cmd.get("code")
-        workdir = cmd.get("workdir", "")
-        if not filename or code is None:
-            return resp("error", error="Missing filename or code")
-        base = os.path.join(workspace, workdir) if workdir else workspace
-        raw = filename if os.path.isabs(filename) else os.path.join(base, filename)
-        safe = _safe_resolve(raw, workspace)
-        if safe is None:
-            return resp("error", error="Path outside workspace/tmp not allowed")
-        try:
-            os.makedirs(os.path.dirname(safe), exist_ok=True)
-            with open(safe, "w") as f:
-                f.write(code)
-            return resp("success", data={"file_path": safe, "workdir": workdir})
-        except OSError as e:
-            return resp("error", error=str(e))
-
-    elif action == "get_file":
-        file_path = cmd.get("file_path")
-        if not file_path:
-            return resp("error", error="Missing file_path")
-        raw = file_path if os.path.isabs(file_path) else os.path.join(workspace, file_path)
-        safe = _safe_resolve(raw, workspace)
-        if safe is None:
-            return resp("error", error="Path not allowed")
-        if not os.path.isfile(safe):
-            return resp("error", error="File not found")
-        try:
-            with open(safe) as f:
-                content = f.read()
-            return resp("success", data={"file_content": content, "file_path": safe})
-        except OSError as e:
-            return resp("error", error=str(e))
-
-    elif action == "run_subprocess":
-        shell_cmd = cmd.get("command")
-        if not shell_cmd:
-            return resp("error", error="Missing command")
-        job_id = str(uuid.uuid4())
-        _daemon_jobs[job_id] = {"stdout": "", "stderr": "", "exit_code": None, "proc": None}
-        asyncio.create_task(_run_job(job_id, shell_cmd, workspace))
-        return resp("success", data={"job_id": job_id, "detached": True, "message": "Job started"})
-
-    elif action == "get_job_status":
-        job_id = cmd.get("job_id")
-        if not job_id or job_id not in _daemon_jobs:
-            return resp("error", error="Job not found")
-        job = _daemon_jobs[job_id]
-        done = job["exit_code"] is not None
-        return resp("completed" if done else "pending", data={
-            "job_id": job_id,
-            "stdout": job["stdout"],
-            "stderr": job["stderr"],
-            "exit_code": job["exit_code"],
-            "completed": done,
-        })
-
-    elif action == "terminate_job":
-        job_id = cmd.get("job_id")
-        if not job_id or job_id not in _daemon_jobs:
-            return resp("error", error="Job not found")
-        proc = _daemon_jobs[job_id].get("proc")
-        if proc and _daemon_jobs[job_id]["exit_code"] is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        return resp("success", data={"job_id": job_id, "terminated": True})
-
-    elif action == "list_files":
-        payload = cmd.get("payload") or {}
-        directory = cmd.get("directory") or payload.get("directory") or workspace
-        max_depth = cmd.get("max_depth") or payload.get("max_depth") or 10
-        include_hidden = cmd.get("include_hidden") or payload.get("include_hidden") or False
-        raw = directory if os.path.isabs(directory) else os.path.join(workspace, directory)
-        safe = _safe_resolve(raw, workspace)
-        if safe is None:
-            return resp("error", error="Directory not allowed")
-        if not os.path.isdir(safe):
-            return resp("error", error="Directory not found")
-        _EXCLUDED = {"venv", "node_modules", "env", ".venv"}
-        lines: list[str] = []
-        base_depth = safe.rstrip(os.sep).count(os.sep)
-        for dirpath, dirnames, filenames in os.walk(safe, topdown=True):
-            depth = dirpath.count(os.sep) - base_depth
-            if max_depth > 0 and depth >= max_depth:
-                dirnames.clear()
-                continue
-            if not include_hidden:
-                dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
-                filenames = sorted(f for f in filenames if not f.startswith("."))
-            else:
-                dirnames.sort()
-                filenames = sorted(filenames)
-            for d in dirnames:
-                lines.append(f"{os.path.join(dirpath, d)}|d|0")
-            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED]
-            for fname in filenames:
-                fp = os.path.join(dirpath, fname)
-                try:
-                    lines.append(f"{fp}|f|{os.path.getsize(fp)}")
-                except OSError:
-                    pass
-        return resp("success", data={"stdout": "\n".join(lines), "file_count": len(lines), "directory": safe})
-
-    else:
-        return resp("error", error=f"Unknown action: {action}")
-
-
-async def _daemon_poll_loop() -> None:
-    """Background coroutine: poll the Neo backend for commands and execute them locally.
-
-    Runs inside the MCP server's asyncio event loop — no Node.js, no VS Code extension needed.
-    Generates a stable deployment UUID on first run; subsequent runs reuse it.
-    The deployment ID is written to ~/.neo/daemon/daemon.log so _discover_sandbox_id()
-    picks it up automatically for neo_submit_task.
-    """
-    deployment_id = _get_or_create_deployment_id()
-    _write_sandbox_log_entry(deployment_id)
-    workspace = _server_cwd
-
-    base_interval = 2.0
-    max_interval = 60.0
-    interval = base_interval
-    consecutive_errors = 0
-
-    async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=12.0) as client:
-        while True:
-            try:
-                r = await client.get(
-                    f"/v2/poll/{deployment_id}",
-                    headers=_headers(),
-                    params={"max_messages": 10, "wait_time": 5},
-                )
-                if r.status_code == 401:
-                    await asyncio.sleep(30)
-                    continue
-                if r.status_code == 404:
-                    # Deployment not yet known to backend — poll frequently so it becomes
-                    # available quickly once the first task is submitted with this ID.
-                    await asyncio.sleep(2)
-                    continue
-                if r.status_code != 200:
-                    raise RuntimeError(f"HTTP {r.status_code}")
-
-                data = r.json()
-                commands: list[dict] = data if isinstance(data, list) else data.get("messages", [])
-
-                for cmd in commands:
-                    response = await _handle_daemon_command(cmd, workspace)
-                    try:
-                        await client.post(
-                            "/v2/poll/response",
-                            headers=_headers(),
-                            json=response,
-                            timeout=10.0,
-                        )
-                    except Exception:
-                        pass  # don't let a send failure stop the loop
-
-                consecutive_errors = 0
-                interval = base_interval
-                await asyncio.sleep(interval)
-
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                consecutive_errors += 1
-                interval = min(base_interval * (1.5 ** min(consecutive_errors, 6)), max_interval)
-                await asyncio.sleep(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +312,25 @@ async def list_tools() -> list[Tool]:
                     "thread_id": {
                         "type": "string",
                         "description": "Thread ID from neo_submit_task. Omit to use the last active thread.",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="neo_task_plan",
+            description=(
+                "Show Neo's current execution plan for a task — the step-by-step breakdown of what "
+                "it is doing or has done, with per-step status (PENDING / RUNNING / COMPLETED / FAILED) "
+                "and result summaries. Call this while a task is RUNNING to see live progress without "
+                "fetching full messages. Much cheaper than neo_get_messages for status checks."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread ID to inspect. Omit to use the last active thread.",
                     },
                 },
                 "required": [],
@@ -603,6 +376,17 @@ async def list_tools() -> list[Tool]:
                     "auto_mode": {
                         "type": "boolean",
                         "description": "Whether to run in auto mode (default: false).",
+                        "default": False,
+                    },
+                    "wait_for_completion": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, block until the task completes and return the full output directly "
+                            "instead of returning immediately with a thread_id. "
+                            "Best for quick tasks (< 3 min) where you need the result right away. "
+                            "For longer tasks or tasks that run code/scripts, leave false and track "
+                            "progress with neo_task_plan / neo_task_status. Default: false."
+                        ),
                         "default": False,
                     },
                 },
@@ -692,30 +476,28 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # neo_submit_task — fire-and-forget; polling runs in background       #
         # ------------------------------------------------------------------ #
         if name == "neo_submit_task":
-            # If the daemon hasn't written its ID yet (race on first startup), wait up to 5 s.
             deployment_id = _get_deployment_id()
-            if not deployment_id:
-                for _ in range(10):
-                    await asyncio.sleep(0.5)
-                    deployment_id = _get_deployment_id()
-                    if deployment_id:
-                        break
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
+            wait = arguments.get("wait_for_completion", False)
             message = f"Working directory: {_server_cwd}\n\nCreate all files inside this directory.\n\n{description}"
+
+            # Always submit in vscode mode — routes execution to the local daemon
+            submit_body: dict = {
+                "message": message,
+                "deployment_type": "vscode",
+                "auto_mode": auto_mode,
+            }
+            if deployment_id:
+                submit_body["deployment_id"] = deployment_id
 
             resp = await client.post(
                 "/v2/thread/init-chat-direct",
                 headers=_headers(),
-                json={
-                    "message": message,
-                    "deployment_type": "vscode",
-                    "auto_mode": auto_mode,
-                    **({"deployment_id": deployment_id} if deployment_id else {}),
-                },
+                json=submit_body,
             )
+
             if resp.status_code != 200:
-                # Include actual backend response body to aid debugging
                 try:
                     detail = resp.json().get("detail") or resp.json().get("error") or resp.text
                 except Exception:
@@ -735,22 +517,54 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if not thread_id:
                 return [TextContent(type="text", text=(
                     f"Backend returned 200 but no thread_id found in response.\n"
-                    f"Response: {data}\n"
-                    f"deployment_id used: {deployment_id or '(none)'}"
+                    f"Response: {data}"
                 ))]
 
             _save_thread_id(thread_id)
-
-            # Start background poller — does not block this response
             asyncio.create_task(_poll_task_bg(thread_id))
 
+            if not wait:
+                return [TextContent(type="text", text=(
+                    f"Task submitted. thread_id: {thread_id}\n\n"
+                    "Polling is running in the background.\n"
+                    "• neo_task_plan   — see live step-by-step progress\n"
+                    "• neo_task_status — check overall status\n"
+                    "• neo_send_feedback — reply if it asks a question\n"
+                    "• neo_pause_task / neo_stop_task — pause or cancel"
+                ))]
+
+            # wait_for_completion=true: block until terminal state, return output directly
+            deadline = 400  # ~100 min max
+            for _ in range(deadline):
+                await asyncio.sleep(3)
+                state = _active_polls.get(thread_id, {})
+                status = state.get("status", "RUNNING")
+
+                if status == "COMPLETED":
+                    msgs = state.get("messages") or []
+                    formatted = [f"[{m.get('sender','?').upper()}]\n{m.get('content','')}" for m in msgs]
+                    output = "\n---\n".join(formatted) or "Task completed with no messages."
+                    if state.get("capped"):
+                        output += "\n---\n[Output truncated at ~20 000 tokens.]"
+                    return [TextContent(type="text", text=f"COMPLETED. thread_id: {thread_id}\n\n{output}")]
+
+                if status == "TERMINATED":
+                    return [TextContent(type="text", text=f"Task TERMINATED. thread_id: {thread_id}")]
+
+                if status == "WAITING_FOR_FEEDBACK":
+                    # Return what we have so far; user must call neo_send_feedback
+                    msgs = state.get("messages") or []
+                    formatted = [f"[{m.get('sender','?').upper()}]\n{m.get('content','')}" for m in msgs]
+                    output = "\n---\n".join(formatted) or ""
+                    return [TextContent(type="text", text=(
+                        f"WAITING_FOR_FEEDBACK. thread_id: {thread_id}\n\n"
+                        f"{output}\n\n"
+                        "Neo has a question — call neo_send_feedback to reply."
+                    ))]
+
             return [TextContent(type="text", text=(
-                f"Task submitted. thread_id: {thread_id}\n\n"
-                "Polling is running in the background.\n"
-                "• neo_task_status — check progress at any time\n"
-                "• neo_pause_task  — pause while it's running\n"
-                "• neo_send_feedback — reply if it asks a question\n"
-                "• neo_stop_task   — cancel and clean up"
+                f"Task still running after timeout. thread_id: {thread_id}\n"
+                "Use neo_task_status / neo_task_plan to continue tracking."
             ))]
 
         # ------------------------------------------------------------------ #
@@ -822,6 +636,47 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=hints.get(status, f"Status: {status}. thread_id: {thread_id}{recovery_note}"))]
 
         # ------------------------------------------------------------------ #
+        # neo_task_plan — live step-by-step plan from current_plan field     #
+        # ------------------------------------------------------------------ #
+        elif name == "neo_task_plan":
+            thread_id, recovered = _resolve_thread_id(arguments)
+            if not thread_id:
+                return [TextContent(type="text", text="No thread_id provided and no active thread found. Submit a task first.")]
+
+            recovery_note = " (thread_id recovered from storage)" if recovered else ""
+
+            # Try in-memory cache first (updated every poll cycle)
+            state = _active_polls.get(thread_id, {})
+            plan = state.get("plan")
+            overall_status = state.get("status", "")
+
+            # If not cached, hit the API directly
+            if not plan:
+                resp = await client.get(f"/v2/thread/status/{thread_id}", headers=_headers())
+                if resp.status_code != 200:
+                    return [TextContent(type="text", text=handle_error(resp.status_code))]
+                body = resp.json()
+                plan = body.get("current_plan") or []
+                overall_status = body.get("status", "UNKNOWN")
+
+            if not plan:
+                return [TextContent(type="text", text=(
+                    f"No plan available yet. Status: {overall_status}. thread_id: {thread_id}{recovery_note}\n"
+                    "Neo may still be setting up — try again in a few seconds."
+                ))]
+
+            status_icons = {"COMPLETED": "✅", "RUNNING": "⏳", "FAILED": "❌", "PENDING": "⬜"}
+            lines = [f"Plan for thread {thread_id}{recovery_note} — overall: {overall_status}\n"]
+            for step in plan:
+                icon = status_icons.get(step.get("status", ""), "•")
+                lines.append(f"{icon} Step {step.get('id', '?')}: {step.get('description', '')}")
+                if step.get("result_summary"):
+                    lines.append(f"   → {step['result_summary']}")
+                for activity in step.get("current_activity", []):
+                    lines.append(f"   {activity}")
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        # ------------------------------------------------------------------ #
         # neo_get_messages — returns cached messages if poller already fetched #
         # ------------------------------------------------------------------ #
         elif name == "neo_get_messages":
@@ -838,7 +693,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # Fetch from API
                 msgs, capped = await _fetch_messages_pages(client, thread_id)
 
-            formatted = [f"[{m.get('role','?').upper()}]\n{m.get('content','')}" for m in msgs]
+            formatted = [f"[{(m.get('sender') or m.get('role','?')).upper()}]\n{m.get('content','')}" for m in msgs]
             output = "\n---\n".join(formatted)
             if capped:
                 output += "\n---\n[Output truncated at ~20 000 tokens. Full output available in VS Code.]"
@@ -932,7 +787,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 async def _run_stdio():
     _check_config()
-    asyncio.create_task(_daemon_poll_loop())
+    asyncio.create_task(_reconnect_inflight_task())
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
@@ -989,7 +844,7 @@ async def _run_http():
     config = uvicorn.Config(starlette_app, host=NEO_HTTP_HOST, port=NEO_HTTP_PORT, log_level="info")
     server = uvicorn.Server(config)
     print(f"Neo MCP HTTP server listening on {NEO_HTTP_HOST}:{NEO_HTTP_PORT}", flush=True)
-    asyncio.create_task(_daemon_poll_loop())
+    asyncio.create_task(_reconnect_inflight_task())
     await server.serve()
 
 
