@@ -4,9 +4,9 @@
 
 ## Prerequisites
 
-- Neo account with API keys — from the **Neo dashboard**
+- Neo account with a secret key (`sk-v1-...`) — from the **Neo dashboard**
 - MCP server registered in your editor (see `docs/CLIENTS.md`)
-- `NEO_API_KEY` and `NEO_SECRET_KEY` set in the MCP config
+- `NEO_SECRET_KEY` set in the MCP config
 
 ---
 
@@ -15,15 +15,32 @@
 ```
 You type a prompt
       ↓
-neo_submit_task   → submits task → returns thread_id immediately
-                    background polling starts automatically
+neo_submit_task   →  submits task  →  returns thread_id immediately
+                     background polling starts automatically
       ↓
-neo_task_status   → check progress at any time
+neo_task_plan     →  see live step-by-step progress (cheapest check)
       ↓
-   COMPLETED           → call neo_get_messages for full output
-   WAITING_FOR_FEEDBACK → call neo_send_feedback to reply, then re-check status
-   TERMINATED          → task failed or was stopped
+neo_task_status   →  check overall status at any time
+      ↓
+   COMPLETED            →  call neo_get_messages for full output
+   WAITING_FOR_FEEDBACK →  call neo_send_feedback to reply, re-check status
+   TERMINATED           →  task failed or was stopped
 ```
+
+---
+
+## Tools reference
+
+| Tool | When to use |
+|---|---|
+| `neo_submit_task` | Start a task. Use `wait_for_completion=true` for short tasks (< 3 min) to get output immediately. |
+| `neo_task_plan` | Check what Neo is doing right now — step statuses, result summaries, files created. Faster than fetching full messages. |
+| `neo_task_status` | Quick overall status check: RUNNING / COMPLETED / WAITING_FOR_FEEDBACK / PAUSED / TERMINATED. |
+| `neo_get_messages` | Full conversation output once COMPLETED. Caps at ~20 000 tokens. |
+| `neo_send_feedback` | Reply when Neo asks a question (WAITING_FOR_FEEDBACK). |
+| `neo_pause_task` | Pause execution mid-task. |
+| `neo_resume_task` | Resume a paused task. |
+| `neo_stop_task` | Cancel and clean up. |
 
 ---
 
@@ -34,6 +51,18 @@ neo_task_status   → check progress at any time
 Use Neo to build a churn prediction model on churn.csv, optimise for recall
 ```
 
+**Quick task — get result immediately**
+```
+Use Neo to create a sentiment analysis script for product reviews (wait for completion)
+```
+→ passes `wait_for_completion=true`, blocks until done, returns output directly
+
+**Check live progress**
+```
+What is Neo working on right now?
+```
+→ calls `neo_task_plan` — shows each step with ✅ / ⏳ / ❌ status
+
 **Data analysis**
 ```
 Use Neo to analyse dataset.csv and suggest the best ML approach
@@ -42,16 +71,6 @@ Use Neo to analyse dataset.csv and suggest the best ML approach
 **Feature engineering**
 ```
 Use Neo to engineer features from transactions.csv for a fraud detection model
-```
-
-**Check a running task**
-```
-Check the status of my Neo task
-```
-
-**Read completed output**
-```
-Show me what Neo built
 ```
 
 ---
@@ -85,23 +104,21 @@ Stop the Neo task and clean up
 
 ---
 
-## Available tools
+## Output truncation
 
-| Tool | Description |
-|---|---|
-| `neo_submit_task` | Submit an AI/ML task. Starts background polling. |
-| `neo_task_status` | Check current status. |
-| `neo_get_messages` | Read output (caps at ~20 000 tokens). |
-| `neo_send_feedback` | Send a reply when Neo is waiting. |
-| `neo_pause_task` | Pause a running task. |
-| `neo_resume_task` | Resume a paused task. |
-| `neo_stop_task` | Cancel and clean up. |
+`neo_get_messages` caps at ~80 000 characters (~20 000 tokens). For a concise summary while the task is running, use `neo_task_plan` instead — it shows step-by-step progress without fetching the full message history.
 
 ---
 
-## Output truncation
+## Workflow: recommended polling pattern
 
-`neo_get_messages` caps at ~80 000 characters (~20 000 tokens). If the output is cut off, ask for earlier messages to page back through the full output.
+For tasks that take a few minutes:
+1. `neo_submit_task` → get `thread_id`
+2. `neo_task_plan` → see what step Neo is on (repeat until COMPLETED)
+3. `neo_get_messages` → read the final output
+
+For short tasks (< 3 min):
+1. `neo_submit_task` with `wait_for_completion=true` → output returned directly
 
 ---
 
@@ -109,10 +126,10 @@ Stop the Neo task and clean up
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Invalid API key` (401) | Wrong keys | Re-check `NEO_API_KEY` and `NEO_SECRET_KEY` |
+| `Invalid API key` (401) | Wrong key | Re-check `NEO_SECRET_KEY` |
 | `Trial or quota ended` (403) | Out of credits | Top up at Neo dashboard |
-| Task submitted but no files appear locally | Using hosted endpoint (remote daemon) | Switch to local `pip install neo-mcp` (stdio mode) |
-| Task appears stuck | Long-running task | Use `neo_task_status` + `neo_get_messages` manually |
+| Task submitted but no files appear locally | VS Code/Cursor extension not running | Start the extension — it handles local file writes |
+| Status stuck on RUNNING | Step waiting for daemon response | Check `neo_task_plan` to see which step is blocked |
 | `neo-mcp` not found | Install incomplete | Re-run `pip install neo-mcp`, check PATH |
 
 ---
@@ -131,8 +148,7 @@ docker push ghcr.io/heyneo/neo-mcp-server:latest
 **Verify the image:**
 ```bash
 docker run -i --rm \
-  -e NEO_API_KEY=your-key \
-  -e NEO_SECRET_KEY=your-secret \
+  -e NEO_SECRET_KEY=sk-v1-... \
   ghcr.io/heyneo/neo-mcp-server:latest
 ```
 

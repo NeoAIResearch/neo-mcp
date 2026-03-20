@@ -11,7 +11,7 @@ pip install neo-mcp
 neo-mcp setup
 ```
 
-The setup wizard detects your editors, prompts for your Neo API keys, and writes all config files automatically.
+The setup wizard detects your editors, prompts for your Neo secret key, and writes all config files automatically.
 
 ---
 
@@ -22,21 +22,18 @@ Point any MCP client directly at the hosted server:
 | Field | Value |
 |---|---|
 | URL | `https://mcp.heyneo.so/mcp` |
-| Header | `x-access-key: ak-v1-...` |
 | Header | `Authorization: Bearer sk-v1-...` |
 
-Get your keys from the **Neo dashboard**.
-
-> **Note:** The hosted endpoint routes tasks to Neo's cloud backend. For local file access and subprocess execution, use the local `pip install` mode (stdio) so the built-in daemon runs on your machine.
+Get your key from the **Neo dashboard**.
 
 ---
 
 ## What you need
 
-- Neo account with API keys (`ak-v1-...` and `sk-v1-...`)
+- Neo account with a secret key (`sk-v1-...`)
 - Python 3.11+ **or** Docker
 
-No VS Code extension required.
+No VS Code extension required for task submission and tracking.
 
 ---
 
@@ -59,8 +56,10 @@ For general coding your assistant works locally — it only routes to Neo for AI
 ```
 You:       "Train a fraud detection model on fraud.csv"
 Assistant: Submitting to Neo…
-           Neo is working — preprocessing data, training XGBoost…
-           Done. AUC-ROC: 0.94. Model saved to fraud_model.pkl
+           ⏳ Step 1: Load and preprocess fraud.csv
+           ⏳ Step 2: Train XGBoost with cross-validation
+           ✅ Step 3: Evaluate — AUC-ROC: 0.94
+           Done. Model saved to fraud_model.pkl
 ```
 
 ---
@@ -69,9 +68,10 @@ Assistant: Submitting to Neo…
 
 | Tool | Description |
 |---|---|
-| `neo_submit_task` | Submit an AI/ML task. Returns a thread_id; background polling tracks progress. |
-| `neo_task_status` | Check task status: RUNNING, WAITING_FOR_FEEDBACK, PAUSED, COMPLETED, TERMINATED. |
-| `neo_get_messages` | Read the full output once the task is COMPLETED. |
+| `neo_submit_task` | Submit an AI/ML task. Returns a `thread_id`; background polling tracks progress. Supports `wait_for_completion=true` to block and return output directly for short tasks. |
+| `neo_task_plan` | Show Neo's live step-by-step execution plan with per-step status, result summaries, and file paths. Use while RUNNING instead of fetching full messages. |
+| `neo_task_status` | Check overall task status: RUNNING, WAITING_FOR_FEEDBACK, PAUSED, COMPLETED, TERMINATED. |
+| `neo_get_messages` | Read the full conversation output once the task is COMPLETED. |
 | `neo_send_feedback` | Reply to Neo when it asks a question (WAITING_FOR_FEEDBACK). |
 | `neo_pause_task` | Pause a running task. |
 | `neo_resume_task` | Resume a paused task. |
@@ -79,17 +79,37 @@ Assistant: Submitting to Neo…
 
 ---
 
+## How it works
+
+```
+neo_submit_task
+      │
+      ├─ POST /v2/thread/init-chat-direct  →  thread_id
+      │         (deployment_type: vscode)
+      │
+      └─ background poller starts
+              │
+              ├── GET /v2/thread/status/{thread_id}   (every 3–15 s)
+              │         stores status + plan steps in memory
+              │
+              └── GET /v2/thread/thread-messages      (on COMPLETED)
+                        cached for neo_get_messages
+```
+
+All polling uses `thread_id` — works with `NEO_SECRET_KEY` auth only. No OAuth required.
+
+---
+
 ## Manual registration (Claude Code)
 
 ```bash
-# Local — pip (recommended for full functionality)
+# Local — pip (recommended)
 claude mcp add --scope user neo \
-  -e NEO_API_KEY=ak-v1-... -e NEO_SECRET_KEY=sk-v1-... \
+  -e NEO_SECRET_KEY=sk-v1-... \
   -- neo-mcp
 
 # Remote — hosted endpoint (no local install)
 claude mcp add --transport http neo https://mcp.heyneo.so/mcp \
-  --header "x-access-key: ak-v1-..." \
   --header "Authorization: Bearer sk-v1-..."
 ```
 
@@ -101,9 +121,10 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for all editors.
 
 | Variable | Required | Description |
 |---|---|---|
-| `NEO_API_KEY` | Yes | Access key (`ak-v1-...`) |
-| `NEO_SECRET_KEY` | Yes | Secret key (`sk-v1-...`) |
-| `NEO_READ_ONLY` | No | `true` = expose only status/message tools |
+| `NEO_SECRET_KEY` | **Yes** | Secret key (`sk-v1-...`) — sole auth token |
+| `NEO_API_KEY` | No | Legacy access key, not used for auth |
+| `NEO_DEPLOYMENT_ID` | No | Pin a specific VS Code extension deployment ID |
+| `NEO_READ_ONLY` | No | `true` = expose only status/plan/message tools |
 | `NEO_WORKSPACE_DIR` | No | Override working directory (useful in Docker) |
 
 ---
@@ -112,8 +133,9 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for all editors.
 
 | Symptom | Fix |
 |---|---|
-| `Invalid API key` (401) | Re-check `NEO_API_KEY` and `NEO_SECRET_KEY` |
+| `Invalid API key` (401) | Re-check `NEO_SECRET_KEY` |
 | `Trial or quota ended` (403) | Top up at Neo dashboard |
-| Task submitted but no files written locally | Use local stdio mode (`pip install neo-mcp`), not the hosted endpoint |
+| Task submitted but no files written locally | Requires VS Code/Cursor extension running locally with an active daemon |
 | `neo-mcp` command not found | Re-run `pip install neo-mcp` and check your PATH |
-| Output truncated | Cap is ~20 000 tokens — ask for earlier messages to page back |
+| Output truncated | Cap is ~20 000 tokens — use `neo_task_plan` for a concise summary |
+| Status stuck on RUNNING | Call `neo_task_plan` to see which step is blocked |

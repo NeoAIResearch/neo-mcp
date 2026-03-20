@@ -7,4 +7,7 @@ build/
 .env
 .claude/
 vscode_extension/
-.tmp/demo-test/
+.tmp/
+test_demo/
+test_project/
+neo_artifacts/
