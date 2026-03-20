@@ -586,72 +586,50 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             ))]
 
         # ------------------------------------------------------------------ #
-        # neo_task_status — reads in-memory state first, falls back to API   #
+        # neo_task_status — status + inline plan steps                       #
         # ------------------------------------------------------------------ #
         elif name == "neo_task_status":
             thread_id, recovered = _resolve_thread_id(arguments)
             if not thread_id:
                 return [TextContent(type="text", text="No thread_id provided and no active thread found. Submit a task first.")]
 
-            recovery_note = f"\n(thread_id recovered from storage)" if recovered else ""
+            recovery_note = "\n(thread_id recovered from storage)" if recovered else ""
 
             # Fast path: background poller has current state in memory
             if thread_id in _active_polls:
                 state = _active_polls[thread_id]
                 status = state["status"]
-                hints = {
-                    "RUNNING": (
-                        f"Status: RUNNING. thread_id: {thread_id}{recovery_note}\n"
-                        "Background poller is active — call neo_task_status again to refresh."
-                    ),
-                    "WAITING_FOR_FEEDBACK": (
-                        f"Status: WAITING_FOR_FEEDBACK. thread_id: {thread_id}{recovery_note}\n"
-                        "Neo has a question. Call neo_send_feedback to reply."
-                    ),
-                    "PAUSED": (
-                        f"Status: PAUSED. thread_id: {thread_id}{recovery_note}\n"
-                        "Call neo_resume_task to continue."
-                    ),
-                    "COMPLETED": (
-                        f"Status: COMPLETED. thread_id: {thread_id}{recovery_note}\n"
-                        "Call neo_get_messages to read the output."
-                    ),
-                    "TERMINATED": (
-                        f"Status: TERMINATED. thread_id: {thread_id}{recovery_note}\n"
-                        "Task was stopped or hit a fatal error."
-                    ),
-                }
-                return [TextContent(type="text", text=hints.get(status, f"Status: {status}. thread_id: {thread_id}{recovery_note}"))]
-
-            # Slow path: no background poller active — hit the API directly
-            resp = await client.get(f"/v2/thread/status/{thread_id}", headers=_headers())
-            if resp.status_code != 200:
-                return [TextContent(type="text", text=handle_error(resp.status_code))]
-            status = resp.json().get("status", "UNKNOWN")
+                plan = state.get("plan", [])
+            else:
+                # Slow path: no background poller — hit the API directly
+                resp = await client.get(f"/v2/thread/status/{thread_id}", headers=_headers())
+                if resp.status_code != 200:
+                    return [TextContent(type="text", text=handle_error(resp.status_code))]
+                body = resp.json()
+                status = body.get("status", "UNKNOWN")
+                plan = body.get("current_plan", [])
 
             hints = {
-                "RUNNING": (
-                    f"Status: RUNNING. thread_id: {thread_id}{recovery_note}\n"
-                    "No background poller active — call neo_task_status again to refresh."
-                ),
-                "WAITING_FOR_FEEDBACK": (
-                    f"Status: WAITING_FOR_FEEDBACK. thread_id: {thread_id}{recovery_note}\n"
-                    "Neo has a question. Call neo_send_feedback to reply."
-                ),
-                "PAUSED": (
-                    f"Status: PAUSED. thread_id: {thread_id}{recovery_note}\n"
-                    "Call neo_resume_task to continue."
-                ),
-                "COMPLETED": (
-                    f"Status: COMPLETED. thread_id: {thread_id}{recovery_note}\n"
-                    "Call neo_get_messages to read the output."
-                ),
-                "TERMINATED": (
-                    f"Status: TERMINATED. thread_id: {thread_id}{recovery_note}\n"
-                    "Task was stopped or hit a fatal error."
-                ),
+                "RUNNING": "Background poller is active — call neo_task_status again to refresh.",
+                "WAITING_FOR_FEEDBACK": "Neo has a question. Call neo_send_feedback to reply.",
+                "PAUSED": "Call neo_resume_task to continue.",
+                "COMPLETED": "Call neo_get_messages to read the output.",
+                "TERMINATED": "Task was stopped or hit a fatal error.",
             }
-            return [TextContent(type="text", text=hints.get(status, f"Status: {status}. thread_id: {thread_id}{recovery_note}"))]
+            lines = [f"Status: {status}. thread_id: {thread_id}{recovery_note}"]
+            if hint := hints.get(status):
+                lines.append(hint)
+
+            if plan:
+                lines.append("")
+                status_icons = {"COMPLETED": "✅", "RUNNING": "⏳", "FAILED": "❌", "PENDING": "⬜"}
+                for step in plan:
+                    icon = status_icons.get(step.get("status", ""), "•")
+                    lines.append(f"{icon} {step.get('description', '')[:100]}")
+                    if step.get("result_summary") and step.get("status") == "COMPLETED":
+                        lines.append(f"   → {step['result_summary'][:120]}")
+
+            return [TextContent(type="text", text="\n".join(lines))]
 
         # ------------------------------------------------------------------ #
         # neo_task_plan — live step-by-step plan from current_plan field     #
