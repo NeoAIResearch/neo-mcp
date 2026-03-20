@@ -70,10 +70,19 @@ claude mcp logs neo
 - `NEO_API_KEY` is legacy/optional and unused in current auth flow.
 - `_check_config()` validates at startup; missing key prints a clean error to stderr and exits 1.
 
-### Task submission — always vscode mode
-`neo_submit_task` always submits with `deployment_type: "vscode"` to route execution to the local VS Code/Cursor extension daemon. This enables local file writes and code execution in the user's workspace.
+### Task submission — vscode vs cloud mode
+`neo_submit_task` picks `deployment_type` via `_resolve_deployment(deployment_id)`:
 
-If a `deployment_id` is available (from `_get_deployment_id()`), it is included so the backend routes commands to the right daemon instance. If not, the backend picks the user's active deployment.
+| Transport | deployment_id available? | deployment_type |
+|-----------|--------------------------|-----------------|
+| stdio | any | `"vscode"` |
+| http | yes | `"vscode"` |
+| http | no (web connector) | `"cloud"` |
+
+`NEO_DEPLOYMENT_TYPE=vscode|cloud` env var overrides this auto-detection.
+
+- **vscode** routes execution to the local VS Code/Cursor extension daemon and includes the `deployment_id` + workspace directory prefix in the message.
+- **cloud** runs on Neo's hosted backend — no `deployment_id` is sent and no local workspace prefix is added to the message (there is no local filesystem).
 
 ### Thread-ID based polling — the core loop
 After submission, `init-chat-direct` returns a `thread_id`. **All status and message queries use `thread_id`** — these APIs work with API key auth:
