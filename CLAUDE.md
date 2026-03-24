@@ -4,16 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 7 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — all via stdio transport.
+A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 9 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — all via stdio transport.
 
 ## Project structure
 
 ```
 neo-mcp/
-├── src/neo_mcp/server.py   # MCP server — all 7 tools, single file
+├── src/neo_mcp/server.py   # MCP server — all tools, single file
+├── src/neo_mcp/oauth.py    # OAuth 2.0 PKCE authorization server (HTTP mode)
+├── src/neo_mcp/setup.py    # setup wizard (neo-mcp setup)
 ├── docs/
-│   ├── SETUP.md            # registration for all MCP clients
-│   └── USAGE.md            # user guide + deployment steps
+│   ├── CLIENTS.md          # registration guide for all MCP clients
+│   ├── USAGE.md            # user guide + deployment steps
+│   ├── CONNECTORS.md       # web connector setup (Claude.ai + ChatGPT)
+│   └── WEB_CONNECTOR.md    # web connector implementation notes
 ├── tests/test_connection.py
 ├── .github/workflows/publish-mcp.yml
 ├── Dockerfile

@@ -35,7 +35,7 @@ http = [
 [project.urls]
 Homepage = "https://heyneo.so"
 Repository = "https://github.com/NeoResearchAI/MCPServer"
-Documentation = "https://github.com/NeoResearchAI/MCPServer/blob/main/neo-mcp/docs/SETUP.md"
+Documentation = "https://github.com/NeoResearchAI/MCPServer/blob/main/neo-mcp/docs/CLIENTS.md"
 "Bug Tracker" = "https://github.com/NeoResearchAI/MCPServer/issues"
 
 [project.scripts]
