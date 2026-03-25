@@ -2,27 +2,22 @@
 
 ---
 
-## What this covers
+## Two modes at a glance
 
-Running Neo MCP as a Docker container in two modes:
+| Mode | Who runs it | Where the key lives |
+|------|-------------|---------------------|
+| **stdio** | MCP client spawns the container as a subprocess | In the client's MCP config (`-e NEO_SECRET_KEY`) — passed to the process automatically |
+| **HTTP** | You deploy it once; any client connects over the network | In each user's MCP client config (`Authorization: Bearer`) — sent as a header automatically |
 
-| Mode | Use case |
-|------|----------|
-| **stdio** (default) | Local MCP client (Claude Code, Cursor, etc.) spawns the container as a subprocess |
-| **HTTP** | Self-hosted endpoint that any MCP client connects to over the network |
-
----
-
-## Prerequisites
-
-- Docker installed and running
-- Neo secret key (`sk-v1-...`) from the **Neo dashboard → Settings → API Keys**
+**In both cases the user types their key exactly once — at client configuration time.
+The server never stores or requires it.**
 
 ---
 
-## Quick start — stdio mode (for Claude Code / Cursor)
+## stdio mode — local use (Claude Code / Cursor)
 
-This is the standard way to use Neo MCP locally without installing Python.
+The client spawns the container, injects the key, and handles it from there.
+The user never touches the key again after this one-time registration:
 
 ```bash
 claude mcp add --scope user neo \
@@ -33,102 +28,33 @@ claude mcp add --scope user neo \
      ghcr.io/heyneo/neo-mcp-server
 ```
 
-The `-v ~/.neo:/root/.neo:ro` mount lets the container read the VS Code/Cursor extension daemon data (sandbox ID, workspace mappings) from your host machine.
+The `-v ~/.neo:/root/.neo:ro` mount lets the container read VS Code/Cursor extension daemon data (sandbox ID, workspace mappings) from your host machine.
+
+**After this command:** the key is stored in Claude Code's MCP config. Every subsequent invocation passes it automatically — no user action needed.
 
 ---
 
-## Build the image locally
+## HTTP mode — shared / self-hosted server
 
-```bash
-# From the neo-mcp/ directory
-docker build -t neo-mcp .
-```
+The server itself needs **no key at all**. Deploy it once; each user configures their own client with their own key.
 
-The Dockerfile uses `python:3.11-slim`, installs all dependencies, and sets `neo-mcp` as the entrypoint.
-
----
-
-## Run in stdio mode (test locally)
-
-```bash
-echo '{}' | docker run -i --rm \
-  -e NEO_SECRET_KEY=sk-v1-... \
-  -v ~/.neo:/root/.neo:ro \
-  neo-mcp
-```
-
-Sending an empty JSON ping lets you confirm the container starts and the key is accepted.
-
----
-
-## Run in HTTP mode (self-hosted endpoint)
-
-HTTP mode exposes a persistent MCP server on port 8000. Useful for teams sharing one instance or for connecting web-based clients.
-
-### Start the server
+### 1. Start the server (no key required)
 
 ```bash
 docker run -d \
   --name neo-mcp \
-  -e NEO_SECRET_KEY=sk-v1-... \
   -e NEO_TRANSPORT=http \
   -p 8000:8000 \
-  neo-mcp
+  ghcr.io/heyneo/neo-mcp-server
 ```
 
-### Health check
-
-```bash
-curl http://localhost:8000/health
-# {"status":"ok","server":"neo-mcp","transport":"http"}
-```
-
-### Connect Claude Code to the HTTP endpoint
-
-```bash
-claude mcp add --transport http --scope user neo http://localhost:8000/mcp \
-  --header "Authorization: Bearer sk-v1-..."
-```
-
-### Connect Cursor / Windsurf
-
-`~/.cursor/mcp.json`:
-```json
-{
-  "mcpServers": {
-    "neo": {
-      "url": "http://localhost:8000/mcp",
-      "headers": { "Authorization": "Bearer sk-v1-..." }
-    }
-  }
-}
-```
-
----
-
-## Environment variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `NEO_SECRET_KEY` | — | **Required** — your `sk-v1-...` secret key |
-| `NEO_TRANSPORT` | `stdio` | Set to `http` for HTTP server mode |
-| `NEO_HTTP_PORT` | `8000` | Port to listen on in HTTP mode |
-| `NEO_HTTP_HOST` | `0.0.0.0` | Host to bind in HTTP mode (pre-set in the image) |
-| `NEO_WORKSPACE_DIR` | (CWD) | Override the working directory reported to Neo |
-| `NEO_DEPLOYMENT_ID` | (auto) | Pin a specific VS Code extension sandbox ID |
-| `NEO_READ_ONLY` | `false` | `true` = expose only status/plan/message tools |
-| `NEO_PUBLIC_URL` | `https://mcp.heyneo.so` | Base URL for OAuth discovery payloads (HTTP mode) |
-
----
-
-## Docker Compose (HTTP mode)
+Or with Docker Compose:
 
 ```yaml
 services:
   neo-mcp:
     image: ghcr.io/heyneo/neo-mcp-server
     environment:
-      NEO_SECRET_KEY: ${NEO_SECRET_KEY}
       NEO_TRANSPORT: http
     ports:
       - "8000:8000"
@@ -140,22 +66,98 @@ services:
       retries: 3
 ```
 
-Start with:
 ```bash
-NEO_SECRET_KEY=sk-v1-... docker compose up -d
+docker compose up -d
 ```
+
+### 2. Health check
+
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","server":"neo-mcp","transport":"http"}
+```
+
+### 3. Each user registers once in their client
+
+The client stores the key and sends it automatically on every request — the user never has to enter it again.
+
+**Claude Code:**
+```bash
+claude mcp add --transport http --scope user neo http://your-server:8000/mcp \
+  --header "Authorization: Bearer sk-v1-..."
+```
+
+**Cursor / Windsurf** — `~/.cursor/mcp.json`:
+```json
+{
+  "mcpServers": {
+    "neo": {
+      "url": "http://your-server:8000/mcp",
+      "headers": { "Authorization": "Bearer sk-v1-..." }
+    }
+  }
+}
+```
+
+---
+
+## How auth works under the hood
+
+```
+stdio mode:
+  claude mcp add -e NEO_SECRET_KEY=sk-v1-...
+        │
+        └─► stored in Claude Code's MCP config
+              │
+              └─► passed as env var to the container subprocess on every call
+                    │
+                    └─► server reads NEO_SECRET_KEY at startup, attaches to every Neo API request
+
+HTTP mode:
+  claude mcp add --header "Authorization: Bearer sk-v1-..."
+        │
+        └─► stored in Claude Code's MCP config
+              │
+              └─► sent as Authorization: Bearer header on every MCP request
+                    │
+                    └─► server extracts the key per-request, attaches to every Neo API request
+```
+
+Neither mode requires the user to do anything after the one-time setup.
+
+---
+
+## Build the image locally
+
+```bash
+# From the neo-mcp/ directory
+docker build -t neo-mcp .
+```
+
+---
+
+## Environment variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `NEO_TRANSPORT` | No | `stdio` (default) or `http` |
+| `NEO_SECRET_KEY` | **stdio mode only** | Your `sk-v1-...` secret key. In HTTP mode the key comes from each client's `Authorization: Bearer` header — this env var is not used. |
+| `NEO_HTTP_PORT` | No | Port to listen on in HTTP mode (default `8000`) |
+| `NEO_HTTP_HOST` | No | Host to bind in HTTP mode (default `0.0.0.0`, pre-set in image) |
+| `NEO_WORKSPACE_DIR` | No | Override the working directory reported to Neo |
+| `NEO_DEPLOYMENT_ID` | No | Pin a specific VS Code extension sandbox ID |
+| `NEO_READ_ONLY` | No | `true` = expose only status/plan/message tools |
+| `NEO_PUBLIC_URL` | No | Base URL for OAuth discovery payloads (default `https://mcp.heyneo.so`) |
 
 ---
 
 ## Using the published image
 
-The image is published automatically to GitHub Container Registry on every push to `main`:
-
 ```bash
 docker pull ghcr.io/heyneo/neo-mcp-server:latest
 ```
 
-Specific versions are tagged by git SHA and semver (when a `v*` tag is pushed).
+The image is published automatically to GitHub Container Registry on every push to `main`. Specific versions are tagged by git SHA and semver (when a `v*` tag is pushed).
 
 ---
 
@@ -164,8 +166,8 @@ Specific versions are tagged by git SHA and semver (when a `v*` tag is pushed).
 | Symptom | Fix |
 |---------|-----|
 | Container exits immediately in stdio mode | Normal — it exits after stdin closes. Use `-i` flag. |
-| `NEO_SECRET_KEY not set` error | Pass `-e NEO_SECRET_KEY=sk-v1-...` to `docker run` |
+| `NEO_SECRET_KEY not set` error | You are running in stdio mode without the key. Pass `-e NEO_SECRET_KEY=sk-v1-...` to `docker run`, or use `claude mcp add -e NEO_SECRET_KEY=...` to register it once. |
 | Port 8000 already in use | Use `-p 8001:8000` to map to a different host port |
+| `Invalid API key` (401) | The key in your client config is wrong. Double-check the value in your MCP client settings. |
 | Tasks submit but no files appear locally | The VS Code/Cursor extension must be running on the host; mount `~/.neo` with `-v ~/.neo:/root/.neo:ro` |
-| `Invalid API key` (401) | Double-check the secret key value |
 | Output truncated | Cap is ~20 000 tokens — call `neo_task_plan` for a concise summary |
