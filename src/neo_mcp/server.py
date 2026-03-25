@@ -146,10 +146,8 @@ _server_cwd = NEO_WORKSPACE_DIR or os.getcwd()
 
 
 def _check_config():
-    # In HTTP mode, keys can be supplied per-request via headers — env vars are optional
-    if NEO_TRANSPORT == "stdio":
-        if not NEO_SECRET_KEY:
-            raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
+    if not NEO_SECRET_KEY:
+        raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
 
 
 app = Server(
@@ -985,17 +983,10 @@ def main():
         from neo_mcp.setup import run_setup
         run_setup(sys.argv[2:])
         return
-    try:
-        if NEO_TRANSPORT == "http":
-            # HTTP mode: NEO_SECRET_KEY is passed per-request via Authorization: Bearer header.
-            # No startup check needed — the server accepts any client that provides a valid key.
-            asyncio.run(_run_http())
-        else:
-            _check_config()
-            asyncio.run(_run_stdio())
-    except ValueError as e:
-        print(f"Neo MCP configuration error: {e}", file=sys.stderr)
-        sys.exit(1)
+    if NEO_TRANSPORT == "http":
+        asyncio.run(_run_http())
+    else:
+        asyncio.run(_run_stdio())
 
 
 if __name__ == "__main__":
