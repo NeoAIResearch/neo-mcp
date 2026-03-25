@@ -968,6 +968,7 @@ async def _run_http():
     from neo_mcp.oauth import oauth_routes
     starlette_app = Starlette(
         routes=[
+            Route("/", health, methods=["GET"]),
             Route("/health", health, methods=["GET"]),
             Route("/mcp", handle_mcp, methods=["GET", "POST", "DELETE"]),
             *oauth_routes(),
