@@ -28,9 +28,7 @@ def _parse_args(args: list) -> dict:
     i = 0
     while i < len(args):
         a = args[i]
-        if a in ("--api-key", "--api_key") and i + 1 < len(args):
-            opts["api_key"] = args[i + 1]; i += 2
-        elif a in ("--secret-key", "--secret_key") and i + 1 < len(args):
+        if a in ("--secret-key", "--secret_key") and i + 1 < len(args):
             opts["secret_key"] = args[i + 1]; i += 2
         elif a == "--editor" and i + 1 < len(args):
             opts["editor"] = args[i + 1]; i += 2
@@ -78,12 +76,10 @@ def _backup(path: Path, no_backup: bool) -> None:
 def _read_json_file(path: Path) -> dict:
     """Read JSON or JSONC file, stripping comments before parsing."""
     text = path.read_text(encoding="utf-8")
-    text = re.sub(r"//[^\n]*", "", text)
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        return {}
+    # Strip // line comments and /* block comments */
+    text = re.sub(r'//[^\n]*', '', text)
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    return json.loads(text)
 
 
 def _write_json_file(path: Path, data: dict, no_backup: bool) -> None:
@@ -98,7 +94,7 @@ def _merge_mcp_servers(path: Path, key: str, server_cfg: dict, no_backup: bool) 
     _write_json_file(path, data, no_backup)
 
 
-def _configure_claude(api_key: str, secret_key: str, opts: dict) -> tuple:
+def _configure_claude(secret_key: str, opts: dict) -> tuple:
     is_tty = sys.stdin.isatty()
     use_remote = opts.get("remote", False)
     if is_tty and not opts.get("remote") and "claude" in _SUPPORTS_REMOTE:
@@ -113,13 +109,11 @@ def _configure_claude(api_key: str, secret_key: str, opts: dict) -> tuple:
                 cmd = [
                     "claude", "mcp", "add", "--transport", "http",
                     "--scope", scope, "neo", REMOTE_URL,
-                    "--header", f"x-access-key: {api_key}",
                     "--header", f"Authorization: Bearer {secret_key}",
                 ]
             else:
                 cmd = [
                     "claude", "mcp", "add", "--scope", scope,
-                    "-e", f"NEO_API_KEY={api_key}",
                     "-e", f"NEO_SECRET_KEY={secret_key}",
                     "--", "neo-mcp",
                 ]
@@ -136,14 +130,13 @@ def _configure_claude(api_key: str, secret_key: str, opts: dict) -> tuple:
             "transport": "http",
             "url": REMOTE_URL,
             "headers": {
-                "x-access-key": api_key,
                 "Authorization": f"Bearer {secret_key}",
             },
         }
     else:
         server_cfg = {
             "command": "neo-mcp",
-            "env": {"NEO_API_KEY": api_key, "NEO_SECRET_KEY": secret_key},
+            "env": {"NEO_SECRET_KEY": secret_key},
         }
 
     # Claude Desktop fallback path
@@ -165,7 +158,7 @@ def _configure_claude(api_key: str, secret_key: str, opts: dict) -> tuple:
         return False, "claude CLI not found — printed config to stdout"
 
 
-def _configure_cursor(api_key: str, secret_key: str, opts: dict) -> tuple:
+def _configure_cursor(secret_key: str, opts: dict) -> tuple:
     is_tty = sys.stdin.isatty()
     use_remote = opts.get("remote", False)
     if is_tty and not opts.get("remote"):
@@ -178,14 +171,13 @@ def _configure_cursor(api_key: str, secret_key: str, opts: dict) -> tuple:
         server_cfg: dict = {
             "url": REMOTE_URL,
             "headers": {
-                "x-access-key": api_key,
                 "Authorization": f"Bearer {secret_key}",
             },
         }
     else:
         server_cfg = {
             "command": "neo-mcp",
-            "env": {"NEO_API_KEY": api_key, "NEO_SECRET_KEY": secret_key},
+            "env": {"NEO_SECRET_KEY": secret_key},
         }
 
     try:
@@ -198,7 +190,7 @@ def _configure_cursor(api_key: str, secret_key: str, opts: dict) -> tuple:
         return False, "Write failed — printed config to stdout"
 
 
-def _configure_windsurf(api_key: str, secret_key: str, opts: dict) -> tuple:
+def _configure_windsurf(secret_key: str, opts: dict) -> tuple:
     is_tty = sys.stdin.isatty()
     use_remote = opts.get("remote", False)
     if is_tty and not opts.get("remote"):
@@ -211,14 +203,13 @@ def _configure_windsurf(api_key: str, secret_key: str, opts: dict) -> tuple:
         server_cfg: dict = {
             "serverUrl": REMOTE_URL,
             "headers": {
-                "x-access-key": api_key,
                 "Authorization": f"Bearer {secret_key}",
             },
         }
     else:
         server_cfg = {
             "command": "neo-mcp",
-            "env": {"NEO_API_KEY": api_key, "NEO_SECRET_KEY": secret_key},
+            "env": {"NEO_SECRET_KEY": secret_key},
         }
 
     try:
@@ -231,7 +222,7 @@ def _configure_windsurf(api_key: str, secret_key: str, opts: dict) -> tuple:
         return False, "Write failed — printed config to stdout"
 
 
-def _configure_zed(api_key: str, secret_key: str, opts: dict) -> tuple:
+def _configure_zed(secret_key: str, opts: dict) -> tuple:
     is_tty = sys.stdin.isatty()
     use_remote = opts.get("remote", False)
     if is_tty and not opts.get("remote"):
@@ -248,7 +239,6 @@ def _configure_zed(api_key: str, secret_key: str, opts: dict) -> tuple:
                 "args": [
                     "-y", "mcp-remote",
                     REMOTE_URL,
-                    "--header", f"x-access-key:{api_key}",
                     "--header", f"Authorization:Bearer {secret_key}",
                 ],
             },
@@ -259,7 +249,7 @@ def _configure_zed(api_key: str, secret_key: str, opts: dict) -> tuple:
             "command": {
                 "path": "neo-mcp",
                 "args": [],
-                "env": {"NEO_API_KEY": api_key, "NEO_SECRET_KEY": secret_key},
+                "env": {"NEO_SECRET_KEY": secret_key},
             },
         }
 
@@ -275,7 +265,7 @@ def _configure_zed(api_key: str, secret_key: str, opts: dict) -> tuple:
         return False, "Write failed — printed config to stdout"
 
 
-def _configure_vscode(api_key: str, secret_key: str, opts: dict) -> tuple:
+def _configure_vscode(secret_key: str, opts: dict) -> tuple:
     is_tty = sys.stdin.isatty()
     use_remote = opts.get("remote", False)
     if is_tty and not opts.get("remote"):
@@ -289,7 +279,6 @@ def _configure_vscode(api_key: str, secret_key: str, opts: dict) -> tuple:
             "type": "http",
             "url": REMOTE_URL,
             "headers": {
-                "x-access-key": api_key,
                 "Authorization": f"Bearer {secret_key}",
             },
         }
@@ -297,7 +286,7 @@ def _configure_vscode(api_key: str, secret_key: str, opts: dict) -> tuple:
         server_cfg = {
             "type": "stdio",
             "command": "neo-mcp",
-            "env": {"NEO_API_KEY": api_key, "NEO_SECRET_KEY": secret_key},
+            "env": {"NEO_SECRET_KEY": secret_key},
         }
 
     try:
@@ -312,7 +301,7 @@ def _configure_vscode(api_key: str, secret_key: str, opts: dict) -> tuple:
         return False, "Write failed — printed config to stdout"
 
 
-def _configure_continue(api_key: str, secret_key: str, opts: dict) -> tuple:
+def _configure_continue(secret_key: str, opts: dict) -> tuple:
     path = Path.home() / ".continue" / "config.json"
     no_backup = opts.get("no_backup", False)
 
@@ -321,7 +310,7 @@ def _configure_continue(api_key: str, secret_key: str, opts: dict) -> tuple:
         "transport": {
             "type": "stdio",
             "command": "neo-mcp",
-            "env": {"NEO_API_KEY": api_key, "NEO_SECRET_KEY": secret_key},
+            "env": {"NEO_SECRET_KEY": secret_key},
         },
     }
 
@@ -338,13 +327,13 @@ def _configure_continue(api_key: str, secret_key: str, opts: dict) -> tuple:
         return False, "Write failed — printed config to stdout"
 
 
-def _configure_codex(api_key: str, secret_key: str, opts: dict) -> tuple:
+def _configure_codex(secret_key: str, opts: dict) -> tuple:
     path = Path.home() / ".codex" / "config.json"
     no_backup = opts.get("no_backup", False)
 
     server_cfg = {
         "command": "neo-mcp",
-        "env": {"NEO_API_KEY": api_key, "NEO_SECRET_KEY": secret_key},
+        "env": {"NEO_SECRET_KEY": secret_key},
     }
 
     try:
@@ -371,7 +360,6 @@ def run_setup(args: list) -> None:
     """Entry point for `neo-mcp setup [flags]`.
 
     Flags:
-      --api-key KEY          Neo access key (ak-v1-...)
       --secret-key KEY       Neo secret key (sk-v1-...)
       --editor EDITORS       Comma-separated: claude,cursor,windsurf,zed,vscode,continue,codex
       --remote               Use hosted mcp.heyneo.so instead of local stdio
@@ -384,16 +372,8 @@ def run_setup(args: list) -> None:
     print("Neo MCP Setup Wizard")
     print("=" * 40)
 
-    # Get API keys
-    api_key = opts.get("api_key") or os.environ.get("NEO_API_KEY", "")
+    # Get secret key
     secret_key = opts.get("secret_key") or os.environ.get("NEO_SECRET_KEY", "")
-
-    if not api_key:
-        if is_tty:
-            api_key = input("Neo API Key (ak-v1-...): ").strip()
-        else:
-            print("Error: --api-key required in non-interactive mode", file=sys.stderr)
-            sys.exit(1)
 
     if not secret_key:
         if is_tty:
@@ -402,8 +382,8 @@ def run_setup(args: list) -> None:
             print("Error: --secret-key required in non-interactive mode", file=sys.stderr)
             sys.exit(1)
 
-    if not api_key or not secret_key:
-        print("Error: both API key and secret key are required.", file=sys.stderr)
+    if not secret_key:
+        print("Error: secret key is required.", file=sys.stderr)
         sys.exit(1)
 
     # Select editors
@@ -428,7 +408,7 @@ def run_setup(args: list) -> None:
     for editor_key in selected:
         label = dict(EDITORS)[editor_key]
         print(f"Configuring {label}...")
-        ok, msg = _CONFIGURATORS[editor_key](api_key, secret_key, opts)
+        ok, msg = _CONFIGURATORS[editor_key](secret_key, opts)
         results.append((label, ok, msg))
 
     # Summary
