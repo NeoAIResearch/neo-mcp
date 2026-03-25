@@ -104,6 +104,7 @@ neo_submit_task
       └─ background poller starts
               │
               ├── GET /v2/thread/status/{thread_id}   (every 3–15 s)
+              
               │         stores status + plan steps in memory
               │
               └── GET /v2/thread/thread-messages      (on COMPLETED)
@@ -136,7 +137,6 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for all editors.
 | Variable | Required | Description |
 |---|---|---|
 | `NEO_SECRET_KEY` | **Yes** | Secret key (`sk-v1-...`) — sole auth token |
-| `NEO_API_KEY` | No | Legacy access key, not used for auth |
 | `NEO_DEPLOYMENT_ID` | No | Pin a specific VS Code extension deployment ID |
 | `NEO_READ_ONLY` | No | `true` = expose only status/plan/message tools |
 | `NEO_WORKSPACE_DIR` | No | Override working directory (useful in Docker) |
