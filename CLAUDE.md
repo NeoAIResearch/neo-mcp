@@ -18,7 +18,9 @@ neo-mcp/
 │   ├── USAGE.md            # user guide + deployment steps
 │   ├── CONNECTORS.md       # web connector setup (Claude.ai + ChatGPT)
 │   └── WEB_CONNECTOR.md    # web connector implementation notes
-├── tests/test_connection.py
+├── tests/
+│   ├── test_connection.py
+│   └── test_server.py
 ├── .github/workflows/publish-mcp.yml
 ├── Dockerfile
 ├── pyproject.toml
@@ -40,8 +42,11 @@ python3 src/neo_mcp/server.py
 # Or after pip install:
 neo-mcp
 
-# Test backend connectivity
-python3 tests/test_connection.py
+# Run unit tests (no key needed)
+python3 -m pytest tests/ -v
+
+# Run connectivity test (requires NEO_SECRET_KEY)
+NEO_SECRET_KEY=sk-v1-... python3 tests/test_connection.py
 
 # Build Docker image
 docker build -t neo-mcp-test .
@@ -71,7 +76,6 @@ claude mcp logs neo
 
 ### Auth
 - Only `NEO_SECRET_KEY` is required (`sk-v1-...`) — passed as `Authorization: Bearer` on every request.
-- `NEO_API_KEY` is legacy/optional and unused in current auth flow.
 - `_check_config()` validates at startup; missing key prints a clean error to stderr and exits 1.
 
 ### Task submission — vscode vs cloud mode

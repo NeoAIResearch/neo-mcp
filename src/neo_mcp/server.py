@@ -11,7 +11,6 @@ from mcp.types import Tool, TextContent
 from mcp import types
 
 NEO_API_URL = os.environ.get("NEO_API_URL", "https://master.heyneo.so")
-NEO_API_KEY = os.environ.get("NEO_API_KEY", "")      # access key (optional, legacy)
 NEO_SECRET_KEY = os.environ.get("NEO_SECRET_KEY", "") # secret key (sk-v1-...) — sole auth token
 NEO_READ_ONLY = os.environ.get("NEO_READ_ONLY", "").lower() == "true"
 NEO_DEPLOYMENT_ID = os.environ.get("NEO_DEPLOYMENT_ID", "")  # optional, override auto-discovered sandbox ID
