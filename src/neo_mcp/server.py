@@ -909,7 +909,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 async def _run_stdio():
-    _check_config()
     asyncio.create_task(_reconnect_inflight_task())
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
@@ -987,10 +986,12 @@ def main():
         run_setup(sys.argv[2:])
         return
     try:
-        _check_config()
         if NEO_TRANSPORT == "http":
+            # HTTP mode: NEO_SECRET_KEY is passed per-request via Authorization: Bearer header.
+            # No startup check needed — the server accepts any client that provides a valid key.
             asyncio.run(_run_http())
         else:
+            _check_config()
             asyncio.run(_run_stdio())
     except ValueError as e:
         print(f"Neo MCP configuration error: {e}", file=sys.stderr)
