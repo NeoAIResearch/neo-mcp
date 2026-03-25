@@ -1,78 +1,93 @@
-name: Publish Neo MCP
+name: Push the Docker image to AWS ECR Repo
 
 on:
   push:
     branches:
       - main
-    paths:
-      - "src/**"
-      - "Dockerfile"
-      - "pyproject.toml"
-      - "requirements.txt"
-    tags:
-      - "v*"
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    ######### update correct repo name
+    env:
+      REPO_NAME: agentwork/mcpserver
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      # 1️⃣ Decide environment + region from branch
+      - name: Set environment and region
+        id: set-env
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+
+          if [ "$BRANCH" = "staging" ]; then
+            echo "env=staging" >> $GITHUB_OUTPUT
+            echo "aws_region=ap-south-1" >> $GITHUB_OUTPUT
+          elif [ "$BRANCH" = "main" ]; then
+            echo "env=prod" >> $GITHUB_OUTPUT
+            echo "aws_region=ap-south-1" >> $GITHUB_OUTPUT
+          else
+            echo "Unsupported branch: $BRANCH"
+            exit 1
+          fi
+
+      - name: Debug secret
+        run: |
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+            echo "AWS SECRET NOT FOUND"
+            exit 1
+          else
+            echo "SECRET EXISTS"
+          fi
+          
+      # 2️⃣ Configure AWS credentials with the correct region
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ steps.set-env.outputs.aws_region }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/heyneo/neo-mcp-server:latest
-            ghcr.io/heyneo/neo-mcp-server:${{ github.sha }}
+      # 3️⃣ Login to ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Deploy to VPS
-        if: github.ref == 'refs/heads/main'
-        uses: appleboy/ssh-action@v1
-        continue-on-error: true
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: root
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: bash /etc/neo-mcp/deploy.sh
+      # 4️⃣ Metadata
+      - name: Get commit hash
+        id: get-commit-hash
+        run: echo "commit_hash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-  publish-pypi:
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: read
+      - name: Get timestamp
+        id: get-timestamp
+        run: echo "timestamp=$(date +'%Y-%m-%d-%H')" >> $GITHUB_OUTPUT
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # 5️⃣ Ensure ECR repository exists
+      - name: Ensure ECR repository exists
+        env:
+          AWS_REGION: ${{ steps.set-env.outputs.aws_region }}
+        run: |
+          aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$AWS_REGION" 2>/dev/null || \
+          aws ecr create-repository --repository-name "$REPO_NAME" --region "$AWS_REGION"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      # 6️⃣ Build & push
+      - name: Build, tag, and push the image to Amazon ECR
+        id: build-push
+        env:
+          ENV: ${{ steps.set-env.outputs.env }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.get-commit-hash.outputs.commit_hash }}-${{ steps.get-timestamp.outputs.timestamp }}
+        run: |
+          FULL_REPO="$ECR_REGISTRY/$REPO_NAME:$ENV-$IMAGE_TAG"
+          docker build -t "$FULL_REPO" .
+          docker push "$FULL_REPO"
+          echo "image_tag=$ENV-$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "full_image=$FULL_REPO" >> $GITHUB_OUTPUT
 
-      - name: Install build tools
-        run: pip install build
-
-      - name: Build distribution
-        run: python -m build
-        working-directory: neo-mcp
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
-          packages-dir: neo-mcp/dist/
+      # 7️⃣ Output the tag ID
+      - name: Display image tag
+        run: |
+          echo "🏷️ Image Tag: ${{ steps.build-push.outputs.image_tag }}"
+          echo "📦 Full Image: ${{ steps.build-push.outputs.full_image }}"
