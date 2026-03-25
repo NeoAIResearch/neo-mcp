@@ -145,11 +145,6 @@ def _resolve_deployment(deployment_id: str) -> tuple[str, str]:
 _server_cwd = NEO_WORKSPACE_DIR or os.getcwd()
 
 
-def _check_config():
-    if not NEO_SECRET_KEY:
-        raise ValueError("NEO_SECRET_KEY environment variable is required but not set.")
-
-
 app = Server(
     "neo-mcp",
     instructions=(
@@ -197,6 +192,11 @@ _ctx_secret_key: contextvars.ContextVar[str] = contextvars.ContextVar("secret_ke
 def _headers() -> dict:
     """Build Neo auth headers. Secret key as sole Bearer token."""
     secret_key = _ctx_secret_key.get() or NEO_SECRET_KEY
+    if not secret_key:
+        raise ValueError(
+            "NEO_SECRET_KEY is not set. "
+            "Pass it when registering: claude mcp add -e NEO_SECRET_KEY=sk-v1-..."
+        )
     return {
         "Authorization": f"Bearer {secret_key}",
     }
@@ -534,6 +534,10 @@ async def list_tools() -> list[Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    try:
+        _headers()  # validate key early — raises ValueError with a clear message if missing
+    except ValueError as e:
+        return [TextContent(type="text", text=str(e))]
     async with httpx.AsyncClient(base_url=NEO_API_URL, timeout=30.0) as client:
 
         # ------------------------------------------------------------------ #
