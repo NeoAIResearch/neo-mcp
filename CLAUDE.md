@@ -4,17 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 7 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — all via stdio transport.
+A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 9 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — all via stdio transport.
 
 ## Project structure
 
 ```
 neo-mcp/
-├── src/neo_mcp/server.py   # MCP server — all 7 tools, single file
+├── src/neo_mcp/server.py   # MCP server — all tools, single file
+├── src/neo_mcp/oauth.py    # OAuth 2.0 PKCE authorization server (HTTP mode)
+├── src/neo_mcp/setup.py    # setup wizard (neo-mcp setup)
 ├── docs/
-│   ├── SETUP.md            # registration for all MCP clients
-│   └── USAGE.md            # user guide + deployment steps
-├── tests/test_connection.py
+│   ├── CLIENTS.md          # registration guide for all MCP clients
+│   ├── USAGE.md            # user guide + deployment steps
+│   ├── CONNECTORS.md       # web connector setup (Claude.ai + ChatGPT)
+│   └── WEB_CONNECTOR.md    # web connector implementation notes
+├── tests/
+│   ├── test_connection.py
+│   └── test_server.py
 ├── .github/workflows/publish-mcp.yml
 ├── Dockerfile
 ├── pyproject.toml
@@ -36,8 +42,11 @@ python3 src/neo_mcp/server.py
 # Or after pip install:
 neo-mcp
 
-# Test backend connectivity
-python3 tests/test_connection.py
+# Run unit tests (no key needed)
+python3 -m pytest tests/ -v
+
+# Run connectivity test (requires NEO_SECRET_KEY)
+NEO_SECRET_KEY=sk-v1-... python3 tests/test_connection.py
 
 # Build Docker image
 docker build -t neo-mcp-test .
@@ -67,13 +76,21 @@ claude mcp logs neo
 
 ### Auth
 - Only `NEO_SECRET_KEY` is required (`sk-v1-...`) — passed as `Authorization: Bearer` on every request.
-- `NEO_API_KEY` is legacy/optional and unused in current auth flow.
 - `_check_config()` validates at startup; missing key prints a clean error to stderr and exits 1.
 
-### Task submission — always vscode mode
-`neo_submit_task` always submits with `deployment_type: "vscode"` to route execution to the local VS Code/Cursor extension daemon. This enables local file writes and code execution in the user's workspace.
+### Task submission — vscode vs cloud mode
+`neo_submit_task` picks `deployment_type` via `_resolve_deployment(deployment_id)`:
 
-If a `deployment_id` is available (from `_get_deployment_id()`), it is included so the backend routes commands to the right daemon instance. If not, the backend picks the user's active deployment.
+| Transport | deployment_id available? | deployment_type |
+|-----------|--------------------------|-----------------|
+| stdio | any | `"vscode"` |
+| http | yes | `"vscode"` |
+| http | no (web connector) | `"cloud"` |
+
+`NEO_DEPLOYMENT_TYPE=vscode|cloud` env var overrides this auto-detection.
+
+- **vscode** routes execution to the local VS Code/Cursor extension daemon and includes the `deployment_id` + workspace directory prefix in the message.
+- **cloud** runs on Neo's hosted backend — no `deployment_id` is sent and no local workspace prefix is added to the message (there is no local filesystem).
 
 ### Thread-ID based polling — the core loop
 After submission, `init-chat-direct` returns a `thread_id`. **All status and message queries use `thread_id`** — these APIs work with API key auth:
