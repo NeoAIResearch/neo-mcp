@@ -20,12 +20,8 @@ NEO_HTTP_PORT = int(os.environ.get("NEO_HTTP_PORT") or os.environ.get("PORT", "8
 NEO_HTTP_HOST = os.environ.get("NEO_HTTP_HOST", "0.0.0.0")
 # Public base URL used in OAuth discovery payloads (override for local dev)
 _BASE_URL = os.environ.get("NEO_PUBLIC_URL", "https://mcpserver.heyneo.com")
-# Deployment type override: "vscode" routes to local daemon; "cloud" runs on Neo's hosted backend.
-# Auto-detected when not set: HTTP transport without a deployment_id → "cloud"; otherwise "vscode".
-NEO_DEPLOYMENT_TYPE = os.environ.get("NEO_DEPLOYMENT_TYPE", "").lower()  # "vscode" | "cloud" | ""
 
 _THREAD_ID_FILE = os.path.expanduser("~/.neo/active_thread_id")
-_STANDALONE_UUID_FILE = os.path.expanduser("~/.neo/daemon/standalone_deployment_id")
 _DAEMON_PORT = 31337
 # Tracks deployment_ids we are actively heartbeating so we don't start duplicate tasks.
 _active_heartbeats: set[str] = set()
@@ -116,48 +112,8 @@ def _discover_sandbox_id() -> str:
 
 
 def _get_deployment_id() -> str:
-    """Return deployment ID: env var override → extension's active daemon ID.
-    Synchronous; for async contexts use _ensure_deployment_id_async().
-    """
+    """Return deployment ID: env var override → extension's active daemon ID."""
     return NEO_DEPLOYMENT_ID or _discover_sandbox_id()
-
-
-def _load_or_create_deployment_id() -> str:
-    """Load a persisted standalone deployment UUID or generate and save a new one.
-
-    Mirrors VS Code StateManager.getDeploymentId() — generates a UUIDv4 once,
-    then reuses it across restarts so Neo always sees the same sandbox.
-    """
-    import uuid as _uuid_mod
-    try:
-        with open(_STANDALONE_UUID_FILE) as f:
-            uid = f.read().strip()
-        if uid:
-            return uid
-    except OSError:
-        pass
-    uid = str(_uuid_mod.uuid4())
-    try:
-        os.makedirs(os.path.dirname(_STANDALONE_UUID_FILE), exist_ok=True)
-        with open(_STANDALONE_UUID_FILE, "w") as f:
-            f.write(uid)
-    except OSError:
-        pass
-    return uid
-
-
-def _write_sandbox_id_to_log(deployment_id: str) -> None:
-    """Append a sandboxId entry to daemon.log so _discover_sandbox_id() finds it.
-
-    Mirrors start-daemon.sh step 10 — same format the extension daemon writes.
-    """
-    log_path = os.path.expanduser("~/.neo/daemon/daemon.log")
-    try:
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        with open(log_path, "a") as f:
-            f.write(f'{{"sandboxId": "{deployment_id}", "source": "standalone"}}\n')
-    except OSError:
-        pass
 
 
 async def _heartbeat_loop(deployment_id: str) -> None:
@@ -268,74 +224,6 @@ async def _auto_start_daemon(secret_key: str) -> bool:
             return True
 
     return False
-
-
-async def _ensure_deployment_id_async(secret_key: str) -> tuple[str, bool]:
-    """Return (deployment_id, daemon_available).
-
-    Gets or creates a stable deployment_id, then ensures a daemon is running
-    to execute tasks locally.  If no daemon is found it is started automatically
-    — the user never needs to start anything manually.
-
-    Priority for deployment_id:
-      1. NEO_DEPLOYMENT_ID env var — explicit pin.
-      2. _discover_sandbox_id() — already registered (VS Code extension or prior run).
-      3. _load_or_create_deployment_id() — stable UUID persisted to disk.
-
-    daemon_available is True when either:
-      - _register_with_daemon() succeeded (Node.js daemon or newly started Python daemon), or
-      - _python_daemon_running() is True (Python daemon already alive), or
-      - _auto_start_daemon() succeeded (daemon was just started in the background).
-    """
-    # 1. Env var override — trust the caller
-    if NEO_DEPLOYMENT_ID:
-        return NEO_DEPLOYMENT_ID, True
-
-    # 2. Resolve deployment ID
-    discovered = _discover_sandbox_id()
-    uid = discovered or _load_or_create_deployment_id()
-    if not discovered:
-        _write_sandbox_id_to_log(uid)   # fast path on next call
-
-    # 3. Try to register with an already-running daemon (Node.js or Python)
-    daemon_ok = await _register_with_daemon(uid, secret_key)
-
-    if not daemon_ok:
-        if _python_daemon_running():
-            daemon_ok = True
-        else:
-            # No daemon running — start one automatically in the background
-            daemon_ok = await _auto_start_daemon(secret_key)
-            if daemon_ok:
-                # Register with the freshly started daemon
-                await _register_with_daemon(uid, secret_key)
-
-    return uid, daemon_ok
-
-
-def _resolve_deployment(deployment_id: str, daemon_available: bool = True) -> tuple[str, str]:
-    """Return (deployment_type, message_prefix) for a task submission.
-
-    Rules (in priority order):
-    - Explicit NEO_DEPLOYMENT_TYPE env var always wins.
-    - HTTP transport with daemon unreachable → "cloud" (hosted server, no local daemon).
-    - Otherwise → "vscode" (route to local daemon; deployment_id is always set).
-
-    In cloud mode the workspace prefix is omitted — there is no local filesystem.
-    """
-    if NEO_DEPLOYMENT_TYPE in ("vscode", "cloud"):
-        dtype = NEO_DEPLOYMENT_TYPE
-    elif NEO_TRANSPORT == "http" and not daemon_available:
-        dtype = "cloud"
-    else:
-        dtype = "vscode"
-
-    if dtype == "cloud":
-        prefix = ""
-    else:
-        prefix = f"Working directory: {_server_cwd}\n\nCreate all files inside this directory.\n\n"
-
-    return dtype, prefix
 
 
 # Capture working directory at server startup — this is where the user launched the MCP client from
@@ -742,20 +630,32 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # ------------------------------------------------------------------ #
         if name == "neo_submit_task":
             secret_key = _ctx_secret_key.get() or NEO_SECRET_KEY
-            deployment_id, daemon_available = await _ensure_deployment_id_async(secret_key)
+            deployment_id = _get_deployment_id()
+
+            # If no deployment_id found, try to auto-start the Python daemon and
+            # wait briefly — the daemon writes its sandboxId to daemon.log which
+            # _discover_sandbox_id() will pick up.
+            if not deployment_id:
+                await _auto_start_daemon(secret_key)
+                for _ in range(10):
+                    await asyncio.sleep(0.5)
+                    deployment_id = _get_deployment_id()
+                    if deployment_id:
+                        break
+
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
             wait = arguments.get("wait_for_completion", False)
 
-            deployment_type, prefix = _resolve_deployment(deployment_id, daemon_available)
+            prefix = f"Working directory: {_server_cwd}\n\nCreate all files inside this directory.\n\n"
             message = f"{prefix}{description}"
 
             submit_body: dict = {
                 "message": message,
-                "deployment_type": deployment_type,
+                "deployment_type": "vscode",
                 "auto_mode": auto_mode,
             }
-            if deployment_id and deployment_type == "vscode":
+            if deployment_id:
                 submit_body["deployment_id"] = deployment_id
 
             try:
@@ -767,7 +667,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             except httpx.HTTPError as exc:
                 return [TextContent(type="text", text=(
                     f"Network error reaching Neo backend: {exc}\n"
-                    f"deployment_type: {deployment_type}, deployment_id: {deployment_id or '(none)'}"
+                    f"deployment_type: vscode, deployment_id: {deployment_id or '(none)'}"
                 ))]
 
             if resp.status_code != 200:
@@ -778,7 +678,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return [TextContent(type="text", text=(
                     f"{handle_error(resp.status_code)}\n"
                     f"HTTP {resp.status_code} — {detail}\n"
-                    f"deployment_type: {deployment_type}, deployment_id: {deployment_id or '(none)'}"
+                    f"deployment_type: vscode, deployment_id: {deployment_id or '(none)'}"
                 ))]
 
             try:
@@ -803,22 +703,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             asyncio.create_task(_poll_task_bg(thread_id))
 
             if not wait:
-                daemon_warning = ""
-                if deployment_type == "vscode" and not daemon_available:
-                    daemon_warning = (
-                        "\n\n⚠ Could not start a local Neo daemon automatically. "
-                        "The task has been queued but will not execute until a daemon is running.\n"
-                        "Fix: ensure `neo-mcp` is installed and try again, "
-                        "or start the Neo extension in VS Code/Cursor."
-                    )
                 return [TextContent(type="text", text=(
-                    f"Task submitted. thread_id: {thread_id}\n"
-                    f"deployment_id: {deployment_id} (deployment_type: {deployment_type})\n\n"
+                    f"Task submitted. thread_id: {thread_id}\n\n"
                     "Polling is running in the background.\n"
                     "• neo_task_plan   — see live step-by-step progress\n"
                     "• neo_task_status — check overall status\n"
                     "• neo_send_feedback — reply if it asks a question\n"
-                    f"• neo_pause_task / neo_stop_task — pause or cancel{daemon_warning}"
+                    "• neo_pause_task / neo_stop_task — pause or cancel"
                 ))]
 
             # wait_for_completion=true: block until terminal state, return output directly
