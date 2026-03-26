@@ -23,7 +23,7 @@ from typing import Any
 _pending_codes: dict[str, dict[str, Any]] = {}
 
 # Public base URL — override via NEO_PUBLIC_URL env var for local dev/testing
-_BASE_URL = os.environ.get("NEO_PUBLIC_URL", "https://mcp.heyneo.so")
+_BASE_URL = os.environ.get("NEO_PUBLIC_URL", "https://mcpserver.heyneo.com")
 
 _CODE_EXPIRY_SECONDS = 600  # 10 minutes
 

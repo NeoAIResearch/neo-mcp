@@ -19,7 +19,7 @@ NEO_TRANSPORT = os.environ.get("NEO_TRANSPORT", "stdio").lower()  # "stdio" or "
 NEO_HTTP_PORT = int(os.environ.get("NEO_HTTP_PORT") or os.environ.get("PORT", "8000"))
 NEO_HTTP_HOST = os.environ.get("NEO_HTTP_HOST", "0.0.0.0")
 # Public base URL used in OAuth discovery payloads (override for local dev)
-_BASE_URL = os.environ.get("NEO_PUBLIC_URL", "https://mcp.heyneo.so")
+_BASE_URL = os.environ.get("NEO_PUBLIC_URL", "https://mcpserver.heyneo.com")
 # Deployment type override: "vscode" routes to local daemon; "cloud" runs on Neo's hosted backend.
 # Auto-detected when not set: HTTP transport without a deployment_id → "cloud"; otherwise "vscode".
 NEO_DEPLOYMENT_TYPE = os.environ.get("NEO_DEPLOYMENT_TYPE", "").lower()  # "vscode" | "cloud" | ""
