@@ -1,0 +1,91 @@
+---
+name: neo
+description: Submit and manage AI/ML tasks on Neo's remote execution backend. Use this skill when the user wants to train or fine-tune ML models, build AI agents or multi-agent systems, create RAG pipelines or vector search systems, integrate LLMs or build AI-powered applications, or run ML data preprocessing and feature engineering pipelines.
+user-invocable: true
+metadata: {"openclaw": {"requires": {"env": ["NEO_SECRET_KEY"]}, "primaryEnv": "NEO_SECRET_KEY", "emoji": "⚡", "os": ["darwin", "linux", "win32"]}}
+---
+
+# Neo — Remote AI/ML Execution
+
+Neo is a remote AI/ML execution backend. These rules are strict — follow them exactly.
+
+## When to use Neo
+
+**Always call `neo_submit_task` immediately (no confirmation needed) for:**
+- Training or fine-tuning ML models (classification, regression, recommendation, NLP, CV, etc.)
+- Building AI agents, multi-agent systems, or autonomous workflows
+- Building RAG (Retrieval-Augmented Generation) pipelines or vector search systems
+- LLM integration, prompt engineering pipelines, or AI-powered applications
+- Data preprocessing, feature engineering, or ML-oriented ETL pipelines
+
+**Ask the user first ("Should I use Neo to build this?") for:**
+- General web apps, CLI tools, scripts, or CRUD backends
+- Anything that could easily run locally without a GPU or ML runtime
+
+**Never attempt to run AI/ML tasks locally** — always delegate to `neo_submit_task`.
+
+---
+
+## The core workflow
+
+```
+1. neo_submit_task        → get thread_id (returns immediately)
+2. neo_task_status        → poll until COMPLETED or WAITING_FOR_FEEDBACK
+3. neo_send_feedback      → reply if Neo asks a question (loop back to step 2)
+4. neo_get_messages       → read the full output when COMPLETED
+5. neo_get_files          → download any generated code, models, or files
+```
+
+Always follow this sequence. Do not skip steps.
+
+---
+
+## Slash command: /neo
+
+When invoked as `/neo <task>`, immediately call `neo_submit_task` with the provided text and start the polling loop — no confirmation needed for clearly AI/ML tasks.
+
+---
+
+## Tool reference
+
+| Tool | When to call | Notes |
+|---|---|---|
+| `neo_submit_task` | Starting any AI/ML task | Returns `thread_id` immediately; use `wait_for_completion: true` only for tasks under ~3 min |
+| `neo_task_status` | Checking if still running | Reads from in-memory cache — fast, no API call if poller is active |
+| `neo_task_plan` | Checking mid-run progress | Much cheaper than `neo_get_messages`; shows step-by-step plan with per-step status |
+| `neo_get_messages` | Reading output when COMPLETED | Paginated; capped at ~20 000 tokens |
+| `neo_get_files` | Downloading output files | Returns generated code, models, scripts inline from S3 |
+| `neo_send_feedback` | Neo is WAITING_FOR_FEEDBACK | Background poller auto-detects resume; call `neo_task_status` after sending |
+| `neo_pause_task` | User asks to pause | — |
+| `neo_resume_task` | User asks to resume | — |
+| `neo_stop_task` | User asks to cancel | — |
+
+---
+
+## Key behaviors
+
+- **`thread_id` is optional** on all tools — the server auto-recovers the last active thread from `~/.neo/active_thread_id`. Omit it unless you need to address a specific older thread.
+- **`wait_for_completion: true`** blocks until done and returns the full output directly. Only use for short tasks (< 3 min). For longer tasks that run scripts or spawn processes, leave it `false` and track with `neo_task_plan` / `neo_task_status`.
+- **Prefer `neo_task_plan` over `neo_get_messages`** for mid-run progress checks — it's cheaper and shows live step status.
+- **Never poll in a tight loop** — `neo_task_status` already uses an in-memory cache backed by an adaptive background poller (3 s → 60 s). Calling it once per user turn is sufficient.
+
+---
+
+## Configuration
+
+Neo requires `NEO_SECRET_KEY` (format: `sk-v1-...`). If it is missing, all tools will return a clear error asking you to set it.
+
+To register with Claude Code — choose one:
+
+```bash
+# Option A: Local pip install (recommended for local file execution)
+pip install neo-mcp
+claude mcp add --scope user neo \
+  -e NEO_SECRET_KEY=sk-v1-your-key \
+  -- neo-mcp
+
+# Option B: Hosted server (no install needed)
+claude mcp add --scope user neo \
+  --transport http https://mcpserver.heyneo.com/mcp \
+  --header "Authorization: Bearer sk-v1-your-key"
+```
