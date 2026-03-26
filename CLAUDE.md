@@ -8,47 +8,61 @@ A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). 
 
 ## Project structure
 
+Each concern lives in its own top-level folder.
+
 ```
 neo-mcp/
-├── src/neo_mcp/server.py   # MCP server — all tools, single file
-├── src/neo_mcp/oauth.py    # OAuth 2.0 PKCE authorization server (HTTP mode)
-├── src/neo_mcp/setup.py    # setup wizard (neo-mcp setup)
-├── src/neo_mcp/daemon.py   # Python daemon for local task execution
-├── docs/
-│   ├── CLIENTS.md          # registration guide for all MCP clients
-│   ├── USAGE.md            # user guide + deployment steps
-│   ├── CONNECTORS.md       # web connector setup (Claude.ai + ChatGPT)
-│   └── WEB_CONNECTOR.md    # web connector implementation notes
-├── skills/
-│   ├── README.md               # index of all framework integrations
-│   ├── claude-code/SKILL.md    # Claude Code skill (/neo command)
-│   ├── vercel/SKILL.md         # Vercel AI SDK (MCP client + inline tools)
-│   ├── openai-agents/SKILL.md  # OpenAI Agents SDK (MCP + function tools)
-│   └── langchain/SKILL.md      # LangChain / LangGraph (MCP adapters + StructuredTool)
-├── tests/
-│   ├── test_connection.py
-│   └── test_server.py
-├── vscode_extension/       # VS Code/Cursor extension (TypeScript, separate release cycle)
-├── .github/workflows/publish-mcp.yml
-├── Dockerfile
-├── pyproject.toml
-└── requirements.txt
+├── python/                         # pip-installable MCP server (neo-mcp package)
+│   ├── src/neo_mcp/
+│   │   ├── server.py               # MCP server — all 9 tools, single file
+│   │   ├── oauth.py                # OAuth 2.0 PKCE authorization server (HTTP mode)
+│   │   ├── setup.py                # setup wizard (neo-mcp setup)
+│   │   ├── daemon.py               # Python daemon for local task execution
+│   │   └── login.py                # browser OAuth flow (neo-mcp login)
+│   ├── tests/
+│   │   ├── test_server.py          # 93-test unit suite (no key needed)
+│   │   └── test_connection.py      # connectivity smoke test (needs key)
+│   ├── scripts/start-daemon.sh     # standalone daemon launcher (bash)
+│   ├── pyproject.toml              # package metadata + entry points
+│   ├── requirements.txt            # runtime deps
+│   ├── Dockerfile                  # HTTP-mode container (used by CI → ECR)
+│   └── DEPLOYMENT.md               # Docker deployment guide
+│
+├── vscode_extension/               # VS Code/Cursor extension (TypeScript, own release cycle)
+│
+├── skills/                         # Agent framework integrations
+│   ├── README.md                   # index
+│   ├── claude-code/SKILL.md        # Claude Code /neo slash command
+│   ├── vercel/SKILL.md             # Vercel AI SDK
+│   ├── openai-agents/SKILL.md      # OpenAI Agents SDK
+│   └── langchain/SKILL.md          # LangChain / LangGraph
+│
+├── docs/                           # Shared documentation
+│   ├── CLIENTS.md                  # Editor setup guide
+│   ├── USAGE.md                    # Usage guide + workflows
+│   ├── CONNECTORS.md               # Claude.ai + ChatGPT web connector setup
+│   └── WEB_CONNECTOR.md            # Web connector implementation notes
+│
+├── .github/workflows/
+│   └── publish-mcp.yml             # CI: builds python/Dockerfile → ECR on push to main
+├── README.md                       # Top-level overview + quick start
+└── CLAUDE.md                       # This file
 ```
 
 ## Commands
 
 ```bash
 # Install dependencies
-pip install -r requirements.txt
+cd python && pip install -r requirements.txt
 
 # Set key (only NEO_SECRET_KEY required)
 export NEO_SECRET_KEY=sk-v1-your-secret-key
 
 # Run the server directly
-python3 src/neo_mcp/server.py
+python3 python/src/neo_mcp/server.py
 
-# Or after pip install:
-neo-mcp
+# Or after pip install (from python/ directory):
+cd python && pip install -e . && neo-mcp
 
 # Authenticate for local daemon (opens browser OAuth flow)
 neo-mcp login
@@ -57,13 +71,13 @@ neo-mcp login
 neo-mcp daemon
 
 # Run unit tests (no key needed)
-python3 -m pytest tests/ -v
+python3 -m pytest python/tests/ -v
 
 # Run connectivity test (requires NEO_SECRET_KEY)
-NEO_SECRET_KEY=sk-v1-... python3 tests/test_connection.py
+NEO_SECRET_KEY=sk-v1-... python3 python/tests/test_connection.py
 
 # Build Docker image
-docker build -t neo-mcp-test .
+docker build -t neo-mcp-test ./python
 
 # Run via Docker
 docker run -i --rm -e NEO_SECRET_KEY=your-secret \
@@ -91,7 +105,7 @@ claude mcp logs neo
 
 ## Architecture
 
-**`src/neo_mcp/server.py`** is the entire server — no submodules, ~1000 lines.
+**`python/src/neo_mcp/server.py`** is the entire server — no submodules, ~1000 lines.
 
 ### Auth
 - Only `NEO_SECRET_KEY` is required (`sk-v1-...`) — passed as `Authorization: Bearer` on every request.
