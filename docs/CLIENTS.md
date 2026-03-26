@@ -202,9 +202,17 @@ claude mcp add --scope user neo -e NEO_SECRET_KEY=YOUR_SECRET_KEY -- docker run 
 
 ## How local execution works
 
-When using local pip/Docker, Neo needs a background daemon to execute tasks (write files, run commands). **This starts automatically** — just submit a task and the daemon launches itself in the background. No manual setup required.
+When using local pip/Docker, Neo needs a background daemon to execute tasks (write files, run commands).
 
-The daemon persists across sessions (it is detached from your editor process). If you ever need to stop it, kill the `neo-mcp` process. Alternatively, use the hosted endpoint (`https://mcpserver.heyneo.com/mcp`) to run tasks on Neo's cloud — no local daemon needed at all.
+**First-time setup (run once):**
+```bash
+neo-mcp login    # opens browser OAuth flow, saves token
+neo-mcp daemon   # starts the background daemon
+```
+
+After that, tasks submitted via `neo_submit_task` will execute locally. The daemon restarts automatically on next task submission if it has stopped, but you need to have run `neo-mcp login` at least once.
+
+Alternatively, use the hosted endpoint (`https://mcpserver.heyneo.com/mcp`) to run tasks on Neo's cloud — no local daemon or login needed at all.
 
 ---
 
