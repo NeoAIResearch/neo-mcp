@@ -1026,66 +1026,122 @@ async def _run_stdio():
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
 
-async def _run_http():
+def _build_http_app():
+    """Build and return the ASGI app for HTTP transport.
+
+    Separated from _run_http() so tests can construct the app without
+    starting a uvicorn server — use httpx.AsyncClient(transport=
+    httpx.ASGITransport(app=_build_http_app())) in tests.
+    """
+    import uuid
     from mcp.server.streamable_http import StreamableHTTPServerTransport
     from starlette.applications import Starlette
+    from starlette.datastructures import Headers
     from starlette.requests import Request
-    from starlette.responses import JSONResponse, Response
-    from starlette.routing import Mount, Route
-    import uvicorn
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
 
-    async def handle_mcp(request: Request) -> Response:
-        """Single endpoint for all MCP streamable-HTTP traffic (POST / GET / DELETE)."""
-        # Bearer token only — OAuth connectors (Claude.ai, ChatGPT) only send this header.
-        # x-access-key is accepted for backwards compat but not required.
-        secret_key = request.headers.get("authorization", "")
-        if secret_key.lower().startswith("bearer "):
-            secret_key = secret_key[7:].strip()
+    # Session store: mcp_session_id -> transport
+    # Each session keeps its own transport so initialize state persists across requests.
+    _sessions: dict[str, StreamableHTTPServerTransport] = {}
+    # Per-session secret key (captured at session creation, used for context var restore)
+    _session_keys: dict[str, str] = {}
+
+    async def _start_session(session_id: str, secret_key: str) -> StreamableHTTPServerTransport:
+        """Create a transport, start the MCP server task, wait until streams are ready."""
+        transport = StreamableHTTPServerTransport(
+            mcp_session_id=session_id, is_json_response_enabled=False
+        )
+        ready = asyncio.Event()
+
+        async def _run_session():
+            async with transport.connect() as (read_stream, write_stream):
+                ready.set()
+                await app.run(read_stream, write_stream, app.create_initialization_options())
+            _sessions.pop(session_id, None)
+            _session_keys.pop(session_id, None)
+
+        asyncio.create_task(_run_session())
+        await ready.wait()  # yield control so the task enters connect() before we proceed
+        return transport
+
+    async def _send_401(send) -> None:
+        body = json.dumps({"error": "Missing Authorization: Bearer <NEO_SECRET_KEY>"}).encode()
+        www_auth = (
+            'Bearer resource_metadata="' + _BASE_URL + '/.well-known/oauth-protected-resource"'
+        )
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"www-authenticate", www_auth.encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    async def mcp_endpoint(scope, receive, send):
+        """Raw ASGI handler for /mcp — manages stateful per-session MCP transports."""
+        if scope["type"] != "http":
+            return
+
+        headers = Headers(scope=scope)
+
+        # Extract Bearer token
+        auth = headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            secret_key = auth[7:].strip()
+        else:
+            secret_key = ""
 
         if not secret_key:
-            return JSONResponse(
-                {"error": "Missing Authorization: Bearer <NEO_SECRET_KEY>"},
-                status_code=401,
-                headers={
-                    "WWW-Authenticate": (
-                        'Bearer resource_metadata="'
-                        + _BASE_URL
-                        + '/.well-known/oauth-protected-resource"'
-                    )
-                },
-            )
+            await _send_401(send)
+            return
 
-        # Set context vars so _headers() picks them up for this request's async context
-        _ctx_api_key.set(request.headers.get("x-access-key", ""))
+        # Set context vars for _headers() in this async context
+        _ctx_api_key.set(headers.get("x-access-key", ""))
         _ctx_secret_key.set(secret_key)
 
-        transport = StreamableHTTPServerTransport(mcp_session_id=None, is_json_response_enabled=False)
-        async with transport.connect() as (read_stream, write_stream):
-            async def run_server():
-                await app.run(read_stream, write_stream, app.create_initialization_options())
+        session_id = headers.get("mcp-session-id", "")
+        if session_id and session_id in _sessions:
+            transport = _sessions[session_id]
+            # Restore the session's key into context so tool calls use the right credentials
+            _ctx_secret_key.set(_session_keys.get(session_id, secret_key))
+        else:
+            session_id = uuid.uuid4().hex
+            transport = await _start_session(session_id, secret_key)
+            _sessions[session_id] = transport
+            _session_keys[session_id] = secret_key
 
-            import anyio
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(run_server)
-                response = await transport.handle_request(request.scope, request.receive, request._send)  # noqa: SLF001
-                tg.cancel_scope.cancel()
-
-        return response
+        await transport.handle_request(scope, receive, send)
 
     async def health(_: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "server": "neo-mcp", "transport": "http"})
 
     from neo_mcp.oauth import oauth_routes
-    starlette_app = Starlette(
+    _starlette = Starlette(
         routes=[
             Route("/", health, methods=["GET"]),
             Route("/health", health, methods=["GET"]),
-            Route("/mcp", handle_mcp, methods=["GET", "POST", "DELETE"]),
             *oauth_routes(),
         ]
     )
 
-    config = uvicorn.Config(starlette_app, host=NEO_HTTP_HOST, port=NEO_HTTP_PORT, log_level="info")
+    # Lightweight ASGI middleware: intercept /mcp before Starlette touches it
+    # (Starlette's Mount redirects /mcp → /mcp/, breaking session establishment)
+    async def _root_asgi(scope, receive, send):
+        if scope["type"] == "http" and scope.get("path", "") == "/mcp":
+            await mcp_endpoint(scope, receive, send)
+        else:
+            await _starlette(scope, receive, send)
+
+    return _root_asgi
+
+
+async def _run_http():
+    import uvicorn
+    asgi_app = _build_http_app()
+    config = uvicorn.Config(asgi_app, host=NEO_HTTP_HOST, port=NEO_HTTP_PORT, log_level="info")
     server = uvicorn.Server(config)
     print(f"Neo MCP HTTP server listening on {NEO_HTTP_HOST}:{NEO_HTTP_PORT}", flush=True)
     asyncio.create_task(_reconnect_inflight_task())

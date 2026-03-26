@@ -1474,5 +1474,346 @@ class TestIntegration(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# 21. HTTP transport — session management and routing
+# ---------------------------------------------------------------------------
+
+class TestHttpTransport(unittest.IsolatedAsyncioTestCase):
+    """Tests for _build_http_app(): session creation, auth, tool availability.
+
+    Uses httpx.AsyncClient with ASGITransport — no network, no uvicorn.
+    Each test builds a fresh app instance (fresh session store).
+    """
+
+    _INIT_PAYLOAD = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "test-client", "version": "1"},
+        },
+    }
+    _INITIALIZED_PAYLOAD = {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {},
+    }
+    _TOOLS_LIST_PAYLOAD = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {},
+    }
+    _MCP_HEADERS = {
+        "Authorization": "Bearer sk-v1-test",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+
+    def _make_client(self):
+        """Return an httpx.AsyncClient wired to a fresh ASGI app instance."""
+        import httpx
+        app = srv._build_http_app()
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        )
+
+    @staticmethod
+    def _parse_sse(content: bytes) -> list[dict]:
+        """Extract JSON objects from SSE data lines."""
+        results = []
+        for line in content.decode().splitlines():
+            if line.startswith("data: "):
+                try:
+                    results.append(json.loads(line[6:]))
+                except json.JSONDecodeError:
+                    pass
+        return results
+
+    # --- Auth ---
+
+    async def test_no_auth_returns_401(self):
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+            )
+        self.assertEqual(resp.status_code, 401)
+
+    async def test_empty_bearer_returns_401(self):
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers={
+                    "Authorization": "Bearer ",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+        self.assertEqual(resp.status_code, 401)
+
+    async def test_401_includes_www_authenticate_header(self):
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+            )
+        self.assertIn("www-authenticate", resp.headers)
+        self.assertIn("Bearer", resp.headers["www-authenticate"])
+
+    async def test_401_body_is_json(self):
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+            )
+        self.assertEqual(resp.status_code, 401)
+        body = resp.json()
+        self.assertIn("error", body)
+
+    async def test_double_space_bearer_is_accepted(self):
+        """Bearer tokens with extra leading space (common copy-paste mistake) must still work."""
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers={
+                    "Authorization": "Bearer  sk-v1-test",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+        # Must NOT be 401 — extra space is stripped
+        self.assertNotEqual(resp.status_code, 401)
+
+    # --- Session establishment ---
+
+    async def test_initialize_returns_200(self):
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers=self._MCP_HEADERS,
+            )
+        self.assertEqual(resp.status_code, 200)
+
+    async def test_initialize_returns_mcp_session_id_header(self):
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers=self._MCP_HEADERS,
+            )
+        self.assertIn("mcp-session-id", resp.headers)
+        session_id = resp.headers["mcp-session-id"]
+        self.assertTrue(len(session_id) > 0)
+
+    async def test_initialize_response_contains_server_info(self):
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers=self._MCP_HEADERS,
+            )
+        messages = self._parse_sse(resp.content)
+        self.assertTrue(len(messages) > 0, "Expected at least one SSE message")
+        init_result = messages[0]
+        self.assertIn("result", init_result)
+        self.assertIn("serverInfo", init_result["result"])
+        self.assertEqual(init_result["result"]["serverInfo"]["name"], "neo-mcp")
+
+    # --- Tool listing after initialization ---
+
+    async def _do_handshake(self, client) -> str:
+        """Run the full MCP handshake and return the session ID."""
+        init_resp = await client.post(
+            "/mcp",
+            content=json.dumps(self._INIT_PAYLOAD),
+            headers=self._MCP_HEADERS,
+        )
+        self.assertEqual(init_resp.status_code, 200)
+        session_id = init_resp.headers["mcp-session-id"]
+
+        await client.post(
+            "/mcp",
+            content=json.dumps(self._INITIALIZED_PAYLOAD),
+            headers={**self._MCP_HEADERS, "mcp-session-id": session_id},
+        )
+        return session_id
+
+    async def test_tools_list_returns_200(self):
+        async with self._make_client() as client:
+            session_id = await self._do_handshake(client)
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._TOOLS_LIST_PAYLOAD),
+                headers={**self._MCP_HEADERS, "mcp-session-id": session_id},
+            )
+        self.assertEqual(resp.status_code, 200)
+
+    async def test_tools_list_returns_all_nine_tools(self):
+        async with self._make_client() as client:
+            session_id = await self._do_handshake(client)
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._TOOLS_LIST_PAYLOAD),
+                headers={**self._MCP_HEADERS, "mcp-session-id": session_id},
+            )
+        messages = self._parse_sse(resp.content)
+        tools_result = next(
+            (m for m in messages if "result" in m and "tools" in m.get("result", {})),
+            None,
+        )
+        self.assertIsNotNone(tools_result, f"No tools/list result in SSE: {messages}")
+        tool_names = [t["name"] for t in tools_result["result"]["tools"]]
+        expected = [
+            "neo_submit_task", "neo_task_status", "neo_task_plan",
+            "neo_get_messages", "neo_get_files", "neo_send_feedback",
+            "neo_pause_task", "neo_resume_task", "neo_stop_task",
+        ]
+        for name in expected:
+            self.assertIn(name, tool_names, f"Missing tool: {name}")
+
+    async def test_tools_list_not_32602_error(self):
+        """Regression: before the session-store fix, tools/list returned -32602."""
+        async with self._make_client() as client:
+            session_id = await self._do_handshake(client)
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._TOOLS_LIST_PAYLOAD),
+                headers={**self._MCP_HEADERS, "mcp-session-id": session_id},
+            )
+        messages = self._parse_sse(resp.content)
+        for msg in messages:
+            if "error" in msg:
+                self.assertNotEqual(
+                    msg["error"].get("code"), -32602,
+                    "Got -32602 (Invalid request parameters) — session state not persisted"
+                )
+
+    async def test_unknown_session_id_returns_404(self):
+        """MCP protocol: an unrecognised mcp-session-id must return 404.
+
+        The client must start fresh (no session ID header) to establish a new
+        session.  Silently creating a new session would break the protocol.
+        """
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._TOOLS_LIST_PAYLOAD),
+                headers={**self._MCP_HEADERS, "mcp-session-id": "nonexistent-session-abc"},
+            )
+        self.assertEqual(resp.status_code, 404)
+
+    async def test_session_id_is_unique_per_request(self):
+        """Two independent initialize requests must receive different session IDs."""
+        async with self._make_client() as client:
+            r1 = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers=self._MCP_HEADERS,
+            )
+            r2 = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers=self._MCP_HEADERS,
+            )
+        self.assertNotEqual(
+            r1.headers["mcp-session-id"],
+            r2.headers["mcp-session-id"],
+        )
+
+    async def test_session_reuse_same_transport(self):
+        """The same session ID reuses the existing transport (state persists)."""
+        async with self._make_client() as client:
+            session_id = await self._do_handshake(client)
+
+            # tools/list on the same session must succeed
+            r1 = await client.post(
+                "/mcp",
+                content=json.dumps(self._TOOLS_LIST_PAYLOAD),
+                headers={**self._MCP_HEADERS, "mcp-session-id": session_id},
+            )
+            # A second tools/list on the same session must also succeed
+            r2 = await client.post(
+                "/mcp",
+                content=json.dumps(self._TOOLS_LIST_PAYLOAD),
+                headers={**self._MCP_HEADERS, "mcp-session-id": session_id},
+            )
+
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r2.status_code, 200)
+        # Both responses must carry the same session ID
+        self.assertEqual(r1.headers.get("mcp-session-id", session_id),
+                         r2.headers.get("mcp-session-id", session_id))
+
+    # --- Context var isolation ---
+
+    async def test_per_session_key_stored_in_context(self):
+        """The key supplied at initialize time is the key used for that session."""
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers={
+                    "Authorization": "Bearer sk-v1-session-specific",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("mcp-session-id", resp.headers)
+
+    # --- Health / routing ---
+
+    async def test_health_endpoint(self):
+        async with self._make_client() as client:
+            resp = await client.get("/health")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["transport"], "http")
+
+    async def test_root_endpoint(self):
+        async with self._make_client() as client:
+            resp = await client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "ok")
+
+    async def test_mcp_path_no_redirect(self):
+        """/mcp must NOT redirect to /mcp/ — that would break session establishment."""
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers=self._MCP_HEADERS,
+                follow_redirects=False,
+            )
+        self.assertNotIn(resp.status_code, (301, 302, 307, 308),
+                         f"Got unexpected redirect {resp.status_code} → {resp.headers.get('location')}")
+
+    async def test_initialized_notification_returns_202(self):
+        async with self._make_client() as client:
+            init_resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INIT_PAYLOAD),
+                headers=self._MCP_HEADERS,
+            )
+            session_id = init_resp.headers["mcp-session-id"]
+            notif_resp = await client.post(
+                "/mcp",
+                content=json.dumps(self._INITIALIZED_PAYLOAD),
+                headers={**self._MCP_HEADERS, "mcp-session-id": session_id},
+            )
+        self.assertEqual(notif_resp.status_code, 202)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
