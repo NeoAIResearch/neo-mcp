@@ -2,7 +2,7 @@
 name: neo
 description: Submit and manage AI/ML tasks on Neo's remote execution backend. Use this skill when the user wants to train or fine-tune ML models, build AI agents or multi-agent systems, create RAG pipelines or vector search systems, integrate LLMs or build AI-powered applications, or run ML data preprocessing and feature engineering pipelines.
 user-invocable: true
-metadata: {"openclaw": {"requires": {"env": ["NEO_SECRET_KEY"]}, "primaryEnv": "NEO_SECRET_KEY", "emoji": "⚡", "os": ["darwin", "linux", "win32"]}}
+metadata: {"openclaw": {"emoji": "⚡", "os": ["darwin", "linux", "win32"]}}
 ---
 
 # Neo — Remote AI/ML Execution
@@ -73,9 +73,7 @@ When invoked as `/neo <task>`, immediately call `neo_submit_task` with the provi
 
 ## Configuration
 
-Neo requires `NEO_SECRET_KEY` (format: `sk-v1-...`). If it is missing, all tools will return a clear error asking you to set it.
-
-To register with Claude Code — choose one:
+To register Neo with Claude Code — choose one:
 
 ```bash
 # Option A: Local pip install (recommended for local file execution)
@@ -84,8 +82,10 @@ claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-your-key \
   -- neo-mcp
 
-# Option B: Hosted server (no install needed)
+# Option B: Hosted server — no install needed (recommended)
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
   --header "Authorization: Bearer sk-v1-your-key"
 ```
+
+After running either command, open a **new Claude Code session** for the tools to load.
