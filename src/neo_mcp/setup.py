@@ -72,13 +72,58 @@ def _backup(path: Path, no_backup: bool) -> None:
         shutil.copy2(path, bak)
 
 
+def _strip_jsonc(text: str) -> str:
+    """Strip JS-style comments from JSONC, respecting string boundaries.
+
+    A naive regex strips // inside URL values like "https://example.com",
+    corrupting the JSON. This state-machine approach only strips comments
+    that appear outside of quoted strings.
+    """
+    result: list[str] = []
+    i = 0
+    in_string = False
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            result.append(c)
+            if c == "\\":
+                i += 1
+                if i < len(text):
+                    result.append(text[i])
+            elif c == '"':
+                in_string = False
+        else:
+            if c == '"':
+                in_string = True
+                result.append(c)
+            elif c == "/" and i + 1 < len(text):
+                nxt = text[i + 1]
+                if nxt == "/":
+                    while i < len(text) and text[i] != "\n":
+                        i += 1
+                    continue
+                elif nxt == "*":
+                    i += 2
+                    while i < len(text) - 1 and not (text[i] == "*" and text[i + 1] == "/"):
+                        i += 1
+                    i += 2
+                    continue
+                else:
+                    result.append(c)
+            else:
+                result.append(c)
+        i += 1
+    return "".join(result)
+
+
 def _read_json_file(path: Path) -> dict:
-    """Read JSON or JSONC file, stripping comments before parsing."""
+    """Read a JSON or JSONC file (e.g. VS Code settings with // comments)."""
     text = path.read_text(encoding="utf-8")
-    # Strip // line comments and /* block comments */
-    text = re.sub(r'//[^\n]*', '', text)
-    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # File may be JSONC (comments allowed) — strip comments and retry
+        return json.loads(_strip_jsonc(text))
 
 
 def _write_json_file(path: Path, data: dict, no_backup: bool) -> None:
