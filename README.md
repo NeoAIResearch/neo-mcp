@@ -29,6 +29,8 @@ claude mcp add --scope user neo \
 
 Verify: `claude mcp list`
 
+> **After adding:** MCP tools load at session start. Open a **new Claude Code session** (new conversation) for the Neo tools to appear.
+
 ---
 
 ### Option C: Claude Code `/neo` skill

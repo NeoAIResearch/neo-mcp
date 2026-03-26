@@ -22,11 +22,13 @@ The wizard asks for your key, detects your installed editors, and writes all con
 claude mcp add --scope user neo --transport http https://mcpserver.heyneo.com/mcp --header "Authorization: Bearer YOUR_SECRET_KEY"
 ```
 
-Verify:
+Verify the server is connected:
 
 ```bash
 claude mcp list
 ```
+
+> **Important:** MCP tools load at session start. After running `claude mcp add`, start a **new Claude Code session** (new conversation) for the Neo tools to appear.
 
 > **Scope options:** `--scope user` (global, recommended) · `--scope project` (writes `.mcp.json` in the current repo) · `--scope local` (this machine only)
 
