@@ -41,10 +41,12 @@ Install the skill so Claude Code knows to route AI/ML requests to Neo automatica
 
 ```bash
 curl -o ~/.claude/skills/neo.md \
-  https://raw.githubusercontent.com/NeoResearchAI/MCPServer/main/skills/neo/SKILL.md
+  https://raw.githubusercontent.com/NeoResearchAI/MCPServer/main/skills/claude-code/SKILL.md
 ```
 
 Then register the MCP server using Option A or B above, and use `/neo <task>` in any Claude Code conversation.
+
+> **Other agent frameworks:** see [`skills/`](skills/README.md) for Vercel AI SDK, OpenAI Agents SDK, and LangChain integration guides.
 
 ---
 
