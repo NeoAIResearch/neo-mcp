@@ -45,6 +45,12 @@ python3 src/neo_mcp/server.py
 # Or after pip install:
 neo-mcp
 
+# Authenticate for local daemon (opens browser OAuth flow)
+neo-mcp login
+
+# Start the Python daemon (for local file execution, after login)
+neo-mcp daemon
+
 # Run unit tests (no key needed)
 python3 -m pytest tests/ -v
 
@@ -121,6 +127,18 @@ When the VS Code/Cursor extension daemon is running:
 
 When no daemon is running:
 - `_auto_start_daemon(secret_key)` spawns the Python daemon (`neo-mcp daemon <cwd>`) as a detached subprocess, waits up to 3 s for its PID file
+
+### Python daemon authentication (`src/neo_mcp/daemon.py`)
+The Python daemon polls `/v2/poll/{deployment_id}` which requires an **OAuth token**, not the `NEO_SECRET_KEY` API key.
+
+**Auth file:** `~/.neo/daemon/mcp_auth.json` — `{"access_token": "...", "refresh_token": "...", "username": "..."}`
+
+This file is written by:
+- **`neo-mcp login`** (`src/neo_mcp/login.py`) — opens `https://heyneo.so/login?redirect=http://localhost:{port}/callback` in the browser, waits for the OAuth callback, then writes the token. Fallback: manual token paste prompt.
+- **VS Code/Cursor extension** — writes the file automatically when logged in via the extension UI.
+
+The daemon exits with a clear error if no valid token is found: `"Run 'neo-mcp login' to authenticate"`.
+On 401 from the poll endpoint, the daemon calls `POST /auth/refresh-token` with `{username, refreshToken}` and retries once.
 
 ### Other design points
 - `NEO_READ_ONLY=true` strips all write tools at `list_tools()` time — only `neo_task_status`, `neo_task_plan`, `neo_get_messages`, and `neo_get_files` remain.

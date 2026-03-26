@@ -1107,6 +1107,10 @@ def main():
         from neo_mcp.setup import run_setup
         run_setup(sys.argv[2:])
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "login":
+        from neo_mcp.login import run_login
+        run_login()
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "daemon":
         from neo_mcp.daemon import main as daemon_main
         sys.argv = [sys.argv[0]] + sys.argv[2:]

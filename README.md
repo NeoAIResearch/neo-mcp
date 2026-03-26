@@ -2,6 +2,8 @@
 
 Run AI/ML tasks on Neo's remote backend from any AI editor — Claude Code, Cursor, Windsurf, Zed, VS Code, Continue.dev, OpenAI Codex CLI, Claude.ai, and ChatGPT.
 
+> **Task execution requires the Neo VS Code or Cursor extension to be running.** The extension is your local sandbox — it receives commands from Neo's backend and executes them (writes files, runs scripts) on your machine.
+
 ---
 
 ## Quick start — choose one
@@ -38,7 +40,6 @@ Verify: `claude mcp list`
 Install the skill so Claude Code knows to route AI/ML requests to Neo automatically:
 
 ```bash
-# Download and install
 curl -o ~/.claude/skills/neo.md \
   https://raw.githubusercontent.com/NeoResearchAI/MCPServer/main/skills/neo/SKILL.md
 ```
@@ -82,7 +83,7 @@ Assistant: Submitting to Neo…
 ```
 neo_submit_task
       │
-      ├─ discovers daemon sandbox ID (VS Code/Cursor extension or auto-started Python daemon)
+      ├─ discovers VS Code/Cursor extension sandbox ID
       ├─ POST /v2/thread/init-chat-direct  →  thread_id  (returns immediately)
       │         deployment_type: "vscode"
       │
@@ -134,7 +135,7 @@ neo_get_files    →  download any files
 
 **Mid-task question:**
 ```
-neo_task_status  →  WAITING_FOR_FEEDBACK
+neo_task_status   →  WAITING_FOR_FEEDBACK
 neo_send_feedback →  your reply  →  task resumes automatically
 ```
 
@@ -145,16 +146,18 @@ neo_send_feedback →  your reply  →  task resumes automatically
 ### Claude Code
 
 ```bash
-# pip (local, recommended)
+# pip (local)
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-... \
   -- neo-mcp
 
-# Hosted server (no install)
+# Hosted server (no install, recommended)
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
   --header "Authorization: Bearer sk-v1-..."
 ```
+
+> Open a **new Claude Code session** after running either command.
 
 ### Cursor
 
@@ -284,10 +287,11 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for the full guide including Docker, scop
 |---|---|
 | `Invalid API key` (401) | Re-check `NEO_SECRET_KEY` at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys |
 | `Trial or quota ended` (403) | Top up at the Neo dashboard |
-| `No healthy deployments available` (400) | The VS Code/Cursor extension is not running — start it and try again. Neo routes task execution through your local extension. |
-| `Task submitted but no files written locally` | VS Code/Cursor extension must be running for local file writes. |
-| Task submission hangs or times out | Your local extension sandbox has expired — restart the VS Code/Cursor extension to get a fresh sandbox ID. |
+| `No healthy deployments available` (400) | The VS Code/Cursor extension is not running — start it and try again |
+| `Task submitted but no files written locally` | The VS Code/Cursor extension must be running for local file writes |
+| Task submission hangs or times out | Extension sandbox has expired — restart the VS Code/Cursor extension |
 | `neo-mcp` not found | Re-run `pip install neo-mcp` and verify `which neo-mcp` |
+| Neo tools don't appear after `claude mcp add` | Open a **new Claude Code session** — tools load at session start |
 | Output truncated | Cap is ~20 000 tokens — use `neo_task_plan` for a concise step summary |
 | Status stuck on RUNNING | Call `neo_task_plan` to see which step is blocked |
-| `Failed to connect` in `claude mcp list` | Header not passed — re-run `claude mcp add` with `--header "Authorization: Bearer YOUR_KEY"` on one line |
+| `Failed to connect` in `claude mcp list` | Re-run `claude mcp add` with `--header "Authorization: Bearer YOUR_KEY"` on one line |

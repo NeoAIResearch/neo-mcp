@@ -5,6 +5,11 @@ Replaces the Node.js VS Code extension daemon for pip-only installations.
 Polls GET /v2/poll/{deployment_id} for commands and executes them locally,
 then sends results back via POST /v2/poll/response.
 
+Authentication:
+    Uses the OAuth access_token stored in ~/.neo/daemon/mcp_auth.json.
+    Run `neo-mcp login` once to authenticate and write this file.
+    The VS Code/Cursor extension also writes this file when logged in.
+
 Supported actions (matches DaemonActionHandlers.ts exactly):
   create_session, write_code, get_file, run_subprocess,
   get_job_status, terminate_job, list_files
@@ -13,7 +18,6 @@ Usage:
     neo-mcp daemon [/path/to/workspace] [--deployment-id UUID]
 
 Environment:
-    NEO_SECRET_KEY   — required (sk-v1-...)
     NEO_API_URL      — optional, defaults to https://master.heyneo.so
     NEO_DEPLOYMENT_ID — optional, pin to a specific UUID
 """
@@ -37,9 +41,10 @@ import httpx
 # ---------------------------------------------------------------------------
 
 NEO_API_URL: str = os.environ.get("NEO_API_URL", "https://master.heyneo.so")
-NEO_SECRET_KEY: str = os.environ.get("NEO_SECRET_KEY", "")
+NEO_AUTH_URL: str = os.environ.get("NEO_AUTH_URL", "https://master.heyneo.so")
 
 _DAEMON_DIR = os.path.expanduser("~/.neo/daemon")
+_MCP_AUTH_FILE = os.path.join(_DAEMON_DIR, "mcp_auth.json")
 _STANDALONE_UUID_FILE = os.path.join(_DAEMON_DIR, "standalone_deployment_id")
 _DAEMON_LOG = os.path.join(_DAEMON_DIR, "daemon.log")
 _PID_FILE = os.path.join(_DAEMON_DIR, "python_daemon.pid")
@@ -47,6 +52,60 @@ _WORKSPACES_FILE = os.path.join(_DAEMON_DIR, "thread-workspaces.json")
 
 # Directories to skip when listing files (matches DaemonActionHandlers.ts)
 _SKIP_DIRS = {"venv", "node_modules", "env", ".venv", "__pycache__", ".git", ".tox", "dist", "build"}
+
+
+# ---------------------------------------------------------------------------
+# OAuth token management
+# ---------------------------------------------------------------------------
+
+def _load_mcp_auth() -> dict:
+    """Load the OAuth credentials written by VS Code extension or neo-mcp login."""
+    try:
+        return json.loads(Path(_MCP_AUTH_FILE).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_mcp_auth(data: dict) -> None:
+    os.makedirs(_DAEMON_DIR, exist_ok=True)
+    Path(_MCP_AUTH_FILE).write_text(json.dumps(data, indent=2))
+
+
+def _get_oauth_token() -> str:
+    """Return the current OAuth access_token, or empty string if not authenticated."""
+    auth = _load_mcp_auth()
+    token = auth.get("access_token", "")
+    # Treat obviously invalid tokens as missing
+    if not token or token in ("\\", "null", "undefined") or len(token) < 10:
+        return ""
+    return token
+
+
+async def _refresh_oauth_token() -> str:
+    """Try to refresh the OAuth token using the stored refresh_token.
+    Returns the new access_token on success, empty string on failure.
+    """
+    auth = _load_mcp_auth()
+    refresh_token = auth.get("refresh_token", "")
+    username = auth.get("username", "")
+    if not refresh_token or not username:
+        return ""
+    try:
+        async with httpx.AsyncClient(base_url=NEO_AUTH_URL, timeout=10.0) as c:
+            r = await c.post(
+                "/auth/refresh-token",
+                json={"username": username, "refreshToken": refresh_token},
+            )
+            if r.status_code == 200:
+                data = r.json()
+                new_token = data.get("token") or data.get("access_token") or data.get("accessToken", "")
+                if new_token:
+                    auth["access_token"] = new_token
+                    _save_mcp_auth(auth)
+                    return new_token
+    except Exception:
+        pass
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -124,39 +183,63 @@ def _save_thread_workspaces(workspaces: dict[str, str]) -> None:
 # Backend HTTP helpers
 # ---------------------------------------------------------------------------
 
-def _auth() -> dict[str, str]:
-    return {"Authorization": f"Bearer {NEO_SECRET_KEY}"}
+def _auth(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
 
 
-async def _poll_backend(client: httpx.AsyncClient, dep_id: str) -> list[dict]:
-    """GET /v2/poll/{dep_id} — returns list of command dicts."""
-    try:
-        r = await client.get(
-            f"/v2/poll/{dep_id}",
-            params={"max_messages": 10, "wait_time": 5},
-            headers=_auth(),
-            timeout=15.0,
-        )
-        if r.status_code == 401:
-            print("ERROR: NEO_SECRET_KEY is invalid or expired.", file=sys.stderr, flush=True)
-            return []
-        if r.status_code not in (200, 404):
-            return []
-        if r.status_code == 404:
-            return []
-        data = r.json()
-        return data if isinstance(data, list) else data.get("messages", [])
-    except Exception:
-        return []
+async def _poll_backend(
+    client: httpx.AsyncClient,
+    dep_id: str,
+    token: str,
+) -> tuple[list[dict], str]:
+    """GET /v2/poll/{dep_id} — returns (commands, updated_token).
+
+    Handles 401 by attempting a token refresh once.
+    Returns ([], token) on error.
+    """
+    for attempt in range(2):
+        try:
+            r = await client.get(
+                f"/v2/poll/{dep_id}",
+                params={"max_messages": 10, "wait_time": 5},
+                headers=_auth(token),
+                timeout=15.0,
+            )
+            if r.status_code == 401 and attempt == 0:
+                new_token = await _refresh_oauth_token()
+                if new_token:
+                    token = new_token
+                    continue
+                print(
+                    "ERROR: OAuth token is invalid or expired. Run 'neo-mcp login' to re-authenticate.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return [], token
+            if r.status_code not in (200, 404):
+                return [], token
+            if r.status_code == 404:
+                return [], token
+            data = r.json()
+            commands = data if isinstance(data, list) else data.get("messages", [])
+            return commands, token
+        except Exception:
+            return [], token
+    return [], token
 
 
-async def _send_response(client: httpx.AsyncClient, dep_id: str, response: dict) -> None:
+async def _send_response(
+    client: httpx.AsyncClient,
+    dep_id: str,
+    token: str,
+    response: dict,
+) -> None:
     """POST /v2/poll/response — send action result back to backend."""
     response.setdefault("sandbox_id", dep_id)
     try:
         await client.post(
             "/v2/poll/response",
-            headers=_auth(),
+            headers=_auth(token),
             json=response,
             timeout=30.0,
         )
@@ -204,7 +287,6 @@ def _h_write_code(cmd: dict, workspace: str) -> dict:
         return {"request_id": cmd["request_id"], "status": "error", "error": "filename and code are required"}
     workdir = cmd.get("workdir") or ""
     base = os.path.join(workspace, workdir) if workdir else workspace
-    # Try workdir-relative first, fall back to workspace-relative
     full = _safe_resolve(base, fname) or _safe_resolve(workspace, fname)
     if not full:
         return {"request_id": cmd["request_id"], "status": "error",
@@ -378,19 +460,22 @@ async def _dispatch(cmd: dict, workspace: str) -> dict:
 # ---------------------------------------------------------------------------
 
 async def run_daemon(workspace: Optional[str] = None, deployment_id: Optional[str] = None) -> None:
-    if not NEO_SECRET_KEY:
-        print(
-            "ERROR: NEO_SECRET_KEY is not set.\n"
-            "Export it before starting the daemon:\n"
-            "  export NEO_SECRET_KEY=sk-v1-...",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     ws = os.path.realpath(workspace or os.getcwd())
     dep_id = deployment_id or get_or_create_deployment_id()
 
-    # Persist so server.py _discover_sandbox_id() finds this deployment
+    # Load OAuth token from mcp_auth.json (written by VS Code extension or neo-mcp login)
+    token = _get_oauth_token()
+    if not token:
+        print(
+            "ERROR: No OAuth token found.\n"
+            "Run 'neo-mcp login' to authenticate, or log in via the Neo VS Code/Cursor extension.\n"
+            f"Token file: {_MCP_AUTH_FILE}",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
+
+    # Persist sandbox ID so server.py _discover_sandbox_id() finds this deployment
     write_sandbox_log(dep_id)
 
     # Write PID file so server.py can check if we're running
@@ -400,15 +485,13 @@ async def run_daemon(workspace: Optional[str] = None, deployment_id: Optional[st
     # Load thread→workspace mappings persisted from previous runs
     thread_workspaces: dict[str, str] = _load_thread_workspaces()
 
-    print(f"Neo Python daemon ready", flush=True)
+    print("Neo daemon ready", flush=True)
     print(f"  deployment_id : {dep_id}", flush=True)
     print(f"  workspace     : {ws}", flush=True)
     print(f"  backend       : {NEO_API_URL}", flush=True)
     print(f"  pid           : {os.getpid()}", flush=True)
-    print(f"  key           : {NEO_SECRET_KEY[:16]}...", flush=True)
     print("Polling for commands...\n", flush=True)
 
-    # Graceful shutdown
     def _shutdown(signum: int, frame) -> None:  # noqa: ANN001
         print("\nDaemon shutting down.", flush=True)
         try:
@@ -423,16 +506,14 @@ async def run_daemon(workspace: Optional[str] = None, deployment_id: Optional[st
     async with httpx.AsyncClient(base_url=NEO_API_URL) as client:
         backoff = 1.0
         while True:
-            commands = await _poll_backend(client, dep_id)
+            commands, token = await _poll_backend(client, dep_id, token)
             if commands:
                 backoff = 1.0
                 for cmd in commands:
                     tid = cmd.get("thread_id")
-                    # Use per-thread workspace if known, otherwise default workspace
                     effective_ws = thread_workspaces.get(tid, ws) if tid else ws
                     resp = await _dispatch(cmd, effective_ws)
 
-                    # Echo routing fields back (required by backend)
                     if tid:
                         resp["thread_id"] = tid
                         if tid not in thread_workspaces:
@@ -441,7 +522,7 @@ async def run_daemon(workspace: Optional[str] = None, deployment_id: Optional[st
                     if cmd.get("response_queue_name"):
                         resp["response_queue_name"] = cmd["response_queue_name"]
 
-                    await _send_response(client, dep_id, resp)
+                    await _send_response(client, dep_id, token, resp)
             else:
                 await asyncio.sleep(min(backoff, 10.0))
                 backoff = min(backoff * 1.5, 10.0)
@@ -456,8 +537,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="neo-mcp daemon",
         description=(
-            "Neo Python daemon — polls the Neo backend for commands and executes\n"
-            "them locally. Run this instead of (or alongside) the VS Code extension."
+            "Neo daemon — polls the Neo backend for commands and executes them locally.\n\n"
+            "Requires authentication: run 'neo-mcp login' first, or log in via the\n"
+            "Neo VS Code/Cursor extension (it writes the token automatically)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
