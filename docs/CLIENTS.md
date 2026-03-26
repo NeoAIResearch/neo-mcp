@@ -1,96 +1,46 @@
 # Neo MCP — Client Setup Guide
 
----
+**Neo MCP server:** `https://mcpserver.heyneo.com/mcp`
 
-## What you need
-
-A single **Neo secret key** (`sk-v1-...`) from the **Neo dashboard → Settings → API Keys**.
-
-That's it — no second key, no OAuth token. Every connection method below uses this one key.
+Get your secret key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.
 
 ---
 
-## Quickstart — setup wizard (recommended)
+## Quickstart — one command
 
 ```bash
-pip install neo-mcp
-neo-mcp setup
+pip install neo-mcp && neo-mcp setup
 ```
 
-The wizard detects your installed editors, prompts for your secret key, and writes all config files automatically. After setup, restart your editor and verify with `/mcp` (Claude Code) or the editor's MCP settings panel.
-
----
-
-## Web browsers — no install required
-
-> **Note:** The hosted endpoint (`https://mcp.heyneo.so/mcp`) is not yet deployed.
-> Once it goes live, the web connector method below will work without any local install.
-> For now, use the local pip or Docker method with your editor.
-
-### Claude.ai _(coming soon — requires hosted endpoint)_
-
-1. Open **claude.ai** → Settings → **Integrations**
-2. Click **Add custom connector**
-3. Enter the URL: `https://mcp.heyneo.so/mcp`
-4. Complete the OAuth flow — enter your `sk-v1-...` key when prompted
-5. Neo tools appear in every conversation automatically
-
-Full walkthrough: [CONNECTORS.md](CONNECTORS.md)
-
-### ChatGPT _(coming soon — requires hosted endpoint)_
-
-1. Open **chatgpt.com** → Settings → **Connectors**
-2. Click **Add connector → Custom**
-3. Enter the URL: `https://mcp.heyneo.so/mcp`
-4. Complete the OAuth flow — enter your `sk-v1-...` key when prompted
+The wizard asks for your key, detects your installed editors, and writes all configs automatically. Restart your editor after setup.
 
 ---
 
 ## Claude Code
 
-### Remote — hosted endpoint _(coming soon)_
-
-Once the hosted endpoint is live:
-
 ```bash
-claude mcp add --transport http --scope user neo https://mcp.heyneo.so/mcp \
-  --header "Authorization: Bearer YOUR_SECRET_KEY"
+claude mcp add --scope user neo --transport http https://mcpserver.heyneo.com/mcp --header "Authorization: Bearer YOUR_SECRET_KEY"
 ```
 
-### Local — pip (works now)
+Verify:
 
 ```bash
-pip install neo-mcp
-claude mcp add --scope user neo \
-  -e NEO_SECRET_KEY=sk-v1-... \
-  -- neo-mcp
+claude mcp list
 ```
 
-### Local — Docker (works now)
-
-```bash
-claude mcp add --scope user neo \
-  -e NEO_SECRET_KEY=sk-v1-... \
-  -- docker run -i --rm \
-     -e NEO_SECRET_KEY \
-     ghcr.io/heyneo/neo-mcp-server
-```
-
-> **Scope options:** `--scope user` applies globally across all projects; `--scope project` writes to `.mcp.json` in the current repo; `--scope local` is machine-local only.
+> **Scope options:** `--scope user` (global, recommended) · `--scope project` (writes `.mcp.json` in the current repo) · `--scope local` (this machine only)
 
 ---
 
 ## Cursor
 
-Config file: `~/.cursor/mcp.json` (create if it doesn't exist; restart Cursor after editing)
-
-### Remote _(coming soon)_
+Edit `~/.cursor/mcp.json` (create if it doesn't exist):
 
 ```json
 {
   "mcpServers": {
     "neo": {
-      "url": "https://mcp.heyneo.so/mcp",
+      "url": "https://mcpserver.heyneo.com/mcp",
       "headers": {
         "Authorization": "Bearer YOUR_SECRET_KEY"
       }
@@ -99,34 +49,19 @@ Config file: `~/.cursor/mcp.json` (create if it doesn't exist; restart Cursor af
 }
 ```
 
-### Local — pip (works now)
-
-```json
-{
-  "mcpServers": {
-    "neo": {
-      "command": "neo-mcp",
-      "env": {
-        "NEO_SECRET_KEY": "sk-v1-..."
-      }
-    }
-  }
-}
-```
+Restart Cursor.
 
 ---
 
 ## Windsurf
 
-Config file: `~/.codeium/windsurf/mcp_config.json`
-
-### Remote _(coming soon)_
+Edit `~/.codeium/windsurf/mcp_config.json`:
 
 ```json
 {
   "mcpServers": {
     "neo": {
-      "serverUrl": "https://mcp.heyneo.so/mcp",
+      "serverUrl": "https://mcpserver.heyneo.com/mcp",
       "headers": {
         "Authorization": "Bearer YOUR_SECRET_KEY"
       }
@@ -135,15 +70,22 @@ Config file: `~/.codeium/windsurf/mcp_config.json`
 }
 ```
 
-### Local — pip (works now)
+Restart Windsurf.
+
+---
+
+## VS Code (GitHub Copilot)
+
+Requires VS Code 1.99+. Edit `.vscode/mcp.json` in your workspace root (create if it doesn't exist):
 
 ```json
 {
-  "mcpServers": {
+  "servers": {
     "neo": {
-      "command": "neo-mcp",
-      "env": {
-        "NEO_SECRET_KEY": "sk-v1-..."
+      "type": "http",
+      "url": "https://mcpserver.heyneo.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_SECRET_KEY"
       }
     }
   }
@@ -154,15 +96,7 @@ Config file: `~/.codeium/windsurf/mcp_config.json`
 
 ## Zed
 
-Config file: `~/.config/zed/settings.json` — add under the `"context_servers"` key.
-
-### Remote via mcp-remote proxy _(coming soon)_
-
-Zed does not yet support HTTP MCP transport natively. `mcp-remote` bridges HTTP → stdio.
-
-```bash
-npm install -g mcp-remote   # one-time install
-```
+Zed uses `npx mcp-remote` to bridge HTTP → stdio. Edit `~/.config/zed/settings.json`:
 
 ```json
 {
@@ -171,30 +105,7 @@ npm install -g mcp-remote   # one-time install
       "source": "custom",
       "command": {
         "path": "npx",
-        "args": [
-          "-y", "mcp-remote",
-          "https://mcp.heyneo.so/mcp",
-          "--header", "Authorization:Bearer YOUR_SECRET_KEY"
-        ]
-      }
-    }
-  }
-}
-```
-
-### Local — pip (works now)
-
-```json
-{
-  "context_servers": {
-    "neo": {
-      "source": "custom",
-      "command": {
-        "path": "neo-mcp",
-        "args": [],
-        "env": {
-          "NEO_SECRET_KEY": "sk-v1-..."
-        }
+        "args": ["-y", "mcp-remote", "https://mcpserver.heyneo.com/mcp", "--header", "Authorization:Bearer YOUR_SECRET_KEY"]
       }
     }
   }
@@ -203,47 +114,30 @@ npm install -g mcp-remote   # one-time install
 
 ---
 
-## VS Code (GitHub Copilot)
+## Claude.ai (web)
 
-Requires VS Code 1.99+. Config file: `.vscode/mcp.json` in your workspace root (create if it doesn't exist).
+1. Open **claude.ai** → Settings → **Integrations**
+2. Click **Add custom connector**
+3. Enter URL: `https://mcpserver.heyneo.com/mcp`
+4. Click **Connect** — you'll be redirected to a Neo authorization page
+5. Enter your `sk-v1-...` key and click **Authorize**
 
-### Remote _(coming soon)_
+Neo tools appear in every conversation automatically.
 
-```json
-{
-  "servers": {
-    "neo": {
-      "type": "http",
-      "url": "https://mcp.heyneo.so/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_SECRET_KEY"
-      }
-    }
-  }
-}
-```
+---
 
-### Local — pip (works now)
+## ChatGPT (web)
 
-```json
-{
-  "servers": {
-    "neo": {
-      "type": "stdio",
-      "command": "neo-mcp",
-      "env": {
-        "NEO_SECRET_KEY": "sk-v1-..."
-      }
-    }
-  }
-}
-```
+1. Open **chatgpt.com** → Settings → **Connectors**
+2. Click **Add connector → Custom**
+3. Enter URL: `https://mcpserver.heyneo.com/mcp`
+4. Click **Connect**, enter your `sk-v1-...` key, and click **Authorize**
 
 ---
 
 ## Continue.dev
 
-Config file: `~/.continue/config.json` — add under `"mcpServers"` (Continue uses an array).
+Edit `~/.continue/config.json`:
 
 ```json
 {
@@ -254,7 +148,7 @@ Config file: `~/.continue/config.json` — add under `"mcpServers"` (Continue us
         "type": "stdio",
         "command": "neo-mcp",
         "env": {
-          "NEO_SECRET_KEY": "sk-v1-..."
+          "NEO_SECRET_KEY": "YOUR_SECRET_KEY"
         }
       }
     }
@@ -262,13 +156,13 @@ Config file: `~/.continue/config.json` — add under `"mcpServers"` (Continue us
 }
 ```
 
-> Continue.dev currently supports stdio transport only — remote option not available yet.
+Requires `pip install neo-mcp` first. Continue.dev supports stdio transport only.
 
 ---
 
 ## OpenAI Codex CLI
 
-Config file: `~/.codex/config.json`
+Edit `~/.codex/config.json`:
 
 ```json
 {
@@ -276,11 +170,30 @@ Config file: `~/.codex/config.json`
     "neo": {
       "command": "neo-mcp",
       "env": {
-        "NEO_SECRET_KEY": "sk-v1-..."
+        "NEO_SECRET_KEY": "YOUR_SECRET_KEY"
       }
     }
   }
 }
+```
+
+Requires `pip install neo-mcp` first.
+
+---
+
+## Local pip / Docker (alternative)
+
+If you prefer running the server locally instead of using the hosted endpoint:
+
+**pip:**
+```bash
+pip install neo-mcp
+claude mcp add --scope user neo -e NEO_SECRET_KEY=YOUR_SECRET_KEY -- neo-mcp
+```
+
+**Docker:**
+```bash
+claude mcp add --scope user neo -e NEO_SECRET_KEY=YOUR_SECRET_KEY -- docker run -i --rm -e NEO_SECRET_KEY ghcr.io/heyneo/neo-mcp-server
 ```
 
 ---
@@ -293,11 +206,11 @@ neo-mcp setup [flags]
 
 | Flag | Description |
 |------|-------------|
-| `--secret-key KEY` | Neo secret key (`sk-v1-...`) — skips interactive prompt |
+| `--secret-key KEY` | Neo secret key — skips interactive prompt |
 | `--editor EDITORS` | Comma-separated: `claude,cursor,windsurf,zed,vscode,continue,codex` |
-| `--remote` | Write remote hosted configs (for when endpoint is live) instead of local stdio |
+| `--remote` | Use the hosted server instead of local stdio |
 | `--scope SCOPE` | Claude Code scope: `user` (default), `project`, or `local` |
-| `--no-backup` | Skip creating `.bak` backup files when overwriting existing configs |
+| `--no-backup` | Skip `.bak` backup files when overwriting existing configs |
 
 **Examples:**
 
@@ -305,28 +218,28 @@ neo-mcp setup [flags]
 # Interactive — wizard prompts for key and editor selection
 neo-mcp setup
 
-# Non-interactive — configure Claude Code and Cursor, local
-neo-mcp setup --secret-key sk-v1-... --editor claude,cursor
+# Non-interactive — configure Claude Code and Cursor with hosted server
+neo-mcp setup --secret-key sk-v1-... --editor claude,cursor --remote
 
-# Configure for project scope
+# Project-scoped Claude Code config
 neo-mcp setup --secret-key sk-v1-... --editor claude --scope project
 ```
 
 ---
 
-## Transport support by editor
+## Transport support
 
-| Editor | Local stdio | Remote HTTP | Web OAuth |
-|--------|-------------|-------------|-----------|
-| Claude.ai | — | — | ⏳ when hosted |
-| ChatGPT | — | — | ⏳ when hosted |
-| Claude Code | ✅ now | ⏳ when hosted | — |
-| Cursor | ✅ now | ⏳ when hosted | — |
-| Windsurf | ✅ now | ⏳ when hosted | — |
-| Zed | ✅ now | ⏳ when hosted (via `mcp-remote`) | — |
-| VS Code Copilot | ✅ now | ⏳ when hosted | — |
-| Continue.dev | ✅ now | ❌ stdio only | — |
-| OpenAI Codex CLI | ✅ now | ❌ stdio only | — |
+| Editor | Remote HTTP (hosted) | Local stdio |
+|--------|---------------------|-------------|
+| Claude.ai | ✅ OAuth flow | — |
+| ChatGPT | ✅ OAuth flow | — |
+| Claude Code | ✅ `--transport http` | ✅ pip / Docker |
+| Cursor | ✅ `url` + `headers` | ✅ `command` |
+| Windsurf | ✅ `serverUrl` + `headers` | ✅ `command` |
+| VS Code Copilot | ✅ `type: http` | ✅ `type: stdio` |
+| Zed | ✅ via `mcp-remote` | ✅ `command` |
+| Continue.dev | ❌ stdio only | ✅ `command` |
+| OpenAI Codex CLI | ❌ stdio only | ✅ `command` |
 
 ---
 
@@ -334,7 +247,8 @@ neo-mcp setup --secret-key sk-v1-... --editor claude --scope project
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Invalid API key` (401) | Wrong or missing secret key | Re-check `NEO_SECRET_KEY` in your config |
+| `Failed to connect` in `claude mcp list` | Header not passed or wrong key | Re-run `claude mcp add` with `--header "Authorization: Bearer YOUR_KEY"` on a single line |
+| `Invalid API key` (401) | Wrong or missing secret key | Re-check your key at app.heyneo.so → Settings → API Keys |
 | `Trial or quota ended` (403) | Out of credits | Top up at the Neo dashboard |
 | `neo-mcp` command not found | Install incomplete or PATH issue | Re-run `pip install neo-mcp`; verify with `which neo-mcp` |
 | Tools don't appear after restart | Config path wrong or JSON syntax error | Validate the JSON and check the file location for your editor |

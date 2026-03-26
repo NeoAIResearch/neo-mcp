@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REMOTE_URL = "https://mcp.heyneo.so/mcp"
+REMOTE_URL = "https://mcpserver.heyneo.com/mcp"
 
 EDITORS = [
     ("claude", "Claude Code"),

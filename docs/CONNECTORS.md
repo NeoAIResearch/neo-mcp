@@ -12,7 +12,7 @@ Neo secret key.
 2. Click **Add custom connector**
 3. Enter the connector URL:
    ```
-   https://mcp.heyneo.so/mcp
+   https://mcpserver.heyneo.com/mcp
    ```
 4. Click **Connect** — Claude.ai will redirect you to the Neo authorization page
 5. Enter your Neo secret key (`sk-v1-...`) from the [Neo dashboard](https://app.heyneo.so)
@@ -27,7 +27,7 @@ Neo secret key.
 2. Click **Add connector** → **Custom**
 3. Enter the connector URL:
    ```
-   https://mcp.heyneo.so/mcp
+   https://mcpserver.heyneo.com/mcp
    ```
 4. Click **Connect** — ChatGPT will redirect you to the Neo authorization page
 5. Enter your Neo secret key (`sk-v1-...`) and click **Authorize**
@@ -41,7 +41,7 @@ Neo secret key.
 Claude.ai (or ChatGPT)
   │
   ├── GET /.well-known/oauth-protected-resource
-  │         ← { authorization_servers: ["https://mcp.heyneo.so"] }
+  │         ← { authorization_servers: ["https://mcpserver.heyneo.com"] }
   │
   ├── GET /.well-known/oauth-authorization-server
   │         ← { authorization_endpoint, token_endpoint, ... }
@@ -76,7 +76,7 @@ Neo's backend already validates Bearer tokens; OAuth is purely the auth-discover
 
 | Symptom | Fix |
 |---------|-----|
-| "Connect" button shows an error | Verify the URL is exactly `https://mcp.heyneo.so/mcp` |
+| "Connect" button shows an error | Verify the URL is exactly `https://mcpserver.heyneo.com/mcp` |
 | Authorization page says "Invalid redirect_uri" | This is a platform issue — try again or report to Neo support |
 | Tools don't appear after connecting | Refresh the page; check Settings → Integrations for an error |
 | "Invalid API key" when using a tool | Re-enter your key: disconnect and reconnect the integration |

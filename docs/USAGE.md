@@ -4,9 +4,8 @@
 
 ## Prerequisites
 
-- Neo account with a secret key (`sk-v1-...`) — from the **Neo dashboard**
-- MCP server registered in your editor (see `docs/CLIENTS.md`)
-- `NEO_SECRET_KEY` set in the MCP config
+- Neo account with a secret key (`sk-v1-...`) — from [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys
+- Neo MCP connected to your editor — see [CLIENTS.md](CLIENTS.md) for setup instructions
 
 ---
 
