@@ -254,12 +254,17 @@ async def _ensure_deployment_id_async(secret_key: str) -> tuple[str, bool]:
     discovered = _discover_sandbox_id()
     if discovered:
         daemon_ok = await _register_with_daemon(discovered, secret_key)
+        # Python daemon running counts as daemon available even if Node daemon is not
+        if not daemon_ok:
+            daemon_ok = _python_daemon_running()
         return discovered, daemon_ok
 
     # 3. Load or generate a stable standalone UUID
     uid = _load_or_create_deployment_id()
     _write_sandbox_id_to_log(uid)                        # fast path next time
     daemon_ok = await _register_with_daemon(uid, secret_key)
+    if not daemon_ok:
+        daemon_ok = _python_daemon_running()
     return uid, daemon_ok
 
 
@@ -756,9 +761,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 daemon_warning = ""
                 if deployment_type == "vscode" and not daemon_available:
                     daemon_warning = (
-                        "\n\n⚠ No local Neo daemon found at 127.0.0.1:31337. "
-                        "The task has been queued but will not execute until a daemon is running. "
-                        "Start the Neo extension in VS Code/Cursor, or run: bash scripts/start-daemon.sh"
+                        "\n\n⚠ No local Neo daemon found. "
+                        "The task has been queued but will not execute until a daemon is running.\n"
+                        "Options:\n"
+                        "  • Run `neo-mcp daemon` in your project directory (pure Python, no VS Code needed)\n"
+                        "  • Start the Neo extension in VS Code/Cursor\n"
+                        "  • Run: bash scripts/start-daemon.sh"
                     )
                 return [TextContent(type="text", text=(
                     f"Task submitted. thread_id: {thread_id}\n"
@@ -1150,11 +1158,25 @@ async def _run_http():
     await server.serve()
 
 
+def _python_daemon_running() -> bool:
+    """Return True if a Python neo-mcp daemon process is currently alive."""
+    try:
+        from neo_mcp.daemon import is_running
+        return is_running()
+    except Exception:
+        return False
+
+
 def main():
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "setup":
         from neo_mcp.setup import run_setup
         run_setup(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "daemon":
+        from neo_mcp.daemon import main as daemon_main
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        daemon_main()
         return
     if NEO_TRANSPORT == "http":
         asyncio.run(_run_http())
