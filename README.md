@@ -284,7 +284,9 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for the full guide including Docker, scop
 |---|---|
 | `Invalid API key` (401) | Re-check `NEO_SECRET_KEY` at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys |
 | `Trial or quota ended` (403) | Top up at the Neo dashboard |
-| Task submitted but no files written locally | VS Code/Cursor extension must be running locally for file writes. Tasks still execute on Neo's backend either way. |
+| `No healthy deployments available` (400) | The VS Code/Cursor extension is not running — start it and try again. Neo routes task execution through your local extension. |
+| `Task submitted but no files written locally` | VS Code/Cursor extension must be running for local file writes. |
+| Task submission hangs or times out | Your local extension sandbox has expired — restart the VS Code/Cursor extension to get a fresh sandbox ID. |
 | `neo-mcp` not found | Re-run `pip install neo-mcp` and verify `which neo-mcp` |
 | Output truncated | Cap is ~20 000 tokens — use `neo_task_plan` for a concise step summary |
 | Status stuck on RUNNING | Call `neo_task_plan` to see which step is blocked |

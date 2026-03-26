@@ -1040,7 +1040,7 @@ async def _run_http():
         # x-access-key is accepted for backwards compat but not required.
         secret_key = request.headers.get("authorization", "")
         if secret_key.lower().startswith("bearer "):
-            secret_key = secret_key[7:]
+            secret_key = secret_key[7:].strip()
 
         if not secret_key:
             return JSONResponse(
