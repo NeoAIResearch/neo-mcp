@@ -121,14 +121,14 @@ def _resolve_deployment(deployment_id: str) -> tuple[str, str]:
 
     Rules:
     - Explicit NEO_DEPLOYMENT_TYPE env var always wins.
-    - HTTP transport with no deployment_id → "cloud" (web connector, no local daemon).
-    - Otherwise → "vscode" (local editor with extension daemon).
+    - No deployment_id found → "cloud" (no local daemon available, run on Neo's hosted backend).
+    - deployment_id found → "vscode" (route to local VS Code/Cursor extension daemon).
 
     In cloud mode the workspace prefix is omitted — there is no local filesystem.
     """
     if NEO_DEPLOYMENT_TYPE in ("vscode", "cloud"):
         dtype = NEO_DEPLOYMENT_TYPE
-    elif NEO_TRANSPORT == "http" and not deployment_id:
+    elif not deployment_id:
         dtype = "cloud"
     else:
         dtype = "vscode"
@@ -560,11 +560,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if deployment_id and deployment_type == "vscode":
                 submit_body["deployment_id"] = deployment_id
 
-            resp = await client.post(
-                "/v2/thread/init-chat-direct",
-                headers=_headers(),
-                json=submit_body,
-            )
+            try:
+                resp = await client.post(
+                    "/v2/thread/init-chat-direct",
+                    headers=_headers(),
+                    json=submit_body,
+                )
+            except httpx.HTTPError as exc:
+                return [TextContent(type="text", text=(
+                    f"Network error reaching Neo backend: {exc}\n"
+                    f"deployment_type: {deployment_type}, deployment_id: {deployment_id or '(none)'}"
+                ))]
 
             if resp.status_code != 200:
                 try:
@@ -577,7 +583,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     f"deployment_type: {deployment_type}, deployment_id: {deployment_id or '(none)'}"
                 ))]
 
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                return [TextContent(type="text", text=(
+                    f"Backend returned 200 but response was not valid JSON.\n"
+                    f"Body: {resp.text[:500]}"
+                ))]
             thread_id = (
                 data.get("thread_id")
                 or data.get("threadId")
