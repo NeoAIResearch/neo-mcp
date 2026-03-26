@@ -6,6 +6,7 @@
 
 - Neo account with a secret key (`sk-v1-...`) — from [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys
 - Neo MCP connected to your editor — see [CLIENTS.md](CLIENTS.md) for setup instructions
+- For local task execution: either the Neo VS Code/Cursor extension **or** `neo-mcp daemon` running in your project directory (not needed when using the hosted endpoint)
 
 ---
 
@@ -128,7 +129,7 @@ For short tasks (< 3 min):
 |---|---|---|
 | `Invalid API key` (401) | Wrong key | Re-check `NEO_SECRET_KEY` |
 | `Trial or quota ended` (403) | Out of credits | Top up at Neo dashboard |
-| Task submitted but no files appear locally | VS Code/Cursor extension not running | Start the extension — it handles local file writes |
+| Task submitted but no files appear locally | No daemon running | Run `neo-mcp daemon` in your project dir, or start the Neo VS Code/Cursor extension |
 | Status stuck on RUNNING | Step waiting for daemon response | Check `neo_task_plan` to see which step is blocked |
 | `neo-mcp` not found | Install incomplete | Re-run `pip install neo-mcp`, check PATH |
 
