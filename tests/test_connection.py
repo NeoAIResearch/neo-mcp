@@ -55,18 +55,16 @@ class TestBackendConnectivity(unittest.TestCase):
             self.fail(f"Timed out connecting to {NEO_API_URL}")
 
     def test_no_secret_key_message(self):
-        """Verify _check_config() raises a clear error when key is missing."""
+        """Verify _headers() raises a clear error when key is missing."""
         import neo_mcp.server as srv
-        orig_transport = srv.NEO_TRANSPORT
         orig_key = srv.NEO_SECRET_KEY
         try:
-            srv.NEO_TRANSPORT = "stdio"
             srv.NEO_SECRET_KEY = ""
+            srv._ctx_secret_key.set("")
             with self.assertRaises(ValueError) as ctx:
-                srv._check_config()
+                srv._headers()
             self.assertIn("NEO_SECRET_KEY", str(ctx.exception))
         finally:
-            srv.NEO_TRANSPORT = orig_transport
             srv.NEO_SECRET_KEY = orig_key
 
 
