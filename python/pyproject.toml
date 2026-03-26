@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "neo-mcp"
 version = "0.2.1"
 description = "MCP server for the Neo AI/ML backend — submit tasks, poll status, read output"
-readme = "README.md"
+readme = "../README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 keywords = ["mcp", "ai", "ml", "neo", "llm", "claude"]
@@ -41,7 +41,7 @@ testpaths = ["tests"]
 [project.urls]
 Homepage = "https://heyneo.so"
 Repository = "https://github.com/NeoResearchAI/MCPServer"
-Documentation = "https://github.com/NeoResearchAI/MCPServer/blob/main/neo-mcp/docs/CLIENTS.md"
+Documentation = "https://github.com/NeoResearchAI/MCPServer/blob/main/docs/CLIENTS.md"
 "Bug Tracker" = "https://github.com/NeoResearchAI/MCPServer/issues"
 
 [project.scripts]
