@@ -19,7 +19,12 @@ neo-mcp/
 │   ├── USAGE.md            # user guide + deployment steps
 │   ├── CONNECTORS.md       # web connector setup (Claude.ai + ChatGPT)
 │   └── WEB_CONNECTOR.md    # web connector implementation notes
-├── skills/neo/SKILL.md     # Claude Code skill definition (/neo command)
+├── skills/
+│   ├── README.md               # index of all framework integrations
+│   ├── claude-code/SKILL.md    # Claude Code skill (/neo command)
+│   ├── vercel/SKILL.md         # Vercel AI SDK (MCP client + inline tools)
+│   ├── openai-agents/SKILL.md  # OpenAI Agents SDK (MCP + function tools)
+│   └── langchain/SKILL.md      # LangChain / LangGraph (MCP adapters + StructuredTool)
 ├── tests/
 │   ├── test_connection.py
 │   └── test_server.py
