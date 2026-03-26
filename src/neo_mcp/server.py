@@ -25,6 +25,10 @@ _BASE_URL = os.environ.get("NEO_PUBLIC_URL", "https://mcpserver.heyneo.com")
 NEO_DEPLOYMENT_TYPE = os.environ.get("NEO_DEPLOYMENT_TYPE", "").lower()  # "vscode" | "cloud" | ""
 
 _THREAD_ID_FILE = os.path.expanduser("~/.neo/active_thread_id")
+_STANDALONE_UUID_FILE = os.path.expanduser("~/.neo/daemon/standalone_deployment_id")
+_DAEMON_PORT = 31337
+# Tracks deployment_ids we are actively heartbeating so we don't start duplicate tasks.
+_active_heartbeats: set[str] = set()
 
 # In-memory poll state: { thread_id: { "status": str, "messages": list|None, "capped": bool } }
 # Populated and updated by background asyncio tasks; read by neo_task_status / neo_get_messages.
@@ -69,14 +73,14 @@ def _resolve_thread_id(arguments: dict) -> tuple[str, bool]:
 
 
 # ---------------------------------------------------------------------------
-# Sandbox / deployment ID discovery
+# Sandbox / deployment ID discovery and creation
 # ---------------------------------------------------------------------------
 
 def _discover_sandbox_id() -> str:
     """Find the active deployment ID from the VS Code/Cursor extension daemon.
 
     Sources (in priority order):
-    1. daemon.log — sandboxId entries written by the extension
+    1. daemon.log — sandboxId entries written by the extension or standalone setup
     2. thread-workspaces.json — sandbox-to-workspace mapping
     """
     cwd = os.getcwd()
@@ -112,23 +116,166 @@ def _discover_sandbox_id() -> str:
 
 
 def _get_deployment_id() -> str:
-    """Return deployment ID: env var override → extension's active daemon ID."""
+    """Return deployment ID: env var override → extension's active daemon ID.
+    Synchronous; for async contexts use _ensure_deployment_id_async().
+    """
     return NEO_DEPLOYMENT_ID or _discover_sandbox_id()
 
 
-def _resolve_deployment(deployment_id: str) -> tuple[str, str]:
+def _load_or_create_deployment_id() -> str:
+    """Load a persisted standalone deployment UUID or generate and save a new one.
+
+    Mirrors VS Code StateManager.getDeploymentId() — generates a UUIDv4 once,
+    then reuses it across restarts so Neo always sees the same sandbox.
+    """
+    import uuid as _uuid_mod
+    try:
+        with open(_STANDALONE_UUID_FILE) as f:
+            uid = f.read().strip()
+        if uid:
+            return uid
+    except OSError:
+        pass
+    uid = str(_uuid_mod.uuid4())
+    try:
+        os.makedirs(os.path.dirname(_STANDALONE_UUID_FILE), exist_ok=True)
+        with open(_STANDALONE_UUID_FILE, "w") as f:
+            f.write(uid)
+    except OSError:
+        pass
+    return uid
+
+
+def _write_sandbox_id_to_log(deployment_id: str) -> None:
+    """Append a sandboxId entry to daemon.log so _discover_sandbox_id() finds it.
+
+    Mirrors start-daemon.sh step 10 — same format the extension daemon writes.
+    """
+    log_path = os.path.expanduser("~/.neo/daemon/daemon.log")
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(f'{{"sandboxId": "{deployment_id}", "source": "standalone"}}\n')
+    except OSError:
+        pass
+
+
+async def _heartbeat_loop(deployment_id: str) -> None:
+    """Send a heartbeat to the daemon every 60 s to keep the deployment alive.
+
+    The daemon evicts deployments with no heartbeat for > 5 minutes.
+    Mirrors start-daemon.sh step 11 (background heartbeat sender).
+    """
+    token_path = os.path.expanduser("~/.neo/daemon/daemon.token")
+    while True:
+        await asyncio.sleep(60)
+        try:
+            with open(token_path) as f:
+                token = f.read().strip()
+        except OSError:
+            break  # Daemon gone — stop heartbeating
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as dc:
+                await dc.post(
+                    f"http://127.0.0.1:{_DAEMON_PORT}/heartbeat",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"deploymentId": deployment_id},
+                )
+        except Exception:
+            pass  # Non-fatal; retry next interval
+
+
+async def _register_with_daemon(deployment_id: str, secret_key: str) -> bool:
+    """Register deployment_id with the local daemon and start a heartbeat task.
+
+    Mirrors start-daemon.sh steps 8–11:
+      - reads daemon.token for IPC auth
+      - POST /register with deploymentId + workspaceFolder + authToken
+      - launches _heartbeat_loop background task if not already running
+
+    Returns True if registration succeeded, False if daemon is not running/reachable.
+    """
+    token_path = os.path.expanduser("~/.neo/daemon/daemon.token")
+    try:
+        with open(token_path) as f:
+            token = f.read().strip()
+        if not token:
+            return False
+    except OSError:
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as dc:
+            resp = await dc.post(
+                f"http://127.0.0.1:{_DAEMON_PORT}/register",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "deploymentId": deployment_id,
+                    "workspaceFolder": _server_cwd,
+                    "authToken": secret_key,
+                },
+            )
+            if resp.status_code != 200:
+                return False
+    except Exception:
+        return False
+
+    if deployment_id not in _active_heartbeats:
+        _active_heartbeats.add(deployment_id)
+        asyncio.create_task(_heartbeat_loop(deployment_id))
+
+    return True
+
+
+async def _ensure_deployment_id_async(secret_key: str) -> tuple[str, bool]:
+    """Return (deployment_id, daemon_available).
+
+    Creates a stable deployment_id if one is not already registered, then
+    registers it with the local daemon (if running).  This is the async
+    equivalent of VS Code's StateManager.getDeploymentId() + PollerClient
+    .registerDeployment().
+
+    Priority:
+      1. NEO_DEPLOYMENT_ID env var — explicit pin, trusted as-is.
+      2. _discover_sandbox_id() — already registered by VS Code extension or
+         a previous standalone run; re-registers to refresh daemon state.
+      3. _load_or_create_deployment_id() — loads ~/.neo/daemon/
+         standalone_deployment_id or generates a fresh UUIDv4 and saves it.
+         Appends to daemon.log so future calls take the fast (discovered) path.
+
+    daemon_available reflects whether _register_with_daemon() succeeded.
+    Use it in _resolve_deployment() to decide vscode vs cloud.
+    """
+    # 1. Env var override — trust the caller, assume daemon is available
+    if NEO_DEPLOYMENT_ID:
+        return NEO_DEPLOYMENT_ID, True
+
+    # 2. Fast path — deployment already visible in daemon artifacts
+    discovered = _discover_sandbox_id()
+    if discovered:
+        daemon_ok = await _register_with_daemon(discovered, secret_key)
+        return discovered, daemon_ok
+
+    # 3. Load or generate a stable standalone UUID
+    uid = _load_or_create_deployment_id()
+    _write_sandbox_id_to_log(uid)                        # fast path next time
+    daemon_ok = await _register_with_daemon(uid, secret_key)
+    return uid, daemon_ok
+
+
+def _resolve_deployment(deployment_id: str, daemon_available: bool = True) -> tuple[str, str]:
     """Return (deployment_type, message_prefix) for a task submission.
 
-    Rules:
+    Rules (in priority order):
     - Explicit NEO_DEPLOYMENT_TYPE env var always wins.
-    - No deployment_id found → "cloud" (no local daemon available, run on Neo's hosted backend).
-    - deployment_id found → "vscode" (route to local VS Code/Cursor extension daemon).
+    - HTTP transport with daemon unreachable → "cloud" (hosted server, no local daemon).
+    - Otherwise → "vscode" (route to local daemon; deployment_id is always set).
 
     In cloud mode the workspace prefix is omitted — there is no local filesystem.
     """
     if NEO_DEPLOYMENT_TYPE in ("vscode", "cloud"):
         dtype = NEO_DEPLOYMENT_TYPE
-    elif not deployment_id:
+    elif NEO_TRANSPORT == "http" and not daemon_available:
         dtype = "cloud"
     else:
         dtype = "vscode"
@@ -544,12 +691,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # neo_submit_task — fire-and-forget; polling runs in background       #
         # ------------------------------------------------------------------ #
         if name == "neo_submit_task":
-            deployment_id = _get_deployment_id()
+            secret_key = _ctx_secret_key.get() or NEO_SECRET_KEY
+            deployment_id, daemon_available = await _ensure_deployment_id_async(secret_key)
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
             wait = arguments.get("wait_for_completion", False)
 
-            deployment_type, prefix = _resolve_deployment(deployment_id)
+            deployment_type, prefix = _resolve_deployment(deployment_id, daemon_available)
             message = f"{prefix}{description}"
 
             submit_body: dict = {
@@ -605,13 +753,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             asyncio.create_task(_poll_task_bg(thread_id))
 
             if not wait:
+                daemon_warning = ""
+                if deployment_type == "vscode" and not daemon_available:
+                    daemon_warning = (
+                        "\n\n⚠ No local Neo daemon found at 127.0.0.1:31337. "
+                        "The task has been queued but will not execute until a daemon is running. "
+                        "Start the Neo extension in VS Code/Cursor, or run: bash scripts/start-daemon.sh"
+                    )
                 return [TextContent(type="text", text=(
-                    f"Task submitted. thread_id: {thread_id}\n\n"
+                    f"Task submitted. thread_id: {thread_id}\n"
+                    f"deployment_id: {deployment_id} (deployment_type: {deployment_type})\n\n"
                     "Polling is running in the background.\n"
                     "• neo_task_plan   — see live step-by-step progress\n"
                     "• neo_task_status — check overall status\n"
                     "• neo_send_feedback — reply if it asks a question\n"
-                    "• neo_pause_task / neo_stop_task — pause or cancel"
+                    f"• neo_pause_task / neo_stop_task — pause or cancel{daemon_warning}"
                 ))]
 
             # wait_for_completion=true: block until terminal state, return output directly
