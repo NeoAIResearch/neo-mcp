@@ -61,9 +61,8 @@ def _prompt_editors() -> list:
     return selected or [EDITORS[0][0]]
 
 
-def _ask_remote(editor_key: str) -> bool:
-    label = dict(EDITORS).get(editor_key, editor_key)
-    ans = input(f"  Use remote hosted server (mcp.heyneo.so) for {label}? [Y/n]: ").strip().lower()
+def _ask_remote() -> bool:
+    ans = input("Use remote hosted server (mcpserver.heyneo.com)? [Y/n]: ").strip().lower()
     return ans in ("", "y", "yes")
 
 
@@ -95,10 +94,7 @@ def _merge_mcp_servers(path: Path, key: str, server_cfg: dict, no_backup: bool) 
 
 
 def _configure_claude(secret_key: str, opts: dict) -> tuple:
-    is_tty = sys.stdin.isatty()
     use_remote = opts.get("remote", False)
-    if is_tty and not opts.get("remote") and "claude" in _SUPPORTS_REMOTE:
-        use_remote = _ask_remote("claude")
 
     scope = opts.get("scope", "user")
     no_backup = opts.get("no_backup", False)
@@ -159,10 +155,7 @@ def _configure_claude(secret_key: str, opts: dict) -> tuple:
 
 
 def _configure_cursor(secret_key: str, opts: dict) -> tuple:
-    is_tty = sys.stdin.isatty()
     use_remote = opts.get("remote", False)
-    if is_tty and not opts.get("remote"):
-        use_remote = _ask_remote("cursor")
 
     path = Path.home() / ".cursor" / "mcp.json"
     no_backup = opts.get("no_backup", False)
@@ -191,10 +184,7 @@ def _configure_cursor(secret_key: str, opts: dict) -> tuple:
 
 
 def _configure_windsurf(secret_key: str, opts: dict) -> tuple:
-    is_tty = sys.stdin.isatty()
     use_remote = opts.get("remote", False)
-    if is_tty and not opts.get("remote"):
-        use_remote = _ask_remote("windsurf")
 
     path = Path.home() / ".codeium" / "windsurf" / "mcp_config.json"
     no_backup = opts.get("no_backup", False)
@@ -223,10 +213,7 @@ def _configure_windsurf(secret_key: str, opts: dict) -> tuple:
 
 
 def _configure_zed(secret_key: str, opts: dict) -> tuple:
-    is_tty = sys.stdin.isatty()
     use_remote = opts.get("remote", False)
-    if is_tty and not opts.get("remote"):
-        use_remote = _ask_remote("zed")
 
     path = Path.home() / ".config" / "zed" / "settings.json"
     no_backup = opts.get("no_backup", False)
@@ -266,10 +253,7 @@ def _configure_zed(secret_key: str, opts: dict) -> tuple:
 
 
 def _configure_vscode(secret_key: str, opts: dict) -> tuple:
-    is_tty = sys.stdin.isatty()
     use_remote = opts.get("remote", False)
-    if is_tty and not opts.get("remote"):
-        use_remote = _ask_remote("vscode")
 
     path = Path.cwd() / ".vscode" / "mcp.json"
     no_backup = opts.get("no_backup", False)
@@ -401,6 +385,10 @@ def run_setup(args: list) -> None:
         print(f"Unknown editor(s): {', '.join(invalid)}", file=sys.stderr)
         print(f"Valid options: {', '.join(sorted(valid_keys))}", file=sys.stderr)
         sys.exit(1)
+
+    # Ask once whether to use the remote hosted server (only if any selected editor supports it)
+    if is_tty and not opts.get("remote") and any(e in _SUPPORTS_REMOTE for e in selected):
+        opts["remote"] = _ask_remote()
 
     # Configure each editor
     print()
