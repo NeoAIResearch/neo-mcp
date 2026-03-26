@@ -95,38 +95,36 @@ class TestResolveThreadId(unittest.TestCase):
 
 
 class TestCheckConfig(unittest.TestCase):
-    def test_raises_if_no_secret_key_in_stdio_mode(self):
-        orig_transport = srv.NEO_TRANSPORT
+    def test_raises_if_no_secret_key(self):
         orig_key = srv.NEO_SECRET_KEY
         try:
-            srv.NEO_TRANSPORT = "stdio"
             srv.NEO_SECRET_KEY = ""
-            with self.assertRaises(ValueError):
-                srv._check_config()
+            srv._ctx_secret_key.set("")
+            with self.assertRaises(ValueError) as ctx:
+                srv._headers()
+            self.assertIn("NEO_SECRET_KEY", str(ctx.exception))
         finally:
-            srv.NEO_TRANSPORT = orig_transport
             srv.NEO_SECRET_KEY = orig_key
 
-    def test_no_raise_if_key_present_in_stdio_mode(self):
-        orig_transport = srv.NEO_TRANSPORT
+    def test_no_raise_if_key_present(self):
         orig_key = srv.NEO_SECRET_KEY
         try:
-            srv.NEO_TRANSPORT = "stdio"
             srv.NEO_SECRET_KEY = "sk-v1-test"
-            srv._check_config()  # should not raise
+            headers = srv._headers()
+            self.assertEqual(headers["Authorization"], "Bearer sk-v1-test")
         finally:
-            srv.NEO_TRANSPORT = orig_transport
             srv.NEO_SECRET_KEY = orig_key
 
-    def test_no_raise_in_http_mode_without_key(self):
-        orig_transport = srv.NEO_TRANSPORT
+    def test_http_mode_uses_ctx_key(self):
+        """HTTP mode: key comes from per-request context var, not module-level env."""
         orig_key = srv.NEO_SECRET_KEY
         try:
-            srv.NEO_TRANSPORT = "http"
             srv.NEO_SECRET_KEY = ""
-            srv._check_config()  # HTTP mode: key is per-request, so no error
+            token = srv._ctx_secret_key.set("sk-v1-per-request")
+            headers = srv._headers()
+            self.assertEqual(headers["Authorization"], "Bearer sk-v1-per-request")
+            srv._ctx_secret_key.reset(token)
         finally:
-            srv.NEO_TRANSPORT = orig_transport
             srv.NEO_SECRET_KEY = orig_key
 
 
@@ -178,13 +176,14 @@ class TestResolveDeployment(unittest.TestCase):
             srv.NEO_TRANSPORT = orig_transport
             srv.NEO_DEPLOYMENT_TYPE = orig_dtype
 
-    def test_http_without_deployment_id_is_cloud(self):
+    def test_http_without_daemon_is_cloud(self):
         orig_transport = srv.NEO_TRANSPORT
         orig_dtype = srv.NEO_DEPLOYMENT_TYPE
         try:
             srv.NEO_TRANSPORT = "http"
             srv.NEO_DEPLOYMENT_TYPE = ""
-            dtype, prefix = srv._resolve_deployment("")
+            # daemon_available=False → cloud mode (hosted server, no local daemon)
+            dtype, prefix = srv._resolve_deployment("", daemon_available=False)
             self.assertEqual(dtype, "cloud")
             self.assertEqual(prefix, "")
         finally:
