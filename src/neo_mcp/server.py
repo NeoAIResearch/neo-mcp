@@ -227,44 +227,89 @@ async def _register_with_daemon(deployment_id: str, secret_key: str) -> bool:
     return True
 
 
+async def _auto_start_daemon(secret_key: str) -> bool:
+    """Start the Python daemon as a detached background process.
+
+    Called automatically when neo_submit_task finds no daemon running — users
+    never need to start the daemon manually.
+
+    Returns True once the daemon's PID file appears (ready to accept work).
+    """
+    import shutil
+    import subprocess
+    import sys as _sys
+
+    neo_mcp_bin = shutil.which("neo-mcp")
+    if neo_mcp_bin:
+        cmd = [neo_mcp_bin, "daemon", _server_cwd]
+    else:
+        # Fallback: invoke via the same Python interpreter that's running now
+        cmd = [_sys.executable, "-c",
+               "from neo_mcp.daemon import main; main()", _server_cwd]
+
+    env = os.environ.copy()
+    env["NEO_SECRET_KEY"] = secret_key
+
+    try:
+        subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,   # detach — survives MCP server restart
+        )
+    except Exception:
+        return False
+
+    # Wait up to 3 s for the daemon to write its PID file
+    for _ in range(6):
+        await asyncio.sleep(0.5)
+        if _python_daemon_running():
+            return True
+
+    return False
+
+
 async def _ensure_deployment_id_async(secret_key: str) -> tuple[str, bool]:
     """Return (deployment_id, daemon_available).
 
-    Creates a stable deployment_id if one is not already registered, then
-    registers it with the local daemon (if running).  This is the async
-    equivalent of VS Code's StateManager.getDeploymentId() + PollerClient
-    .registerDeployment().
+    Gets or creates a stable deployment_id, then ensures a daemon is running
+    to execute tasks locally.  If no daemon is found it is started automatically
+    — the user never needs to start anything manually.
 
-    Priority:
-      1. NEO_DEPLOYMENT_ID env var — explicit pin, trusted as-is.
-      2. _discover_sandbox_id() — already registered by VS Code extension or
-         a previous standalone run; re-registers to refresh daemon state.
-      3. _load_or_create_deployment_id() — loads ~/.neo/daemon/
-         standalone_deployment_id or generates a fresh UUIDv4 and saves it.
-         Appends to daemon.log so future calls take the fast (discovered) path.
+    Priority for deployment_id:
+      1. NEO_DEPLOYMENT_ID env var — explicit pin.
+      2. _discover_sandbox_id() — already registered (VS Code extension or prior run).
+      3. _load_or_create_deployment_id() — stable UUID persisted to disk.
 
-    daemon_available reflects whether _register_with_daemon() succeeded.
-    Use it in _resolve_deployment() to decide vscode vs cloud.
+    daemon_available is True when either:
+      - _register_with_daemon() succeeded (Node.js daemon or newly started Python daemon), or
+      - _python_daemon_running() is True (Python daemon already alive), or
+      - _auto_start_daemon() succeeded (daemon was just started in the background).
     """
-    # 1. Env var override — trust the caller, assume daemon is available
+    # 1. Env var override — trust the caller
     if NEO_DEPLOYMENT_ID:
         return NEO_DEPLOYMENT_ID, True
 
-    # 2. Fast path — deployment already visible in daemon artifacts
+    # 2. Resolve deployment ID
     discovered = _discover_sandbox_id()
-    if discovered:
-        daemon_ok = await _register_with_daemon(discovered, secret_key)
-        # Python daemon running counts as daemon available even if Node daemon is not
-        if not daemon_ok:
-            daemon_ok = _python_daemon_running()
-        return discovered, daemon_ok
+    uid = discovered or _load_or_create_deployment_id()
+    if not discovered:
+        _write_sandbox_id_to_log(uid)   # fast path on next call
 
-    # 3. Load or generate a stable standalone UUID
-    uid = _load_or_create_deployment_id()
-    _write_sandbox_id_to_log(uid)                        # fast path next time
+    # 3. Try to register with an already-running daemon (Node.js or Python)
     daemon_ok = await _register_with_daemon(uid, secret_key)
+
     if not daemon_ok:
-        daemon_ok = _python_daemon_running()
+        if _python_daemon_running():
+            daemon_ok = True
+        else:
+            # No daemon running — start one automatically in the background
+            daemon_ok = await _auto_start_daemon(secret_key)
+            if daemon_ok:
+                # Register with the freshly started daemon
+                await _register_with_daemon(uid, secret_key)
+
     return uid, daemon_ok
 
 
@@ -761,12 +806,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 daemon_warning = ""
                 if deployment_type == "vscode" and not daemon_available:
                     daemon_warning = (
-                        "\n\n⚠ No local Neo daemon found. "
+                        "\n\n⚠ Could not start a local Neo daemon automatically. "
                         "The task has been queued but will not execute until a daemon is running.\n"
-                        "Options:\n"
-                        "  • Run `neo-mcp daemon` in your project directory (pure Python, no VS Code needed)\n"
-                        "  • Start the Neo extension in VS Code/Cursor\n"
-                        "  • Run: bash scripts/start-daemon.sh"
+                        "Fix: ensure `neo-mcp` is installed and try again, "
+                        "or start the Neo extension in VS Code/Cursor."
                     )
                 return [TextContent(type="text", text=(
                     f"Task submitted. thread_id: {thread_id}\n"

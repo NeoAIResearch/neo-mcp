@@ -198,20 +198,11 @@ claude mcp add --scope user neo -e NEO_SECRET_KEY=YOUR_SECRET_KEY -- docker run 
 
 ---
 
-## Standalone daemon (no VS Code required)
+## How local execution works
 
-When using local pip/Docker, Neo needs a local daemon to execute tasks (write files, run commands). The VS Code/Cursor extension provides this automatically. Without VS Code, run the built-in Python daemon instead:
+When using local pip/Docker, Neo needs a background daemon to execute tasks (write files, run commands). **This starts automatically** — just submit a task and the daemon launches itself in the background. No manual setup required.
 
-```bash
-# In your project directory (keep this running in a terminal)
-export NEO_SECRET_KEY=sk-v1-...
-neo-mcp daemon
-
-# Or with an explicit workspace path
-neo-mcp daemon /path/to/your/project
-```
-
-The daemon polls Neo's backend and handles all local execution. Start it before submitting tasks. Alternatively, use the hosted endpoint (`https://mcpserver.heyneo.com/mcp`) to run tasks on Neo's cloud — no local daemon needed.
+The daemon persists across sessions (it is detached from your editor process). If you ever need to stop it, kill the `neo-mcp` process. Alternatively, use the hosted endpoint (`https://mcpserver.heyneo.com/mcp`) to run tasks on Neo's cloud — no local daemon needed at all.
 
 ---
 
