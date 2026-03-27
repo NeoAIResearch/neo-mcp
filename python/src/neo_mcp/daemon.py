@@ -147,11 +147,22 @@ _jobs: dict[str, _Job] = {}
 # ---------------------------------------------------------------------------
 
 def get_or_create_deployment_id() -> str:
-    """Load persisted standalone deployment UUID or generate a new one.
-    Matches StateManager.getDeploymentId() from the VS Code extension.
+    """Return the deployment UUID for this daemon instance.
+
+    Priority:
+    1. NEO_DEPLOYMENT_ID env var (explicit override)
+    2. Derived from NEO_SECRET_KEY — same algorithm as server.py _derive_deployment_id(),
+       so the hosted MCP server and this daemon independently compute the same UUID from
+       the same API key. No --deployment-id flag or file reading needed.
+    3. Persisted UUID from standalone_deployment_id file (legacy / no-key setups)
+    4. Generate a random UUID and persist it
     """
     if env_id := os.environ.get("NEO_DEPLOYMENT_ID"):
         return env_id
+    if sk := os.environ.get("NEO_SECRET_KEY"):
+        import hashlib as _hashlib
+        digest = _hashlib.sha256(sk.encode()).digest()[:16]
+        return str(uuid.UUID(bytes=digest, version=5))
     os.makedirs(_DAEMON_DIR, exist_ok=True)
     try:
         uid = Path(_STANDALONE_UUID_FILE).read_text().strip()
@@ -240,7 +251,8 @@ async def _poll_backend(
                     token = new_token
                     continue
                 print(
-                    "ERROR: OAuth token is invalid or expired. Run 'neo-mcp login' to re-authenticate.",
+                    "ERROR: Auth rejected (401). Check NEO_SECRET_KEY is correct, "
+                    "or refresh OAuth with 'neo-mcp login'.",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -499,8 +511,8 @@ async def run_daemon(workspace: Optional[str] = None, deployment_id: Optional[st
     if not token:
         print(
             "ERROR: No auth token found.\n"
-            "Either run 'neo-mcp login' to authenticate, log in via the Neo VS Code/Cursor\n"
-            f"extension (writes {_MCP_AUTH_FILE}), or set NEO_SECRET_KEY.",
+            "Set your API key: export NEO_SECRET_KEY=sk-v1-...\n"
+            "Or run 'neo-mcp login' to authenticate via browser OAuth.",
             file=sys.stderr,
             flush=True,
         )

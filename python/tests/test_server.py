@@ -447,11 +447,39 @@ class TestGetDeploymentId(unittest.TestCase):
             result = srv._get_deployment_id()
         self.assertEqual(result, "discovered-id")
 
-    def test_returns_empty_when_nothing_found(self):
+    def test_returns_empty_when_nothing_found_and_no_key(self):
+        """When no header, env var, files, AND no API key: return empty."""
         srv.NEO_DEPLOYMENT_ID = ""
-        with patch("neo_mcp.server._discover_sandbox_id", return_value=""):
-            result = srv._get_deployment_id()
-        self.assertEqual(result, "")
+        orig_key = srv.NEO_SECRET_KEY
+        try:
+            srv.NEO_SECRET_KEY = ""
+            srv._ctx_secret_key.set("")
+            with patch("neo_mcp.server._discover_sandbox_id", return_value=""):
+                result = srv._get_deployment_id()
+            self.assertEqual(result, "")
+        finally:
+            srv.NEO_SECRET_KEY = orig_key
+
+    def test_falls_back_to_key_derived_uuid(self):
+        """When no header/env/files but API key is set, derive UUID from key."""
+        srv.NEO_DEPLOYMENT_ID = ""
+        orig_key = srv.NEO_SECRET_KEY
+        try:
+            srv.NEO_SECRET_KEY = "sk-v1-testkey"
+            srv._ctx_secret_key.set("")
+            with patch("neo_mcp.server._discover_sandbox_id", return_value=""):
+                result = srv._get_deployment_id()
+                self.assertRegex(result, r"^[a-f0-9\-]{36}$")
+                # Same key → same UUID on every call (deterministic)
+                result2 = srv._get_deployment_id()
+                self.assertEqual(result, result2)
+            # Different key → different UUID
+            srv.NEO_SECRET_KEY = "sk-v1-otherkey"
+            with patch("neo_mcp.server._discover_sandbox_id", return_value=""):
+                result3 = srv._get_deployment_id()
+            self.assertNotEqual(result, result3)
+        finally:
+            srv.NEO_SECRET_KEY = orig_key
 
 
 # ---------------------------------------------------------------------------

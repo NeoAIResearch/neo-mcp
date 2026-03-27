@@ -161,8 +161,13 @@ def _get_deployment_id() -> str:
     3. VS Code/Cursor extension daemon.log
     4. Python daemon standalone_deployment_id file
     5. thread-workspaces.json
+    6. Derived from API key — both the hosted server and the user's daemon compute
+       the same UUID from the same NEO_SECRET_KEY, so no header or file needed.
     """
-    return _ctx_deployment_id.get() or NEO_DEPLOYMENT_ID or _discover_sandbox_id()
+    if dep := _ctx_deployment_id.get() or NEO_DEPLOYMENT_ID or _discover_sandbox_id():
+        return dep
+    sk = _ctx_secret_key.get() or NEO_SECRET_KEY
+    return _derive_deployment_id(sk) if sk else ""
 
 
 async def _heartbeat_loop(deployment_id: str) -> None:
@@ -775,20 +780,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # (set once when adding the MCP server; no ongoing user action).
                 if not deployment_id:
                     return [TextContent(type="text", text=(
-                        "No active deployment found.\n\n"
-                        "The hosted Neo MCP server requires a daemon running on your local "
-                        "machine to execute tasks. Set one up with either:\n\n"
-                        "Option 1 — VS Code/Cursor extension (easiest):\n"
-                        "  Install the Neo extension and log in. It handles everything.\n\n"
-                        "Option 2 — Python daemon (no VS Code needed):\n"
-                        "  neo-mcp login        # once, opens browser\n"
-                        "  neo-mcp daemon       # keep this running\n\n"
-                        "Then re-add the hosted MCP with your deployment ID:\n"
-                        "  claude mcp add --scope user neo \\\n"
-                        "    --transport http https://mcpserver.heyneo.com/mcp \\\n"
-                        "    --header \"Authorization: Bearer <your-key>\" \\\n"
-                        "    --header \"X-Neo-Deployment-Id: "
-                        "$(cat ~/.neo/daemon/standalone_deployment_id)\""
+                        "No API key provided. "
+                        "Set Authorization: Bearer sk-v1-... in the request header."
                     ))]
             else:
                 # ── Local install (stdio mode) ──────────────────────────────
@@ -1273,7 +1266,7 @@ def _build_http_app():
         # Set context vars for _headers() in this async context
         _ctx_api_key.set(headers.get("x-access-key", ""))
         _ctx_secret_key.set(secret_key)
-        _ctx_deployment_id.set(deployment_id_header)
+        _ctx_deployment_id.set(deployment_id_header or (_derive_deployment_id(secret_key) if secret_key else ""))
 
         session_id = headers.get("mcp-session-id", "")
         if session_id and session_id in _sessions:
@@ -1286,8 +1279,9 @@ def _build_http_app():
             transport = await _start_session(session_id, secret_key, deployment_id_header)
             _sessions[session_id] = transport
             _session_keys[session_id] = secret_key
-            if deployment_id_header:
-                _session_deployment_ids[session_id] = deployment_id_header
+            resolved_dep_id = deployment_id_header or (_derive_deployment_id(secret_key) if secret_key else "")
+            if resolved_dep_id:
+                _session_deployment_ids[session_id] = resolved_dep_id
 
         await transport.handle_request(scope, receive, send)
 

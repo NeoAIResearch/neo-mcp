@@ -6,13 +6,34 @@ Get your secret key at [app.heyneo.so](https://app.heyneo.so) → Settings → A
 
 ---
 
-## Quickstart — one command
+## Quickstart — choose a path
 
+**VS Code/Cursor extension (simplest):** Install the Neo extension, log in, then add the MCP server:
+```bash
+claude mcp add --scope user neo \
+  --transport http https://mcpserver.heyneo.com/mcp \
+  --header "Authorization: Bearer sk-v1-YOUR_KEY"
+```
+
+**pip install (local, daemon auto-starts):**
+```bash
+pip install neo-mcp
+claude mcp add --scope user neo -e NEO_SECRET_KEY=sk-v1-YOUR_KEY -- neo-mcp
+```
+
+**pip install (hosted server, no extension):**
+```bash
+pip install neo-mcp
+NEO_SECRET_KEY=sk-v1-YOUR_KEY neo-mcp daemon &   # keep running
+claude mcp add --scope user neo \
+  --transport http https://mcpserver.heyneo.com/mcp \
+  --header "Authorization: Bearer sk-v1-YOUR_KEY"
+```
+
+**Auto-configure all editors:**
 ```bash
 pip install neo-mcp && neo-mcp setup
 ```
-
-The wizard asks for your key, detects your installed editors, and writes all configs automatically. Restart your editor after setup.
 
 ---
 
@@ -202,17 +223,27 @@ claude mcp add --scope user neo -e NEO_SECRET_KEY=YOUR_SECRET_KEY -- docker run 
 
 ## How local execution works
 
-When using local pip/Docker, Neo needs a background daemon to execute tasks (write files, run commands).
+Tasks execute on your machine via a daemon process that polls the Neo backend for commands.
 
-**First-time setup (run once):**
+**Stdio (local pip install):** The daemon starts automatically when you submit your first task. No manual steps needed — `NEO_SECRET_KEY` is used for daemon auth.
+
+**Hosted server (HTTP transport):** The hosted server can't start a daemon on your machine. Run it manually:
 ```bash
-neo-mcp login    # opens browser OAuth flow, saves token
-neo-mcp daemon   # starts the background daemon
+NEO_SECRET_KEY=sk-v1-YOUR_KEY neo-mcp daemon &
 ```
 
-After that, tasks submitted via `neo_submit_task` will execute locally. The daemon restarts automatically on next task submission if it has stopped, but you need to have run `neo-mcp login` at least once.
+The daemon derives the same UUID from your API key as the hosted server does — no `--deployment-id` flag or header needed.
 
-Alternatively, use the hosted endpoint (`https://mcpserver.heyneo.com/mcp`) to run tasks on Neo's cloud — no local daemon or login needed at all.
+**To keep the daemon running across reboots**, add to `~/.zshrc` or `~/.bashrc`:
+```bash
+pgrep -f "neo-mcp daemon" > /dev/null || NEO_SECRET_KEY=sk-v1-YOUR_KEY neo-mcp daemon &
+```
+
+**Optional: browser login for OAuth-based auth (advanced):**
+```bash
+neo-mcp login    # opens browser → saves token to ~/.neo/daemon/mcp_auth.json
+```
+OAuth is not required — the daemon uses `NEO_SECRET_KEY` by default. Use `neo-mcp login` only if you want full OAuth with automatic token refresh.
 
 ---
 
