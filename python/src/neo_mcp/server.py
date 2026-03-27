@@ -78,11 +78,15 @@ def _resolve_thread_id(arguments: dict) -> tuple[str, bool]:
 # ---------------------------------------------------------------------------
 
 def _vscode_daemon_deployment_id() -> str:
-    """Return the deployment ID from VS Code/Cursor extension's daemon.log only.
+    """Return the most recent sandboxId written to daemon.log by the Python daemon.
 
-    Returns non-empty string only when the extension wrote daemon.log — meaning
-    the extension daemon is (or was recently) handling that deployment.
-    Used to skip Python daemon auto-start when the extension is already running.
+    NOTE: In production the VS Code/Cursor extension does NOT write {"sandboxId": ...}
+    entries to daemon.log (file logging is disabled for the production backend URL).
+    Only the Python daemon writes these entries (with "source": "python-daemon").
+
+    This function is kept as a utility for discovering any previously-run Python
+    daemon's deployment ID. It must NOT be used as a proxy for "is VS Code extension
+    running?" — use _register_with_daemon() for that (checks localhost:31337).
     """
     for log_name in ("daemon.log", "daemon.log.1"):
         log_path = os.path.expanduser(f"~/.neo/daemon/{log_name}")
@@ -788,20 +792,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     ))]
             else:
                 # ── Local install (stdio mode) ──────────────────────────────
-                # If the VS Code/Cursor extension is running, it already polls
-                # /v2/poll/{deployment_id} with its own OAuth token — don't
-                # start a competing Python daemon for the same deployment_id.
-                # Only auto-start the Python daemon when there is no extension.
-                vscode_id = _vscode_daemon_deployment_id()
+                # Check in order:
+                # 1. Python daemon already running for this deployment_id → skip
+                # 2. VS Code/Cursor extension daemon running (localhost:31337) → register
+                #    with it instead of spawning a Python daemon (fast-fails if no
+                #    daemon.token, so adds no latency when extension is absent)
+                # 3. Neither → auto-start Python daemon
                 if not deployment_id:
                     deployment_id = _get_or_create_persistent_deployment_id(secret_key)
-                if not vscode_id and not _python_daemon_running(deployment_id):
-                    await _auto_start_daemon(secret_key, deployment_id)
-                    # Wait up to 5 s for the daemon to write its PID file
-                    for _ in range(10):
-                        await asyncio.sleep(0.5)
-                        if _python_daemon_running(deployment_id):
-                            break
+                if not _python_daemon_running(deployment_id):
+                    if not await _register_with_daemon(deployment_id, secret_key):
+                        await _auto_start_daemon(secret_key, deployment_id)
+                        # Wait up to 5 s for the daemon to write its PID file
+                        for _ in range(10):
+                            await asyncio.sleep(0.5)
+                            if _python_daemon_running(deployment_id):
+                                break
 
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
