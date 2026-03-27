@@ -3,6 +3,7 @@ import contextvars
 import json
 import os
 import re
+import time
 
 import httpx
 from mcp.server import Server
@@ -29,6 +30,10 @@ _active_heartbeats: set[str] = set()
 # In-memory poll state: { thread_id: { "status": str, "messages": list|None, "capped": bool } }
 # Populated and updated by background asyncio tasks; read by neo_task_status / neo_get_messages.
 _active_polls: dict[str, dict] = {}
+
+# CLI auth relay: { state_uuid: { "access_token", "refresh_token", "username", "expires" } }
+# Written by /auth/callback, consumed once by /auth/poll/{state}. TTL = 5 min.
+_cli_auth_relay: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -72,12 +77,34 @@ def _resolve_thread_id(arguments: dict) -> tuple[str, bool]:
 # Sandbox / deployment ID discovery and creation
 # ---------------------------------------------------------------------------
 
+def _vscode_daemon_deployment_id() -> str:
+    """Return the deployment ID from VS Code/Cursor extension's daemon.log only.
+
+    Returns non-empty string only when the extension wrote daemon.log — meaning
+    the extension daemon is (or was recently) handling that deployment.
+    Used to skip Python daemon auto-start when the extension is already running.
+    """
+    for log_name in ("daemon.log", "daemon.log.1"):
+        log_path = os.path.expanduser(f"~/.neo/daemon/{log_name}")
+        try:
+            with open(log_path, "r", errors="ignore") as f:
+                lines = f.readlines()
+            for line in reversed(lines):
+                m = re.search(r'"sandboxId"\s*:\s*"([a-f0-9\-]{36})"', line)
+                if m:
+                    return m.group(1)
+        except OSError:
+            pass
+    return ""
+
+
 def _discover_sandbox_id() -> str:
     """Find the active deployment ID from the VS Code/Cursor extension daemon.
 
     Sources (in priority order):
     1. daemon.log — sandboxId entries written by the extension or standalone setup
-    2. thread-workspaces.json — sandbox-to-workspace mapping
+    2. standalone_deployment_id — UUID persisted by the Python daemon on first run
+    3. thread-workspaces.json — sandbox-to-workspace mapping
     """
     cwd = os.getcwd()
 
@@ -96,6 +123,16 @@ def _discover_sandbox_id() -> str:
         except OSError:
             pass
 
+    # Check standalone_deployment_id — written by the Python daemon on first run,
+    # before daemon.log. This is the same file the Python daemon uses to persist its UUID.
+    standalone_path = os.path.expanduser("~/.neo/daemon/standalone_deployment_id")
+    try:
+        uid = open(standalone_path).read().strip()
+        if uid and re.match(r'^[a-f0-9\-]{36}$', uid):
+            return uid
+    except OSError:
+        pass
+
     ws_path = os.path.expanduser("~/.neo/daemon/thread-workspaces.json")
     try:
         with open(ws_path, "r", errors="ignore") as f:
@@ -112,8 +149,16 @@ def _discover_sandbox_id() -> str:
 
 
 def _get_deployment_id() -> str:
-    """Return deployment ID: env var override → extension's active daemon ID."""
-    return NEO_DEPLOYMENT_ID or _discover_sandbox_id()
+    """Return deployment ID.
+
+    Priority:
+    1. Per-request X-Neo-Deployment-Id header (HTTP mode — set by context var)
+    2. NEO_DEPLOYMENT_ID env var
+    3. VS Code/Cursor extension daemon.log
+    4. Python daemon standalone_deployment_id file
+    5. thread-workspaces.json
+    """
+    return _ctx_deployment_id.get() or NEO_DEPLOYMENT_ID or _discover_sandbox_id()
 
 
 async def _heartbeat_loop(deployment_id: str) -> None:
@@ -183,11 +228,66 @@ async def _register_with_daemon(deployment_id: str, secret_key: str) -> bool:
     return True
 
 
-async def _auto_start_daemon(secret_key: str) -> bool:
+def _derive_deployment_id(secret_key: str) -> str:
+    """Derive a stable, deterministic deployment UUID from the API key.
+
+    This is the primary UUID strategy for both the hosted server and local
+    single-user setups. It mirrors what VS Code's StateManager.getDeploymentId()
+    does (persist once, reuse always) — but without files, making it safe for
+    multi-user hosted servers where every user has a different API key.
+
+    Properties:
+    - Same key → same UUID on every call (stable across restarts)
+    - Different keys → different UUIDs (per-user isolation on hosted server)
+    - No files or headers needed — works purely from the API key
+    """
+    import hashlib
+    import uuid as _uuid
+    # SHA-256 of the key, take first 16 bytes → UUID
+    digest = hashlib.sha256(secret_key.encode()).digest()[:16]
+    return str(_uuid.UUID(bytes=digest, version=5))
+
+
+def _get_or_create_persistent_deployment_id(secret_key: str = "") -> str:
+    """Return the best available persistent deployment UUID.
+
+    Priority:
+    1. UUID derived from API key (deterministic, per-user, no files needed) —
+       used whenever secret_key is available, handles both hosted and local modes
+    2. Existing standalone_deployment_id file — for backwards compatibility when
+       no key is provided (edge case: tools called outside normal submit flow)
+    3. Generate a random UUID as last resort and persist it
+    """
+    if secret_key:
+        return _derive_deployment_id(secret_key)
+
+    # Fallback: file-based UUID (backwards compat, local single-user setups)
+    standalone_path = os.path.expanduser("~/.neo/daemon/standalone_deployment_id")
+    try:
+        uid = open(standalone_path).read().strip()
+        if uid and re.match(r'^[a-f0-9\-]{36}$', uid):
+            return uid
+    except OSError:
+        pass
+    import uuid as _uuid
+    uid = str(_uuid.uuid4())
+    try:
+        os.makedirs(os.path.expanduser("~/.neo/daemon"), exist_ok=True)
+        open(standalone_path, "w").write(uid)
+    except OSError:
+        pass
+    return uid
+
+
+async def _auto_start_daemon(secret_key: str, deployment_id: str = "") -> bool:
     """Start the Python daemon as a detached background process.
 
     Called automatically when neo_submit_task finds no daemon running — users
     never need to start the daemon manually.
+
+    Passes the deployment_id via --deployment-id so the daemon polls with the
+    same UUID the server already has — mirrors VS Code's approach of generating
+    the UUID in the client before starting the daemon.
 
     Returns True once the daemon's PID file appears (ready to accept work).
     """
@@ -200,8 +300,10 @@ async def _auto_start_daemon(secret_key: str) -> bool:
         cmd = [neo_mcp_bin, "daemon", _server_cwd]
     else:
         # Fallback: invoke via the same Python interpreter that's running now
-        cmd = [_sys.executable, "-c",
-               "from neo_mcp.daemon import main; main()", _server_cwd]
+        cmd = [_sys.executable, "-m", "neo_mcp.daemon", _server_cwd]
+
+    if deployment_id:
+        cmd += ["--deployment-id", deployment_id]
 
     env = os.environ.copy()
     env["NEO_SECRET_KEY"] = secret_key
@@ -217,8 +319,8 @@ async def _auto_start_daemon(secret_key: str) -> bool:
     except Exception:
         return False
 
-    # Wait up to 3 s for the daemon to write its PID file
-    for _ in range(6):
+    # Wait up to 5 s for the daemon to write its PID file
+    for _ in range(10):
         await asyncio.sleep(0.5)
         if _python_daemon_running():
             return True
@@ -255,7 +357,18 @@ app = Server(
 
 def handle_error(status_code: int) -> str:
     messages = {
-        400: "No available deployment. The built-in daemon may still be starting — retry in a few seconds.",
+        400: (
+            "No available deployment.\n\n"
+            "To fix this, you need a Neo daemon running and connected to your API key:\n\n"
+            "Option 1 — VS Code/Cursor extension (recommended):\n"
+            "  Install the Neo extension and log in. It starts the daemon automatically.\n\n"
+            "Option 2 — Python daemon (no VS Code needed):\n"
+            "  1. Run: neo-mcp login   (authenticate once)\n"
+            "  2. Run: neo-mcp daemon  (keep this running)\n"
+            "  3. If using the hosted MCP server (mcpserver.heyneo.com), also pass your\n"
+            "     deployment ID as a header when adding the MCP:\n"
+            "     --header \"X-Neo-Deployment-Id: $(cat ~/.neo/daemon/standalone_deployment_id)\""
+        ),
         401: "Invalid API key. Check your NEO_SECRET_KEY configuration.",
         402: "Your Neo account has insufficient credits.",
         403: "Your Neo trial or quota has ended.",
@@ -272,6 +385,8 @@ def handle_error(status_code: int) -> str:
 # Per-request key context vars — safe for concurrent async HTTP requests
 _ctx_api_key: contextvars.ContextVar[str] = contextvars.ContextVar("api_key", default="")
 _ctx_secret_key: contextvars.ContextVar[str] = contextvars.ContextVar("secret_key", default="")
+# Per-request deployment ID — set from X-Neo-Deployment-Id header in HTTP mode
+_ctx_deployment_id: contextvars.ContextVar[str] = contextvars.ContextVar("deployment_id", default="")
 
 
 def _headers() -> dict:
@@ -630,18 +745,63 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # ------------------------------------------------------------------ #
         if name == "neo_submit_task":
             secret_key = _ctx_secret_key.get() or NEO_SECRET_KEY
-            deployment_id = _get_deployment_id()
 
-            # If no deployment_id found, try to auto-start the Python daemon and
-            # wait briefly — the daemon writes its sandboxId to daemon.log which
-            # _discover_sandbox_id() will pick up.
-            if not deployment_id:
-                await _auto_start_daemon(secret_key)
-                for _ in range(10):
-                    await asyncio.sleep(0.5)
-                    deployment_id = _get_deployment_id()
-                    if deployment_id:
-                        break
+            # Step 1: Determine the deployment UUID to use.
+            # Priority:
+            #   a) X-Neo-Deployment-Id header / NEO_DEPLOYMENT_ID env var (explicit override)
+            #   b) Running VS Code extension / local daemon (discovered via daemon.log)
+            #   c) Key-derived UUID — deterministic from the API key, unique per user,
+            #      works on hosted server without any extra setup (same concept as VS Code's
+            #      StateManager.getDeploymentId() but key-based instead of file-based)
+            deployment_id = _get_deployment_id()  # covers (a) and (b)
+
+            if NEO_TRANSPORT == "http":
+                # ── Hosted server (HTTP mode) ───────────────────────────────
+                # Do NOT auto-start daemons here. The hosted server is a
+                # stateless bridge; spawning one daemon process per user would
+                # exhaust the server at scale. Execution must happen on the
+                # user's own machine via:
+                #   • The Neo VS Code/Cursor extension (recommended), OR
+                #   • `neo-mcp login` then `neo-mcp daemon` run locally
+                #
+                # The deployment_id is discovered automatically when the local
+                # daemon/extension is running — the daemon registers with Neo
+                # and Neo routes the task back to it. The deployment_id travels
+                # to the hosted server via the X-Neo-Deployment-Id header
+                # (set once when adding the MCP server; no ongoing user action).
+                if not deployment_id:
+                    return [TextContent(type="text", text=(
+                        "No active deployment found.\n\n"
+                        "The hosted Neo MCP server requires a daemon running on your local "
+                        "machine to execute tasks. Set one up with either:\n\n"
+                        "Option 1 — VS Code/Cursor extension (easiest):\n"
+                        "  Install the Neo extension and log in. It handles everything.\n\n"
+                        "Option 2 — Python daemon (no VS Code needed):\n"
+                        "  neo-mcp login        # once, opens browser\n"
+                        "  neo-mcp daemon       # keep this running\n\n"
+                        "Then re-add the hosted MCP with your deployment ID:\n"
+                        "  claude mcp add --scope user neo \\\n"
+                        "    --transport http https://mcpserver.heyneo.com/mcp \\\n"
+                        "    --header \"Authorization: Bearer <your-key>\" \\\n"
+                        "    --header \"X-Neo-Deployment-Id: "
+                        "$(cat ~/.neo/daemon/standalone_deployment_id)\""
+                    ))]
+            else:
+                # ── Local install (stdio mode) ──────────────────────────────
+                # If the VS Code/Cursor extension is running, it already polls
+                # /v2/poll/{deployment_id} with its own OAuth token — don't
+                # start a competing Python daemon for the same deployment_id.
+                # Only auto-start the Python daemon when there is no extension.
+                vscode_id = _vscode_daemon_deployment_id()
+                if not deployment_id:
+                    deployment_id = _get_or_create_persistent_deployment_id(secret_key)
+                if not vscode_id and not _python_daemon_running(deployment_id):
+                    await _auto_start_daemon(secret_key, deployment_id)
+                    # Wait up to 5 s for the daemon to write its PID file
+                    for _ in range(10):
+                        await asyncio.sleep(0.5)
+                        if _python_daemon_running(deployment_id):
+                            break
 
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
@@ -1038,7 +1198,7 @@ def _build_http_app():
     from starlette.applications import Starlette
     from starlette.datastructures import Headers
     from starlette.requests import Request
-    from starlette.responses import JSONResponse
+    from starlette.responses import JSONResponse, Response
     from starlette.routing import Route
 
     # Session store: mcp_session_id -> transport
@@ -1046,8 +1206,10 @@ def _build_http_app():
     _sessions: dict[str, StreamableHTTPServerTransport] = {}
     # Per-session secret key (captured at session creation, used for context var restore)
     _session_keys: dict[str, str] = {}
+    # Per-session deployment ID (from X-Neo-Deployment-Id header)
+    _session_deployment_ids: dict[str, str] = {}
 
-    async def _start_session(session_id: str, secret_key: str) -> StreamableHTTPServerTransport:
+    async def _start_session(session_id: str, secret_key: str, deployment_id: str = "") -> StreamableHTTPServerTransport:
         """Create a transport, start the MCP server task, wait until streams are ready."""
         transport = StreamableHTTPServerTransport(
             mcp_session_id=session_id, is_json_response_enabled=False
@@ -1060,6 +1222,7 @@ def _build_http_app():
                 await app.run(read_stream, write_stream, app.create_initialization_options())
             _sessions.pop(session_id, None)
             _session_keys.pop(session_id, None)
+            _session_deployment_ids.pop(session_id, None)
 
         asyncio.create_task(_run_session())
         await ready.wait()  # yield control so the task enters connect() before we proceed
@@ -1098,31 +1261,137 @@ def _build_http_app():
             await _send_401(send)
             return
 
+        # Extract optional deployment ID from X-Neo-Deployment-Id header
+        deployment_id_header = headers.get("x-neo-deployment-id", "").strip()
+
         # Set context vars for _headers() in this async context
         _ctx_api_key.set(headers.get("x-access-key", ""))
         _ctx_secret_key.set(secret_key)
+        _ctx_deployment_id.set(deployment_id_header)
 
         session_id = headers.get("mcp-session-id", "")
         if session_id and session_id in _sessions:
             transport = _sessions[session_id]
-            # Restore the session's key into context so tool calls use the right credentials
+            # Restore the session's credentials into context
             _ctx_secret_key.set(_session_keys.get(session_id, secret_key))
+            _ctx_deployment_id.set(_session_deployment_ids.get(session_id, deployment_id_header))
         else:
             session_id = uuid.uuid4().hex
-            transport = await _start_session(session_id, secret_key)
+            transport = await _start_session(session_id, secret_key, deployment_id_header)
             _sessions[session_id] = transport
             _session_keys[session_id] = secret_key
+            if deployment_id_header:
+                _session_deployment_ids[session_id] = deployment_id_header
 
         await transport.handle_request(scope, receive, send)
 
     async def health(_: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "server": "neo-mcp", "transport": "http"})
 
+    # ------------------------------------------------------------------
+    # CLI auth relay endpoints
+    # ------------------------------------------------------------------
+    async def auth_callback(request: Request) -> Response:
+        """Receive the OAuth redirect from heyneo.so after browser login.
+
+        URL: /auth/callback?state={uuid}&access_token={tok}&refresh_token={r}&username={u}
+
+        Stores the token temporarily (5 min TTL) so the CLI can poll for it.
+        Returns a success HTML page the user sees in their browser.
+        """
+        state = request.query_params.get("state", "")
+        access_token = request.query_params.get("access_token", "")
+        refresh_token = request.query_params.get("refresh_token", "")
+        username = request.query_params.get("username", "")
+
+        if state and access_token and len(access_token) >= 10:
+            # Purge expired entries to avoid unbounded growth
+            now = time.time()
+            expired = [k for k, v in _cli_auth_relay.items() if v["expires"] < now]
+            for k in expired:
+                del _cli_auth_relay[k]
+
+            _cli_auth_relay[state] = {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "username": username,
+                "expires": now + 300,  # 5 min TTL — single-use
+            }
+            body = b"""<!DOCTYPE html>
+<html>
+<head><title>Neo Login</title>
+<style>body{font-family:sans-serif;text-align:center;margin-top:80px;background:#0f0f0f;color:#fff;}
+h1{color:#22c55e;}p{color:#a1a1aa;}</style></head>
+<body>
+<h1>&#10003; Authenticated</h1>
+<p>You can close this tab and return to your terminal.</p>
+</body></html>"""
+        else:
+            body = b"""<!DOCTYPE html>
+<html>
+<head><title>Neo Login</title>
+<style>body{font-family:sans-serif;text-align:center;margin-top:80px;background:#0f0f0f;color:#fff;}
+h1{color:#ef4444;}p{color:#a1a1aa;}</style></head>
+<body>
+<h1>&#10007; Login failed</h1>
+<p>No token received. Please try again.</p>
+</body></html>"""
+
+        return Response(content=body, media_type="text/html")
+
+    async def auth_pending(request: Request) -> JSONResponse:
+        """Register a state as pending before the CLI shows the login URL.
+
+        URL: POST /auth/pending/{state}
+
+        Marks the state as expecting a callback so poll returns 202 (not 410).
+        Expires in 5 minutes if no callback arrives.
+        """
+        state = request.path_params.get("state", "")
+        if state:
+            _cli_auth_relay[state] = {
+                "access_token": "",  # empty = pending
+                "refresh_token": "",
+                "username": "",
+                "expires": time.time() + 300,
+            }
+        return JSONResponse({"status": "pending"}, status_code=202)
+
+    async def auth_poll(request: Request) -> JSONResponse:
+        """CLI polls this until the token arrives.
+
+        URL: GET /auth/poll/{state}
+
+        Returns 202 + {"status":"pending"} while waiting.
+        Returns 200 + {access_token, refresh_token, username} once ready (single-use).
+        Returns 410 if the state is expired or was never registered.
+        """
+        state = request.path_params.get("state", "")
+        entry = _cli_auth_relay.get(state)
+        if entry is None:
+            return JSONResponse({"status": "expired"}, status_code=410)
+        if entry["expires"] < time.time():
+            del _cli_auth_relay[state]
+            return JSONResponse({"status": "expired"}, status_code=410)
+        # Still pending (no token yet)
+        if not entry.get("access_token"):
+            return JSONResponse({"status": "pending"}, status_code=202)
+        # Token ready — return and delete (single-use)
+        del _cli_auth_relay[state]
+        return JSONResponse({
+            "access_token": entry["access_token"],
+            "refresh_token": entry["refresh_token"],
+            "username": entry["username"],
+        })
+
     from neo_mcp.oauth import oauth_routes
     _starlette = Starlette(
         routes=[
             Route("/", health, methods=["GET"]),
             Route("/health", health, methods=["GET"]),
+            Route("/auth/callback", auth_callback, methods=["GET"]),
+            Route("/auth/pending/{state}", auth_pending, methods=["POST"]),
+            Route("/auth/poll/{state}", auth_poll, methods=["GET"]),
             *oauth_routes(),
         ]
     )
@@ -1148,11 +1417,11 @@ async def _run_http():
     await server.serve()
 
 
-def _python_daemon_running() -> bool:
-    """Return True if a Python neo-mcp daemon process is currently alive."""
+def _python_daemon_running(deployment_id: str = "") -> bool:
+    """Return True if a Python neo-mcp daemon for this deployment is currently alive."""
     try:
         from neo_mcp.daemon import is_running
-        return is_running()
+        return is_running(deployment_id)
     except Exception:
         return False
 

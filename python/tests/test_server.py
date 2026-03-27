@@ -338,6 +338,96 @@ class TestDiscoverSandboxId(unittest.TestCase):
         self.assertEqual(result, uid_log)
 
 
+# ---------------------------------------------------------------------------
+# 5b. _vscode_daemon_deployment_id — daemon.log only, no standalone fallback
+# ---------------------------------------------------------------------------
+
+class TestVscodeDaemonDeploymentId(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._patch = patch("neo_mcp.server.os.path.expanduser",
+                            side_effect=lambda p: p.replace("~", self._tmpdir))
+        self._patch.start()
+        os.makedirs(os.path.join(self._tmpdir, ".neo", "daemon"), exist_ok=True)
+        self._daemon_dir = os.path.join(self._tmpdir, ".neo", "daemon")
+
+    def tearDown(self):
+        self._patch.stop()
+
+    def _write_log(self, lines, filename="daemon.log"):
+        path = os.path.join(self._daemon_dir, filename)
+        with open(path, "w") as f:
+            f.write("\n".join(lines))
+
+    def test_returns_id_from_daemon_log(self):
+        uid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        self._write_log([f'{{"sandboxId": "{uid}"}}'])
+        self.assertEqual(srv._vscode_daemon_deployment_id(), uid)
+
+    def test_returns_last_id_when_multiple_entries(self):
+        uid1 = "11111111-1111-1111-1111-111111111111"
+        uid2 = "22222222-2222-2222-2222-222222222222"
+        self._write_log([f'{{"sandboxId": "{uid1}"}}', f'{{"sandboxId": "{uid2}"}}'])
+        self.assertEqual(srv._vscode_daemon_deployment_id(), uid2)
+
+    def test_falls_back_to_daemon_log_1(self):
+        uid = "33333333-3333-3333-3333-333333333333"
+        self._write_log([f'{{"sandboxId": "{uid}"}}'], filename="daemon.log.1")
+        self.assertEqual(srv._vscode_daemon_deployment_id(), uid)
+
+    def test_prefers_daemon_log_over_log_1(self):
+        uid1 = "44444444-4444-4444-4444-444444444444"
+        uid2 = "55555555-5555-5555-5555-555555555555"
+        self._write_log([f'{{"sandboxId": "{uid1}"}}'], filename="daemon.log")
+        self._write_log([f'{{"sandboxId": "{uid2}"}}'], filename="daemon.log.1")
+        self.assertEqual(srv._vscode_daemon_deployment_id(), uid1)
+
+    def test_returns_empty_when_no_log_files(self):
+        self.assertEqual(srv._vscode_daemon_deployment_id(), "")
+
+    def test_returns_empty_for_invalid_uuid_format(self):
+        self._write_log(['{"sandboxId": "not-a-valid-uuid-here"}'])
+        self.assertEqual(srv._vscode_daemon_deployment_id(), "")
+
+    def test_does_not_fall_back_to_standalone_deployment_id(self):
+        """Critical: unlike _discover_sandbox_id, must NOT read standalone_deployment_id."""
+        uid = "66666666-6666-6666-6666-666666666666"
+        standalone = os.path.join(self._daemon_dir, "standalone_deployment_id")
+        with open(standalone, "w") as f:
+            f.write(uid)
+        # No daemon.log — should return empty, not the standalone file
+        self.assertEqual(srv._vscode_daemon_deployment_id(), "")
+
+    def test_does_not_fall_back_to_workspaces_json(self):
+        """Critical: must NOT read thread-workspaces.json."""
+        uid = "77777777-7777-7777-7777-777777777777"
+        ws_path = os.path.join(self._daemon_dir, "thread-workspaces.json")
+        with open(ws_path, "w") as f:
+            json.dump({uid: "/workspace"}, f)
+        self.assertEqual(srv._vscode_daemon_deployment_id(), "")
+
+    def test_handles_mixed_plaintext_and_json_lines(self):
+        uid = "88888888-8888-8888-8888-888888888888"
+        self._write_log([
+            "[2026-01-01] Daemon started",
+            '{"sandboxId": "tooshort"}',
+            f'{{"sandboxId": "{uid}"}}',
+            "[2026-01-01] Polling started",
+        ])
+        self.assertEqual(srv._vscode_daemon_deployment_id(), uid)
+
+    def test_empty_log_file_returns_empty(self):
+        self._write_log([])
+        self.assertEqual(srv._vscode_daemon_deployment_id(), "")
+
+    def test_recovers_id_after_non_json_only_log(self):
+        """Falls back to daemon.log.1 when daemon.log exists but has no sandboxId."""
+        uid = "99999999-9999-9999-9999-999999999999"
+        self._write_log(["[2026-01-01] No sandbox yet"], filename="daemon.log")
+        self._write_log([f'{{"sandboxId": "{uid}"}}'], filename="daemon.log.1")
+        self.assertEqual(srv._vscode_daemon_deployment_id(), uid)
+
+
 class TestGetDeploymentId(unittest.TestCase):
     def setUp(self):
         self._orig = srv.NEO_DEPLOYMENT_ID
@@ -683,6 +773,115 @@ class TestNeoSubmitTask(unittest.TestCase):
         txt = text_of(result)
         self.assertIn("COMPLETED", txt)
         self.assertIn("Model trained!", txt)
+
+    # -- VS Code extension / daemon auto-start routing tests ----------------
+
+    def test_vscode_extension_present_skips_daemon_autostart(self):
+        """When VS Code extension daemon.log is found, Python daemon must NOT start."""
+        resp_ok = make_response(200, {"thread_id": "tid-ext-skip"})
+        ext_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        mock_daemon = AsyncMock()
+
+        with patch("neo_mcp.server._get_deployment_id", return_value=ext_id), \
+             patch("neo_mcp.server._vscode_daemon_deployment_id", return_value=ext_id), \
+             patch("neo_mcp.server._auto_start_daemon", mock_daemon), \
+             patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
+             patch("asyncio.create_task"):
+            ctx, _ = make_async_client({"DEFAULT": resp_ok})
+            MockClient.return_value = ctx
+            result = call_tool("neo_submit_task", {"description": "train model"})
+
+        mock_daemon.assert_not_called()
+        self.assertIn("tid-ext-skip", text_of(result))
+
+    def test_vscode_extension_absent_autostart_daemon(self):
+        """When no VS Code extension, Python daemon must be auto-started."""
+        resp_ok = make_response(200, {"thread_id": "tid-no-ext"})
+        mock_daemon = AsyncMock(return_value=True)
+
+        with patch("neo_mcp.server._get_deployment_id", return_value=""), \
+             patch("neo_mcp.server._vscode_daemon_deployment_id", return_value=""), \
+             patch("neo_mcp.server._get_or_create_persistent_deployment_id", return_value="key-uuid"), \
+             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._auto_start_daemon", mock_daemon), \
+             patch("asyncio.sleep", new_callable=AsyncMock), \
+             patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
+             patch("asyncio.create_task"):
+            ctx, _ = make_async_client({"DEFAULT": resp_ok})
+            MockClient.return_value = ctx
+            result = call_tool("neo_submit_task", {"description": "train model"})
+
+        mock_daemon.assert_called_once()
+        self.assertIn("tid-no-ext", text_of(result))
+
+    def test_vscode_extension_absent_daemon_already_running_no_restart(self):
+        """If our Python daemon is already running, don't start a second one."""
+        resp_ok = make_response(200, {"thread_id": "tid-already-running"})
+        mock_daemon = AsyncMock()
+
+        with patch("neo_mcp.server._get_deployment_id", return_value=""), \
+             patch("neo_mcp.server._vscode_daemon_deployment_id", return_value=""), \
+             patch("neo_mcp.server._get_or_create_persistent_deployment_id", return_value="key-uuid"), \
+             patch("neo_mcp.server._python_daemon_running", return_value=True), \
+             patch("neo_mcp.server._auto_start_daemon", mock_daemon), \
+             patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
+             patch("asyncio.create_task"):
+            ctx, _ = make_async_client({"DEFAULT": resp_ok})
+            MockClient.return_value = ctx
+            call_tool("neo_submit_task", {"description": "train model"})
+
+        mock_daemon.assert_not_called()
+
+    def test_vscode_extension_id_sent_in_submit_body(self):
+        """Extension deployment_id must be forwarded to init-chat-direct."""
+        captured = {}
+        resp_ok = make_response(200, {"thread_id": "tid-body"})
+        ext_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+
+        async def mock_post(url, **kwargs):
+            captured.update(kwargs.get("json", {}))
+            return resp_ok
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=mock_post)
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=mock_client)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("neo_mcp.server._get_deployment_id", return_value=ext_id), \
+             patch("neo_mcp.server._vscode_daemon_deployment_id", return_value=ext_id), \
+             patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
+             patch("asyncio.create_task"):
+            call_tool("neo_submit_task", {"description": "task"})
+
+        self.assertEqual(captured.get("deployment_id"), ext_id)
+        self.assertEqual(captured.get("deployment_type"), "vscode")
+
+    def test_key_derived_id_used_when_no_extension_no_existing_id(self):
+        """When no extension and no discovered ID, key-derived UUID is submitted."""
+        captured = {}
+        resp_ok = make_response(200, {"thread_id": "tid-key-derived"})
+        key_uuid = "cccccccc-dddd-eeee-ffff-aaaaaaaaaaaa"
+
+        async def mock_post(url, **kwargs):
+            captured.update(kwargs.get("json", {}))
+            return resp_ok
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=mock_post)
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=mock_client)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("neo_mcp.server._get_deployment_id", return_value=""), \
+             patch("neo_mcp.server._vscode_daemon_deployment_id", return_value=""), \
+             patch("neo_mcp.server._get_or_create_persistent_deployment_id", return_value=key_uuid), \
+             patch("neo_mcp.server._python_daemon_running", return_value=True), \
+             patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
+             patch("asyncio.create_task"):
+            call_tool("neo_submit_task", {"description": "task"})
+
+        self.assertEqual(captured.get("deployment_id"), key_uuid)
 
 
 # ---------------------------------------------------------------------------

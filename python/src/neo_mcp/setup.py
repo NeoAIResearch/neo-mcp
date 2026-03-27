@@ -1,14 +1,21 @@
 """neo-mcp setup wizard — stdlib only."""
 import getpass
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 
 REMOTE_URL = "https://mcpserver.heyneo.com/mcp"
+
+_DAEMON_DIR = os.path.expanduser("~/.neo/daemon")
+_MCP_AUTH_FILE = os.path.join(_DAEMON_DIR, "mcp_auth.json")
+_STANDALONE_UUID_FILE = os.path.join(_DAEMON_DIR, "standalone_deployment_id")
 
 EDITORS = [
     ("claude", "Claude Code"),
@@ -21,6 +28,139 @@ EDITORS = [
 ]
 
 _SUPPORTS_REMOTE = {"claude", "cursor", "windsurf", "vscode"}
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+
+def _valid_oauth_token() -> str:
+    """Return the stored OAuth access_token if it exists and looks valid."""
+    try:
+        data = json.loads(Path(_MCP_AUTH_FILE).read_text())
+        token = data.get("access_token", "")
+        if token and len(token) >= 10 and token not in ("\\", "null", "undefined"):
+            return token
+    except (OSError, json.JSONDecodeError):
+        pass
+    return ""
+
+
+def _do_login() -> bool:
+    """Run the browser OAuth flow. Returns True if login succeeded."""
+    try:
+        from neo_mcp.login import run_login
+        run_login()
+        return bool(_valid_oauth_token())
+    except SystemExit:
+        return False
+    except Exception as e:
+        print(f"  Login error: {e}", file=sys.stderr)
+        return False
+
+
+def _validate_api_key(secret_key: str) -> bool:
+    """Check that the API key is accepted by the Neo backend.
+
+    Uses the thread-status endpoint (what the MCP server actually calls),
+    not the daemon poll endpoint. A 404 on an unknown thread_id means auth
+    passed; 401/403 means the key is bad.
+    """
+    import urllib.request
+    import urllib.error
+
+    neo_api = os.environ.get("NEO_API_URL", "https://master.heyneo.so")
+    # Use a dummy thread_id — we expect 404, which still means auth passed.
+    url = f"{neo_api}/v2/thread/status/00000000-0000-0000-0000-000000000000"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {secret_key}"})
+    try:
+        urllib.request.urlopen(req, timeout=8)
+        return True  # Unexpected 200 — still fine
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return False  # Bad API key
+        return True  # 404 = key valid, thread not found — expected
+    except Exception:
+        return True  # Network error — don't block setup
+
+
+# ---------------------------------------------------------------------------
+# Daemon helpers (remote mode only)
+# ---------------------------------------------------------------------------
+
+def _derive_deployment_id(secret_key: str) -> str:
+    """Derive a stable, deterministic UUID from the API key.
+
+    Each user's key maps to a unique UUID — no files, no collisions on hosted servers.
+    Matches the logic in server.py _derive_deployment_id().
+    """
+    digest = hashlib.sha256(secret_key.encode()).digest()[:16]
+    return str(uuid.UUID(bytes=digest, version=5))
+
+
+def _daemon_pid_file(deployment_id: str) -> str:
+    return os.path.join(_DAEMON_DIR, f"daemon_{deployment_id[:8]}.pid")
+
+
+def _vscode_extension_deployment_id() -> str:
+    """Return deployment_id from VS Code/Cursor extension's daemon.log if present."""
+    import re
+    for log_name in ("daemon.log", "daemon.log.1"):
+        log_path = Path(_DAEMON_DIR) / log_name
+        try:
+            lines = log_path.read_text(errors="ignore").splitlines()
+            for line in reversed(lines):
+                m = re.search(r'"sandboxId"\s*:\s*"([a-f0-9\-]{36})"', line)
+                if m:
+                    return m.group(1)
+        except OSError:
+            pass
+    return ""
+
+
+def _daemon_running(deployment_id: str) -> bool:
+    """Check only the per-deployment PID file — never the legacy global one.
+
+    The legacy python_daemon.pid may contain a VS Code extension process or
+    a daemon for a different UUID. We must verify the daemon for THIS specific
+    deployment_id is running.
+    """
+    try:
+        pid = int(Path(_daemon_pid_file(deployment_id)).read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _start_daemon(secret_key: str, deployment_id: str) -> bool:
+    """Start neo-mcp daemon in the background. Returns True when PID file appears."""
+    neo_mcp_bin = shutil.which("neo-mcp")
+    if not neo_mcp_bin:
+        print("  neo-mcp not found on PATH — cannot start daemon.", file=sys.stderr)
+        return False
+
+    env = os.environ.copy()
+    env["NEO_SECRET_KEY"] = secret_key
+
+    try:
+        subprocess.Popen(
+            [neo_mcp_bin, "daemon", "--deployment-id", deployment_id],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        print(f"  Failed to start daemon: {e}", file=sys.stderr)
+        return False
+
+    # Wait up to 10 s for daemon to be ready
+    for _ in range(20):
+        time.sleep(0.5)
+        if _daemon_running(deployment_id):
+            return True
+    return False
 
 
 def _parse_args(args: list) -> dict:
@@ -140,6 +280,7 @@ def _merge_mcp_servers(path: Path, key: str, server_cfg: dict, no_backup: bool) 
 
 def _configure_claude(secret_key: str, opts: dict) -> tuple:
     use_remote = opts.get("remote", False)
+    deployment_id = opts.get("deployment_id", "")
 
     scope = opts.get("scope", "user")
     no_backup = opts.get("no_backup", False)
@@ -152,6 +293,8 @@ def _configure_claude(secret_key: str, opts: dict) -> tuple:
                     "--scope", scope, "neo", REMOTE_URL,
                     "--header", f"Authorization: Bearer {secret_key}",
                 ]
+                if deployment_id:
+                    cmd += ["--header", f"X-Neo-Deployment-Id: {deployment_id}"]
             else:
                 cmd = [
                     "claude", "mcp", "add", "--scope", scope,
@@ -167,12 +310,13 @@ def _configure_claude(secret_key: str, opts: dict) -> tuple:
 
     # Fallback: write JSON directly to ~/.claude/claude_desktop_config.json
     if use_remote:
+        headers: dict = {"Authorization": f"Bearer {secret_key}"}
+        if deployment_id:
+            headers["X-Neo-Deployment-Id"] = deployment_id
         server_cfg: dict = {
             "transport": "http",
             "url": REMOTE_URL,
-            "headers": {
-                "Authorization": f"Bearer {secret_key}",
-            },
+            "headers": headers,
         }
     else:
         server_cfg = {
@@ -201,17 +345,16 @@ def _configure_claude(secret_key: str, opts: dict) -> tuple:
 
 def _configure_cursor(secret_key: str, opts: dict) -> tuple:
     use_remote = opts.get("remote", False)
+    deployment_id = opts.get("deployment_id", "")
 
     path = Path.home() / ".cursor" / "mcp.json"
     no_backup = opts.get("no_backup", False)
 
     if use_remote:
-        server_cfg: dict = {
-            "url": REMOTE_URL,
-            "headers": {
-                "Authorization": f"Bearer {secret_key}",
-            },
-        }
+        headers: dict = {"Authorization": f"Bearer {secret_key}"}
+        if deployment_id:
+            headers["X-Neo-Deployment-Id"] = deployment_id
+        server_cfg: dict = {"url": REMOTE_URL, "headers": headers}
     else:
         server_cfg = {
             "command": "neo-mcp",
@@ -230,17 +373,16 @@ def _configure_cursor(secret_key: str, opts: dict) -> tuple:
 
 def _configure_windsurf(secret_key: str, opts: dict) -> tuple:
     use_remote = opts.get("remote", False)
+    deployment_id = opts.get("deployment_id", "")
 
     path = Path.home() / ".codeium" / "windsurf" / "mcp_config.json"
     no_backup = opts.get("no_backup", False)
 
     if use_remote:
-        server_cfg: dict = {
-            "serverUrl": REMOTE_URL,
-            "headers": {
-                "Authorization": f"Bearer {secret_key}",
-            },
-        }
+        headers: dict = {"Authorization": f"Bearer {secret_key}"}
+        if deployment_id:
+            headers["X-Neo-Deployment-Id"] = deployment_id
+        server_cfg: dict = {"serverUrl": REMOTE_URL, "headers": headers}
     else:
         server_cfg = {
             "command": "neo-mcp",
@@ -435,7 +577,93 @@ def run_setup(args: list) -> None:
     if is_tty and not opts.get("remote") and any(e in _SUPPORTS_REMOTE for e in selected):
         opts["remote"] = _ask_remote()
 
-    # Configure each editor
+    use_remote = opts.get("remote", False)
+
+    # ── Validate API key ─────────────────────────────────────────────────────
+    print()
+    print("Validating API key…", end=" ", flush=True)
+    if _validate_api_key(secret_key):
+        print("OK.")
+    else:
+        print("FAILED.")
+        print("Error: API key rejected by Neo backend. Check your NEO_SECRET_KEY.", file=sys.stderr)
+        sys.exit(1)
+
+    # ── Detect VS Code/Cursor extension or derive deployment ID from key ─────
+    vscode_id = _vscode_extension_deployment_id()
+
+    if vscode_id:
+        _setup_deployment_id = vscode_id
+        print(f"\nVS Code/Cursor extension detected (ID: {vscode_id[:8]}…).")
+        print("Authentication: not required — extension daemon handles task execution.")
+    else:
+        _setup_deployment_id = _derive_deployment_id(secret_key)
+
+        # ── Authentication (OAuth for Python daemon) ──────────────────────────
+        # The MCP server tracks task status via thread_id using the API key — no
+        # OAuth needed there. But the Python daemon polls /v2/poll/{deployment_id}
+        # which requires an OAuth token. Ensure the user is logged in.
+        print()
+        existing_token = _valid_oauth_token()
+        if existing_token:
+            try:
+                username = json.loads(Path(_MCP_AUTH_FILE).read_text()).get("username", "")
+            except Exception:
+                username = ""
+            print(f"Authentication: already logged in{' as ' + username if username else ''}.")
+        else:
+            print("Authentication: the daemon needs an OAuth token to receive tasks.")
+            print("Opening browser login…")
+            ok = _do_login()
+            if not ok:
+                print(
+                    "\nLogin failed or was cancelled.\n"
+                    "The daemon requires a browser login to execute tasks on your machine.\n"
+                    "Re-run `neo-mcp login` to authenticate, then re-run setup.",
+                    file=sys.stderr,
+                )
+                print("Continuing setup without login (daemon will fail until you run neo-mcp login).")
+
+    # ── Remote mode: start daemon if needed, capture deployment ID ──────────
+    if use_remote:
+        deployment_id = _setup_deployment_id
+        print(f"\nDeployment ID: {deployment_id}")
+
+        if vscode_id:
+            print("Daemon: VS Code/Cursor extension is handling execution — no daemon needed.")
+        elif _daemon_running(deployment_id):
+            print("Daemon: already running.")
+        else:
+            print("Starting Neo daemon in background…")
+            ok = _start_daemon(secret_key, deployment_id)
+            if ok:
+                print("Daemon: started and polling Neo backend.")
+            else:
+                print(
+                    "Daemon: failed to start (check that neo-mcp is installed and "
+                    "`neo-mcp login` has been run).\n"
+                    "The MCP server will still be configured — start the daemon manually "
+                    "with `neo-mcp daemon` before using Neo tools.",
+                    file=sys.stderr,
+                )
+
+        if not vscode_id:
+            # Persist deployment ID so daemon.py can reuse it on restart
+            try:
+                os.makedirs(_DAEMON_DIR, exist_ok=True)
+                Path(_STANDALONE_UUID_FILE).write_text(deployment_id)
+            except OSError:
+                pass
+            print(
+                "\nIMPORTANT: The daemon must keep running for Neo to work.\n"
+                "  • It survives terminal close (started with start_new_session=True).\n"
+                "  • To restart it after a reboot: neo-mcp daemon\n"
+                "  • Or add it to your shell startup: echo 'neo-mcp daemon &' >> ~/.zshrc"
+            )
+
+        opts["deployment_id"] = deployment_id
+
+    # ── Configure each editor ───────────────────────────────────────────────
     print()
     results = []
     for editor_key in selected:

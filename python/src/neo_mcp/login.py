@@ -1,9 +1,18 @@
 """
 neo-mcp login — browser-based OAuth flow for standalone pip installations.
 
-Opens https://heyneo.so/login?redirect=http://localhost:{port}/callback,
-waits for the auth callback, then writes the token to
-~/.neo/daemon/mcp_auth.json so the daemon and server can use it.
+Flow (remote/headless — primary):
+  1. Generate a unique state UUID.
+  2. Open https://heyneo.so/login?redirect=https://mcpserver.heyneo.com/auth/callback?state={uuid}
+  3. User logs in on their browser (any device) — Neo redirects to the MCP server callback.
+  4. CLI polls https://mcpserver.heyneo.com/auth/poll/{state} every 2 s until token arrives.
+  5. Token written to ~/.neo/daemon/mcp_auth.json.
+
+Flow (local — fast path):
+  If a localhost port can be bound and the browser is on the same machine,
+  the callback comes directly to the local HTTP server (faster, no relay needed).
+  This is tried first; relay is used if the local server doesn't receive the
+  callback within 8 s (likely running on a remote machine).
 
 Usage:
     neo-mcp login
@@ -16,64 +25,22 @@ import os
 import socket
 import sys
 import threading
+import time
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
+import urllib.request
+import urllib.error
 
 NEO_AUTH_URL = os.environ.get("NEO_AUTH_URL", "https://heyneo.so")
+NEO_RELAY_URL = os.environ.get("NEO_RELAY_URL", "https://mcpserver.heyneo.com")
 _DAEMON_DIR = os.path.expanduser("~/.neo/daemon")
 _MCP_AUTH_FILE = os.path.join(_DAEMON_DIR, "mcp_auth.json")
 
 # ---------------------------------------------------------------------------
-# Callback HTTP server
+# Shared helpers
 # ---------------------------------------------------------------------------
-
-_received: dict = {}  # shared between threads: {"access_token", "refresh_token", "username"}
-_server_done = threading.Event()
-
-
-class _CallbackHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/callback":
-            params = parse_qs(parsed.query)
-            _received["access_token"] = params.get("access_token", [""])[0]
-            _received["refresh_token"] = params.get("refresh_token", [""])[0]
-            _received["username"] = params.get("username", [""])[0]
-
-            body = b"""<!DOCTYPE html>
-<html>
-<head><title>Neo Login</title>
-<style>body{font-family:sans-serif;text-align:center;margin-top:80px;background:#0f0f0f;color:#fff;}
-h1{color:#22c55e;}p{color:#a1a1aa;}</style></head>
-<body>
-<h1>&#10003; Authenticated</h1>
-<p>You can close this tab and return to your terminal.</p>
-</body></html>"""
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            _server_done.set()
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, fmt, *args):  # suppress default access log
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _free_port() -> int:
-    """Return an available TCP port."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
 
 def _write_mcp_auth(access_token: str, refresh_token: str, username: str) -> None:
     os.makedirs(_DAEMON_DIR, exist_ok=True)
@@ -88,28 +55,102 @@ def _write_mcp_auth(access_token: str, refresh_token: str, username: str) -> Non
         pass
 
 
-def _prompt_manual_token() -> tuple[str, str, str]:
-    """Fallback: ask user to paste their access token manually."""
-    print()
-    print("Browser login timed out or was cancelled.")
-    print()
-    print("Manual authentication:")
-    print(f"  1. Open {NEO_AUTH_URL}/login in your browser")
-    print("  2. Log in to your Neo account")
-    print("  3. Open browser DevTools → Application → Local Storage")
-    print("     (or check the auth callback URL for ?access_token=...)")
-    print()
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# ---------------------------------------------------------------------------
+# Local callback server (fast path for local installs)
+# ---------------------------------------------------------------------------
+
+_local_received: dict = {}
+_local_done = threading.Event()
+
+
+class _LocalCallbackHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/callback":
+            params = parse_qs(parsed.query)
+            _local_received["access_token"] = params.get("access_token", [""])[0]
+            _local_received["refresh_token"] = params.get("refresh_token", [""])[0]
+            _local_received["username"] = params.get("username", [""])[0]
+            body = b"""<!DOCTYPE html>
+<html><head><title>Neo Login</title>
+<style>body{font-family:sans-serif;text-align:center;margin-top:80px;background:#0f0f0f;color:#fff;}
+h1{color:#22c55e;}p{color:#a1a1aa;}</style></head>
+<body><h1>&#10003; Authenticated</h1>
+<p>You can close this tab and return to your terminal.</p>
+</body></html>"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            _local_done.set()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Relay flow — works on remote servers (primary path)
+# ---------------------------------------------------------------------------
+
+def _relay_login() -> tuple[str, str, str]:
+    """Open login URL that redirects to the MCP server relay, poll for the token.
+
+    Returns (access_token, refresh_token, username) or ("", "", "") on failure.
+    """
+    state = str(uuid.uuid4())
+    callback_url = f"{NEO_RELAY_URL}/auth/callback?state={state}"
+    login_url = f"{NEO_AUTH_URL}/login?redirect={callback_url}"
+    poll_url = f"{NEO_RELAY_URL}/auth/poll/{state}"
+    pending_url = f"{NEO_RELAY_URL}/auth/pending/{state}"
+
+    # Register state on relay server before showing URL so first poll gets 202
     try:
-        token = input("Paste your access_token here (or press Enter to skip): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        return "", "", ""
-    if not token or len(token) < 10:
-        return "", "", ""
-    try:
-        username = input("Enter your Neo username (email): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        username = ""
-    return token, "", username
+        req = urllib.request.Request(pending_url, data=b"", method="POST")
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # Non-fatal — relay server may not be reachable yet
+
+    print()
+    print("Open this URL in your browser to log in to Neo:")
+    print(f"\n  {login_url}\n")
+    print("Waiting for login", end="", flush=True)
+
+    webbrowser.open(login_url)
+
+    # Poll the MCP server relay for up to 3 minutes
+    for i in range(90):
+        time.sleep(2)
+        print(".", end="", flush=True)
+        try:
+            resp = urllib.request.urlopen(poll_url, timeout=5)
+            data = json.loads(resp.read())
+            access_token = data.get("access_token", "")
+            if access_token and len(access_token) >= 10:
+                print(" done.")
+                return access_token, data.get("refresh_token", ""), data.get("username", "")
+        except urllib.error.HTTPError as e:
+            if e.code == 410:
+                # State expired server-side
+                print()
+                print("Login session expired. Please try again.")
+                return "", "", ""
+            # 202 = still pending — keep polling
+        except Exception:
+            pass  # Network blip — keep trying
+
+    print()
+    print("Login timed out (3 minutes).")
+    return "", "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -117,34 +158,37 @@ def _prompt_manual_token() -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 
 def run_login() -> None:
+    # Try local callback server first (fast path — works if browser is on same machine)
     port = _free_port()
-    redirect_url = f"http://localhost:{port}/callback"
-    login_url = f"{NEO_AUTH_URL}/login?redirect={redirect_url}"
+    local_redirect = f"http://localhost:{port}/callback"
+    local_login_url = f"{NEO_AUTH_URL}/login?redirect={local_redirect}"
 
-    # Start local callback server in background thread
-    server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
+    local_server = HTTPServer(("127.0.0.1", port), _LocalCallbackHandler)
+    t = threading.Thread(target=local_server.serve_forever, daemon=True)
     t.start()
 
-    print()
-    print("Opening Neo login in your browser…")
-    print(f"  {login_url}")
-    print()
-    print("If the browser doesn't open automatically, paste the URL above into your browser.")
-    print()
+    # Attempt to open the local-redirect URL silently.
+    # If this machine is remote, the browser will be on a different host and
+    # the callback will never arrive — we'll fall through to the relay flow.
+    webbrowser.open(local_login_url)
 
-    opened = webbrowser.open(login_url)
-    if not opened:
-        print(f"Could not open browser automatically. Please open this URL manually:\n  {login_url}\n")
+    # Wait 8 s for the local callback (fast path)
+    got_local = _local_done.wait(timeout=8)
+    local_server.shutdown()
 
-    # Wait up to 120 s for the callback
-    completed = _server_done.wait(timeout=120)
-    server.shutdown()
+    if got_local and _local_received.get("access_token"):
+        token = _local_received["access_token"]
+        refresh = _local_received.get("refresh_token", "")
+        username = _local_received.get("username", "")
+        _write_mcp_auth(token, refresh, username)
+        print(f"Logged in as: {username or '(unknown)'}")
+        print(f"Token saved to: {_MCP_AUTH_FILE}")
+        return
 
-    if completed and _received.get("access_token"):
-        access_token = _received["access_token"]
-        refresh_token = _received.get("refresh_token", "")
-        username = _received.get("username", "")
+    # Local callback didn't fire — use relay flow (remote server / headless)
+    access_token, refresh_token, username = _relay_login()
+
+    if access_token:
         _write_mcp_auth(access_token, refresh_token, username)
         print(f"Logged in as: {username or '(unknown)'}")
         print(f"Token saved to: {_MCP_AUTH_FILE}")
@@ -153,14 +197,23 @@ def run_login() -> None:
         print("  neo-mcp daemon")
         return
 
-    # Fallback: manual paste
-    access_token, refresh_token, username = _prompt_manual_token()
-    if access_token:
-        _write_mcp_auth(access_token, refresh_token, username)
-        print()
+    # Last resort: manual paste
+    print()
+    print("Could not complete login automatically.")
+    print(f"  1. Open {NEO_AUTH_URL}/login in your browser and log in")
+    print("  2. After login, check the callback URL for ?access_token=...")
+    print()
+    try:
+        token = input("Paste your access_token here (or press Enter to skip): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        token = ""
+    if token and len(token) >= 10:
+        try:
+            username = input("Enter your Neo username (email): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            username = ""
+        _write_mcp_auth(token, "", username)
         print("Token saved.")
-        print("You can now start the Neo daemon:")
-        print("  neo-mcp daemon")
     else:
         print("Login cancelled — no token saved.")
         sys.exit(1)

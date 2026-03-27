@@ -50,6 +50,16 @@ _DAEMON_LOG = os.path.join(_DAEMON_DIR, "daemon.log")
 _PID_FILE = os.path.join(_DAEMON_DIR, "python_daemon.pid")
 _WORKSPACES_FILE = os.path.join(_DAEMON_DIR, "thread-workspaces.json")
 
+
+def _pid_file_for(deployment_id: str) -> str:
+    """Return a per-deployment PID file path.
+
+    Using a per-deployment PID file lets multiple daemons (one per user) run
+    safely on the same hosted server without clobbering each other's state.
+    Short prefix keeps filenames readable.
+    """
+    return os.path.join(_DAEMON_DIR, f"daemon_{deployment_id[:8]}.pid")
+
 # Directories to skip when listing files (matches DaemonActionHandlers.ts)
 _SKIP_DIRS = {"venv", "node_modules", "env", ".venv", "__pycache__", ".git", ".tox", "dist", "build"}
 
@@ -72,12 +82,20 @@ def _save_mcp_auth(data: dict) -> None:
 
 
 def _get_oauth_token() -> str:
-    """Return the current OAuth access_token, or empty string if not authenticated."""
+    """Return the best available polling token.
+
+    Priority:
+    1. OAuth access_token from ~/.neo/daemon/mcp_auth.json (written by VS Code
+       extension or neo-mcp login) — full OAuth with refresh support
+    2. NEO_SECRET_KEY env var — API key usable when no OAuth session exists,
+       e.g. when running on the hosted MCP server without a browser login
+    """
     auth = _load_mcp_auth()
     token = auth.get("access_token", "")
     # Treat obviously invalid tokens as missing
     if not token or token in ("\\", "null", "undefined") or len(token) < 10:
-        return ""
+        # Fall back to the API key — Neo accepts it as a Bearer token for polling too
+        token = os.environ.get("NEO_SECRET_KEY", "")
     return token
 
 
@@ -153,14 +171,25 @@ def write_sandbox_log(deployment_id: str) -> None:
         f.write(f'{{"sandboxId": "{deployment_id}", "source": "python-daemon"}}\n')
 
 
-def is_running() -> bool:
-    """Return True if a Python daemon process is currently alive (via PID file)."""
-    try:
-        pid = int(Path(_PID_FILE).read_text().strip())
-        os.kill(pid, 0)  # signal 0 = existence check only
-        return True
-    except (OSError, ValueError):
-        return False
+def is_running(deployment_id: str = "") -> bool:
+    """Return True if a Python daemon for this deployment is currently alive.
+
+    Checks the per-deployment PID file first (deployment_id given), then falls
+    back to the legacy global PID file for backwards compatibility.
+    """
+    pid_files = []
+    if deployment_id:
+        pid_files.append(_pid_file_for(deployment_id))
+    pid_files.append(_PID_FILE)
+
+    for pid_path in pid_files:
+        try:
+            pid = int(Path(pid_path).read_text().strip())
+            os.kill(pid, 0)  # signal 0 = existence check only
+            return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -463,13 +492,15 @@ async def run_daemon(workspace: Optional[str] = None, deployment_id: Optional[st
     ws = os.path.realpath(workspace or os.getcwd())
     dep_id = deployment_id or get_or_create_deployment_id()
 
-    # Load OAuth token from mcp_auth.json (written by VS Code extension or neo-mcp login)
+    # Load best available auth token:
+    #   1. OAuth from mcp_auth.json (VS Code extension or neo-mcp login)
+    #   2. NEO_SECRET_KEY API key as fallback (works when auto-started by the MCP server)
     token = _get_oauth_token()
     if not token:
         print(
-            "ERROR: No OAuth token found.\n"
-            "Run 'neo-mcp login' to authenticate, or log in via the Neo VS Code/Cursor extension.\n"
-            f"Token file: {_MCP_AUTH_FILE}",
+            "ERROR: No auth token found.\n"
+            "Either run 'neo-mcp login' to authenticate, log in via the Neo VS Code/Cursor\n"
+            f"extension (writes {_MCP_AUTH_FILE}), or set NEO_SECRET_KEY.",
             file=sys.stderr,
             flush=True,
         )
@@ -478,9 +509,11 @@ async def run_daemon(workspace: Optional[str] = None, deployment_id: Optional[st
     # Persist sandbox ID so server.py _discover_sandbox_id() finds this deployment
     write_sandbox_log(dep_id)
 
-    # Write PID file so server.py can check if we're running
+    # Write PID files: per-deployment (primary) + legacy global (backwards compat)
     os.makedirs(_DAEMON_DIR, exist_ok=True)
-    Path(_PID_FILE).write_text(str(os.getpid()))
+    pid_str = str(os.getpid())
+    Path(_pid_file_for(dep_id)).write_text(pid_str)
+    Path(_PID_FILE).write_text(pid_str)
 
     # Load thread→workspace mappings persisted from previous runs
     thread_workspaces: dict[str, str] = _load_thread_workspaces()
@@ -494,10 +527,11 @@ async def run_daemon(workspace: Optional[str] = None, deployment_id: Optional[st
 
     def _shutdown(signum: int, frame) -> None:  # noqa: ANN001
         print("\nDaemon shutting down.", flush=True)
-        try:
-            os.unlink(_PID_FILE)
-        except OSError:
-            pass
+        for pid_path in (_pid_file_for(dep_id), _PID_FILE):
+            try:
+                os.unlink(pid_path)
+            except OSError:
+                pass
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)

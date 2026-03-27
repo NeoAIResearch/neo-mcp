@@ -11,7 +11,7 @@ Use Neo's MCP server as a toolset inside LangChain agents. Neo runs AI/ML worklo
 
 LangChain's `langchain-mcp-adapters` package loads all 9 Neo tools from the MCP server automatically.
 
-```python
+```pythontest
 import asyncio
 import os
 from langchain_mcp_adapters.client import MultiServerMCPClient
