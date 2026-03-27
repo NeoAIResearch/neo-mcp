@@ -299,8 +299,7 @@ def _configure_claude(secret_key: str, opts: dict) -> tuple:
                     "--scope", scope, "neo", REMOTE_URL,
                     "--header", f"Authorization: Bearer {secret_key}",
                 ]
-                if deployment_id:
-                    cmd += ["--header", f"X-Neo-Deployment-Id: {deployment_id}"]
+                pass  # deployment_id auto-derived from API key by server
             else:
                 cmd = [
                     "claude", "mcp", "add", "--scope", scope,
@@ -316,13 +315,10 @@ def _configure_claude(secret_key: str, opts: dict) -> tuple:
 
     # Fallback: write JSON directly to ~/.claude/claude_desktop_config.json
     if use_remote:
-        headers: dict = {"Authorization": f"Bearer {secret_key}"}
-        if deployment_id:
-            headers["X-Neo-Deployment-Id"] = deployment_id
         server_cfg: dict = {
             "transport": "http",
             "url": REMOTE_URL,
-            "headers": headers,
+            "headers": {"Authorization": f"Bearer {secret_key}"},
         }
     else:
         server_cfg = {
@@ -357,10 +353,7 @@ def _configure_cursor(secret_key: str, opts: dict) -> tuple:
     no_backup = opts.get("no_backup", False)
 
     if use_remote:
-        headers: dict = {"Authorization": f"Bearer {secret_key}"}
-        if deployment_id:
-            headers["X-Neo-Deployment-Id"] = deployment_id
-        server_cfg: dict = {"url": REMOTE_URL, "headers": headers}
+        server_cfg: dict = {"url": REMOTE_URL, "headers": {"Authorization": f"Bearer {secret_key}"}}
     else:
         server_cfg = {
             "command": "neo-mcp",
@@ -385,10 +378,7 @@ def _configure_windsurf(secret_key: str, opts: dict) -> tuple:
     no_backup = opts.get("no_backup", False)
 
     if use_remote:
-        headers: dict = {"Authorization": f"Bearer {secret_key}"}
-        if deployment_id:
-            headers["X-Neo-Deployment-Id"] = deployment_id
-        server_cfg: dict = {"serverUrl": REMOTE_URL, "headers": headers}
+        server_cfg: dict = {"serverUrl": REMOTE_URL, "headers": {"Authorization": f"Bearer {secret_key}"}}
     else:
         server_cfg = {
             "command": "neo-mcp",
@@ -604,31 +594,15 @@ def run_setup(args: list) -> None:
         print("Authentication: not required — extension daemon handles task execution.")
     else:
         _setup_deployment_id = _derive_deployment_id(secret_key)  # no-extension path
-
-        # ── Authentication (OAuth for Python daemon) ──────────────────────────
-        # The MCP server tracks task status via thread_id using the API key — no
-        # OAuth needed there. But the Python daemon polls /v2/poll/{deployment_id}
-        # which requires an OAuth token. Ensure the user is logged in.
-        print()
+        print("\nNo VS Code/Cursor extension detected.")
+        print("The Python daemon will authenticate using your API key (NEO_SECRET_KEY).")
         existing_token = _valid_oauth_token()
         if existing_token:
             try:
                 username = json.loads(Path(_MCP_AUTH_FILE).read_text()).get("username", "")
             except Exception:
                 username = ""
-            print(f"Authentication: already logged in{' as ' + username if username else ''}.")
-        else:
-            print("Authentication: the daemon needs an OAuth token to receive tasks.")
-            print("Opening browser login…")
-            ok = _do_login()
-            if not ok:
-                print(
-                    "\nLogin failed or was cancelled.\n"
-                    "The daemon requires a browser login to execute tasks on your machine.\n"
-                    "Re-run `neo-mcp login` to authenticate, then re-run setup.",
-                    file=sys.stderr,
-                )
-                print("Continuing setup without login (daemon will fail until you run neo-mcp login).")
+            print(f"OAuth token found{' for ' + username if username else ''} — will be used by daemon.")
 
     # ── Remote mode: start daemon if needed, capture deployment ID ──────────
     if use_remote:
@@ -646,10 +620,8 @@ def run_setup(args: list) -> None:
                 print("Daemon: started and polling Neo backend.")
             else:
                 print(
-                    "Daemon: failed to start (check that neo-mcp is installed and "
-                    "`neo-mcp login` has been run).\n"
-                    "The MCP server will still be configured — start the daemon manually "
-                    "with `neo-mcp daemon` before using Neo tools.",
+                    "Daemon: failed to start (check that neo-mcp is installed).\n"
+                    "Start manually: NEO_SECRET_KEY=... neo-mcp daemon",
                     file=sys.stderr,
                 )
 

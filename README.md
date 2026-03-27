@@ -2,40 +2,53 @@
 
 Run AI/ML tasks on Neo's remote backend from any AI editor — Claude Code, Cursor, Windsurf, Zed, VS Code, Continue.dev, OpenAI Codex CLI, Claude.ai, and ChatGPT.
 
-> **Task execution requires the Neo VS Code or Cursor extension to be running.** The extension is your local sandbox — it receives commands from Neo's backend and executes them (writes files, runs scripts) on your machine.
+> **Task execution runs on your local machine** via the Neo VS Code/Cursor extension (recommended) or the Python daemon (`neo-mcp daemon`). The daemon receives commands from Neo's backend and executes them locally — writing files, running scripts.
 
 ---
 
 ## Quick start — choose one
 
-### Option A: pip + auto-configure (recommended)
+### Option A: VS Code or Cursor extension (simplest — no commands needed)
 
-```bash
-pip install neo-mcp
-neo-mcp setup
-```
+Install the [Neo extension](https://marketplace.visualstudio.com/items?itemName=NeoResearch.neo) from the marketplace, log in, and you're done. The extension handles the daemon automatically.
 
-The wizard asks for your Neo secret key, detects your installed editors, and writes all config files automatically. Restart your editor after setup.
-
----
-
-### Option B: One command — no install needed (Claude Code)
-
-Connect directly to the hosted server — no `pip install` required:
-
+Then add the hosted MCP server (one command):
 ```bash
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
   --header "Authorization: Bearer sk-v1-YOUR_KEY"
 ```
 
-Verify: `claude mcp list`
+---
 
-> **After adding:** MCP tools load at session start. Open a **new Claude Code session** (new conversation) for the Neo tools to appear.
+### Option B: pip install (local, no extension needed)
+
+```bash
+pip install neo-mcp
+claude mcp add --scope user neo \
+  -e NEO_SECRET_KEY=sk-v1-YOUR_KEY \
+  -- neo-mcp
+```
+
+The daemon starts automatically on your first task. Open a **new Claude Code session** after running these commands.
 
 ---
 
-### Option C: Claude Code `/neo` skill
+### Option C: Hosted server + Python daemon (HTTP transport, no extension)
+
+```bash
+pip install neo-mcp
+NEO_SECRET_KEY=sk-v1-YOUR_KEY neo-mcp daemon &   # keep running while you work
+claude mcp add --scope user neo \
+  --transport http https://mcpserver.heyneo.com/mcp \
+  --header "Authorization: Bearer sk-v1-YOUR_KEY"
+```
+
+The hosted server and your daemon both derive the same UUID from your API key — no extra setup headers needed. Open a **new Claude Code session** after the `claude mcp add` command.
+
+---
+
+### Option D: Claude Code `/neo` skill
 
 Install the skill so Claude Code knows to route AI/ML requests to Neo automatically:
 
@@ -44,7 +57,7 @@ curl -o ~/.claude/skills/neo.md \
   https://raw.githubusercontent.com/NeoResearchAI/MCPServer/main/skills/claude-code/SKILL.md
 ```
 
-Then register the MCP server using Option A or B above, and use `/neo <task>` in any Claude Code conversation.
+Then register the MCP server using any option above, and use `/neo <task>` in any Claude Code conversation.
 
 > **Other agent frameworks:** see [`skills/`](skills/README.md) for Vercel AI SDK, OpenAI Agents SDK, and LangChain integration guides.
 
@@ -289,9 +302,9 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for the full guide including Docker, scop
 |---|---|
 | `Invalid API key` (401) | Re-check `NEO_SECRET_KEY` at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys |
 | `Trial or quota ended` (403) | Top up at the Neo dashboard |
-| `No healthy deployments available` (400) | The VS Code/Cursor extension is not running — start it and try again |
-| `Task submitted but no files written locally` | The VS Code/Cursor extension must be running for local file writes |
-| Task submission hangs or times out | Extension sandbox has expired — restart the VS Code/Cursor extension |
+| `No healthy deployments available` (400) | No daemon running. Start one: `NEO_SECRET_KEY=sk-v1-... neo-mcp daemon &`, or install the Neo VS Code/Cursor extension |
+| `Task submitted but no files written locally` | Daemon must be running for local file writes — see above |
+| Task submission hangs or times out | Daemon has stopped — restart with `NEO_SECRET_KEY=sk-v1-... neo-mcp daemon &` |
 | `neo-mcp` not found | Re-run `pip install neo-mcp` and verify `which neo-mcp` |
 | Neo tools don't appear after `claude mcp add` | Open a **new Claude Code session** — tools load at session start |
 | Output truncated | Cap is ~20 000 tokens — use `neo_task_plan` for a concise step summary |

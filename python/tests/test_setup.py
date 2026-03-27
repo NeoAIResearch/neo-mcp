@@ -234,9 +234,10 @@ class TestRunSetupNoExtension(unittest.TestCase):
 
         return mock_login, mock_start_daemon
 
-    def test_no_extension_no_token_login_called(self):
+    def test_no_extension_login_not_called_api_key_auth(self):
+        """Login is no longer required — daemon authenticates with API key."""
         mock_login, _ = self._run(has_token=False, remote=False)
-        mock_login.assert_called_once()
+        mock_login.assert_not_called()
 
     def test_no_extension_existing_token_login_skipped(self):
         mock_login, _ = self._run(has_token=True, remote=False)
@@ -251,10 +252,10 @@ class TestRunSetupNoExtension(unittest.TestCase):
         _, mock_daemon = self._run(has_token=True, remote=False)
         mock_daemon.assert_not_called()
 
-    def test_no_extension_login_failure_continues_setup(self):
-        """Login failure should not abort setup — user can run neo-mcp login later."""
+    def test_no_extension_setup_completes_without_login(self):
+        """Setup completes without OAuth login — API key is sufficient."""
         mock_login, _ = self._run(has_token=False, remote=False, login_succeeds=False)
-        mock_login.assert_called_once()
+        mock_login.assert_not_called()
 
     def test_no_extension_key_derived_id_used_remote(self):
         """Without extension, deployment_id is derived from API key."""
