@@ -47,84 +47,74 @@ def _write_auth(daemon_dir: str, token: str = "oauth-token-xyz", username: str =
 
 
 # ---------------------------------------------------------------------------
-# 1. _vscode_extension_deployment_id
+# 1. _vscode_extension_running — socket + daemon.token check
 # ---------------------------------------------------------------------------
 
-class TestVscodeExtensionDeploymentId(unittest.TestCase):
+class TestVscodeExtensionRunning(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp()
         self._daemon_dir = _make_daemon_dir(self._tmpdir)
-        # Patch _DAEMON_DIR so all path operations hit our temp directory
         self._patcher = patch.object(setup_mod, "_DAEMON_DIR", self._daemon_dir)
         self._patcher.start()
 
     def tearDown(self):
         self._patcher.stop()
 
-    def test_returns_id_from_daemon_log(self):
-        uid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-        _write_log(self._daemon_dir, [f'{{"sandboxId": "{uid}"}}'])
-        self.assertEqual(setup_mod._vscode_extension_deployment_id(), uid)
+    def _write_token(self) -> None:
+        (Path(self._daemon_dir) / "daemon.token").write_text("test-token")
 
-    def test_returns_last_entry_when_multiple(self):
-        uid1 = "11111111-1111-1111-1111-111111111111"
-        uid2 = "22222222-2222-2222-2222-222222222222"
-        _write_log(self._daemon_dir, [
-            f'{{"sandboxId": "{uid1}"}}',
-            f'{{"sandboxId": "{uid2}"}}',
-        ])
-        self.assertEqual(setup_mod._vscode_extension_deployment_id(), uid2)
+    def test_returns_false_when_no_token_file(self):
+        """Fast path: no daemon.token → extension not running, no socket attempt."""
+        import socket as _socket
+        with patch.object(_socket, "socket") as mock_sock:
+            result = setup_mod._vscode_extension_running()
+        self.assertFalse(result)
+        mock_sock.assert_not_called()  # Socket never created
 
-    def test_falls_back_to_daemon_log_1(self):
-        uid = "33333333-3333-3333-3333-333333333333"
-        _write_log(self._daemon_dir, [f'{{"sandboxId": "{uid}"}}'], "daemon.log.1")
-        self.assertEqual(setup_mod._vscode_extension_deployment_id(), uid)
+    def test_returns_false_when_token_exists_but_port_closed(self):
+        """Token file exists but nothing on port 31337 → not running."""
+        self._write_token()
+        import socket as _socket
 
-    def test_prefers_daemon_log_over_log_1(self):
-        uid1 = "44444444-4444-4444-4444-444444444444"
-        uid2 = "55555555-5555-5555-5555-555555555555"
-        _write_log(self._daemon_dir, [f'{{"sandboxId": "{uid1}"}}'], "daemon.log")
-        _write_log(self._daemon_dir, [f'{{"sandboxId": "{uid2}"}}'], "daemon.log.1")
-        self.assertEqual(setup_mod._vscode_extension_deployment_id(), uid1)
+        mock_s = MagicMock()
+        mock_s.connect.side_effect = OSError("Connection refused")
+        with patch.object(_socket, "socket", return_value=mock_s):
+            result = setup_mod._vscode_extension_running()
+        self.assertFalse(result)
 
-    def test_returns_empty_when_no_log_files(self):
-        self.assertEqual(setup_mod._vscode_extension_deployment_id(), "")
+    def test_returns_true_when_token_exists_and_port_open(self):
+        """Token file exists and port 31337 accepts connection → running."""
+        self._write_token()
+        import socket as _socket
 
-    def test_returns_empty_for_short_uuid(self):
-        _write_log(self._daemon_dir, ['{"sandboxId": "tooshort"}'])
-        self.assertEqual(setup_mod._vscode_extension_deployment_id(), "")
+        mock_s = MagicMock()
+        mock_s.connect.return_value = None  # Success
+        with patch.object(_socket, "socket", return_value=mock_s):
+            result = setup_mod._vscode_extension_running()
+        self.assertTrue(result)
+        mock_s.connect.assert_called_once_with(("127.0.0.1", 31337))
 
-    def test_handles_mixed_log_lines(self):
-        uid = "66666666-6666-6666-6666-666666666666"
-        _write_log(self._daemon_dir, [
-            "[2026-01-01] Daemon started",
-            '{"other": "data"}',
-            f'{{"sandboxId": "{uid}"}}',
-            "[2026-01-01] Still running",
-        ])
-        self.assertEqual(setup_mod._vscode_extension_deployment_id(), uid)
+    def test_timeout_set_to_one_second(self):
+        """Socket timeout must be 1s to avoid blocking setup."""
+        self._write_token()
+        import socket as _socket
 
-    def test_empty_log_file_returns_empty(self):
-        _write_log(self._daemon_dir, [])
-        self.assertEqual(setup_mod._vscode_extension_deployment_id(), "")
+        mock_s = MagicMock()
+        mock_s.connect.return_value = None
+        with patch.object(_socket, "socket", return_value=mock_s):
+            setup_mod._vscode_extension_running()
+        mock_s.settimeout.assert_called_once_with(1.0)
 
-    def test_recovers_from_log_with_no_sandbox_id(self):
-        """daemon.log has no sandboxId, fall back to daemon.log.1."""
-        uid = "77777777-7777-7777-7777-777777777777"
-        _write_log(self._daemon_dir, ["[2026-01-01] Just startup messages"], "daemon.log")
-        _write_log(self._daemon_dir, [f'{{"sandboxId": "{uid}"}}'], "daemon.log.1")
-        self.assertEqual(setup_mod._vscode_extension_deployment_id(), uid)
+    def test_socket_closed_after_connect(self):
+        """Socket must be closed after successful connection check."""
+        self._write_token()
+        import socket as _socket
 
-    def test_ignores_invalid_uuid_in_log(self):
-        _write_log(self._daemon_dir, ['{"sandboxId": "not-a-real-uuid"}'])
-        self.assertEqual(setup_mod._vscode_extension_deployment_id(), "")
-
-    def test_valid_uuid_36_chars(self):
-        """Exact 36-char UUID must be accepted."""
-        uid = "abcdef12-3456-7890-abcd-ef1234567890"
-        _write_log(self._daemon_dir, [f'{{"sandboxId": "{uid}"}}'])
-        result = setup_mod._vscode_extension_deployment_id()
-        self.assertEqual(result, uid)
+        mock_s = MagicMock()
+        mock_s.connect.return_value = None
+        with patch.object(_socket, "socket", return_value=mock_s):
+            setup_mod._vscode_extension_running()
+        mock_s.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +130,7 @@ def _base_patches(vscode_id: str, has_token: bool, tmpdir: str, remote: bool = F
         patch.object(setup_mod, "_DAEMON_DIR", daemon_dir),
         patch.object(setup_mod, "_MCP_AUTH_FILE", auth_file),
         patch.object(setup_mod, "_STANDALONE_UUID_FILE", standalone_file),
-        patch("neo_mcp.setup._vscode_extension_deployment_id", return_value=vscode_id),
+        patch("neo_mcp.setup._vscode_extension_running", return_value=bool(vscode_id)),
         patch("neo_mcp.setup._validate_api_key", return_value=True),
         patch("neo_mcp.setup._valid_oauth_token", return_value="tok" if has_token else ""),
         patch("neo_mcp.setup._daemon_running", return_value=False),
@@ -191,8 +181,9 @@ class TestRunSetupExtensionDetected(unittest.TestCase):
         _, mock_daemon, _ = self._run(remote=True)
         mock_daemon.assert_not_called()
 
-    def test_extension_id_passed_to_editor_config(self):
-        ext_id = "eeeeeeee-ffff-0000-1111-222222222222"
+    def test_extension_detected_deployment_id_is_key_derived(self):
+        """When extension is running, setup uses the key-derived deployment_id
+        (extension's actual UUID is not accessible from files at setup time)."""
         captured_opts = {}
 
         def fake_configurator(sk, opts):
@@ -200,7 +191,7 @@ class TestRunSetupExtensionDetected(unittest.TestCase):
             return (True, "ok")
 
         args = ["--secret-key", "sk-v1-testkey", "--editor", "claude", "--remote"]
-        patches = _base_patches(vscode_id=ext_id, has_token=False, tmpdir=self._tmpdir, remote=True)
+        patches = _base_patches(vscode_id="anything", has_token=False, tmpdir=self._tmpdir, remote=True)
 
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
              patches[5], patches[6], patches[7], \
@@ -210,7 +201,12 @@ class TestRunSetupExtensionDetected(unittest.TestCase):
              patch("sys.stdin.isatty", return_value=True):
             setup_mod.run_setup(args)
 
-        self.assertEqual(captured_opts.get("deployment_id"), ext_id)
+        dep_id = captured_opts.get("deployment_id", "")
+        # Must be a stable key-derived UUID (not empty, not the old log-based ID)
+        self.assertTrue(dep_id, "deployment_id must be set in remote mode")
+        # Must be a valid UUID format
+        import re
+        self.assertRegex(dep_id, r"^[a-f0-9\-]{36}$")
 
 
 class TestRunSetupNoExtension(unittest.TestCase):
@@ -287,53 +283,54 @@ class TestRunSetupNoExtension(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 3. _vscode_extension_deployment_id vs _discover_sandbox_id parity
+# 3. Detection correctness: _vscode_extension_running vs daemon.log approach
 # ---------------------------------------------------------------------------
 
-class TestExtensionVsDiscoverParity(unittest.TestCase):
-    """_vscode_extension_deployment_id and server._vscode_daemon_deployment_id
-    must agree on the same daemon.log format."""
+class TestExtensionDetectionCorrectness(unittest.TestCase):
+    """Verify that _vscode_extension_running() correctly detects the live extension
+    and is NOT fooled by stale daemon.log entries from the Python daemon."""
 
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp()
         self._daemon_dir = _make_daemon_dir(self._tmpdir)
-        self._setup_patcher = patch.object(setup_mod, "_DAEMON_DIR", self._daemon_dir)
-        self._setup_patcher.start()
-
-        import neo_mcp.server as srv
-        self._srv = srv
-        self._srv_patcher = patch("neo_mcp.server.os.path.expanduser",
-                                  side_effect=lambda p: p.replace("~", self._tmpdir))
-        self._srv_patcher.start()
+        self._patcher = patch.object(setup_mod, "_DAEMON_DIR", self._daemon_dir)
+        self._patcher.start()
 
     def tearDown(self):
-        self._setup_patcher.stop()
-        self._srv_patcher.stop()
+        self._patcher.stop()
 
-    def test_both_agree_on_valid_entry(self):
-        uid = "abcdef12-3456-7890-abcd-ef1234567890"
-        _write_log(self._daemon_dir, [f'{{"sandboxId": "{uid}"}}'])
-        self.assertEqual(
-            setup_mod._vscode_extension_deployment_id(),
-            self._srv._vscode_daemon_deployment_id(),
-        )
+    def _write_token(self):
+        (Path(self._daemon_dir) / "daemon.token").write_text("test-token")
 
-    def test_both_return_empty_for_no_log(self):
-        self.assertEqual(setup_mod._vscode_extension_deployment_id(), "")
-        self.assertEqual(self._srv._vscode_daemon_deployment_id(), "")
+    def test_stale_python_daemon_log_does_not_trigger_extension_detection(self):
+        """Python daemon writes sandboxId to daemon.log. Even with that entry present,
+        _vscode_extension_running() must return False when port 31337 is closed."""
+        uid = "deadbeef-0000-0000-0000-000000000000"
+        _write_log(self._daemon_dir,
+                   [f'{{"sandboxId": "{uid}", "source": "python-daemon"}}'])
+        # daemon.token absent → no extension
+        result = setup_mod._vscode_extension_running()
+        self.assertFalse(result)
 
-    def test_both_return_last_when_multiple_entries(self):
-        uid1 = "11111111-1111-1111-1111-111111111111"
-        uid2 = "22222222-2222-2222-2222-222222222222"
-        _write_log(self._daemon_dir, [
-            f'{{"sandboxId": "{uid1}"}}',
-            f'{{"sandboxId": "{uid2}"}}',
-        ])
-        r_setup = setup_mod._vscode_extension_deployment_id()
-        r_srv = self._srv._vscode_daemon_deployment_id()
-        self.assertEqual(r_setup, uid2)
-        self.assertEqual(r_srv, uid2)
-        self.assertEqual(r_setup, r_srv)
+    def test_extension_detected_by_live_port_not_log(self):
+        """Extension running = daemon.token + port 31337 open, regardless of daemon.log."""
+        self._write_token()
+        import socket as _socket
+        mock_s = MagicMock()
+        mock_s.connect.return_value = None
+        with patch.object(_socket, "socket", return_value=mock_s):
+            result = setup_mod._vscode_extension_running()
+        self.assertTrue(result)
+
+    def test_dead_extension_token_file_remains_returns_false(self):
+        """Token file can persist after extension exits. Must still return False."""
+        self._write_token()
+        import socket as _socket
+        mock_s = MagicMock()
+        mock_s.connect.side_effect = OSError("Connection refused")
+        with patch.object(_socket, "socket", return_value=mock_s):
+            result = setup_mod._vscode_extension_running()
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":

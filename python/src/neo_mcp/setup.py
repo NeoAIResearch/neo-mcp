@@ -102,20 +102,26 @@ def _daemon_pid_file(deployment_id: str) -> str:
     return os.path.join(_DAEMON_DIR, f"daemon_{deployment_id[:8]}.pid")
 
 
-def _vscode_extension_deployment_id() -> str:
-    """Return deployment_id from VS Code/Cursor extension's daemon.log if present."""
-    import re
-    for log_name in ("daemon.log", "daemon.log.1"):
-        log_path = Path(_DAEMON_DIR) / log_name
-        try:
-            lines = log_path.read_text(errors="ignore").splitlines()
-            for line in reversed(lines):
-                m = re.search(r'"sandboxId"\s*:\s*"([a-f0-9\-]{36})"', line)
-                if m:
-                    return m.group(1)
-        except OSError:
-            pass
-    return ""
+def _vscode_extension_running() -> bool:
+    """Return True if VS Code/Cursor extension daemon is listening on localhost:31337.
+
+    The extension daemon creates ~/.neo/daemon/daemon.token and listens on port 31337.
+    We check the token file first (fast path) then attempt a socket connection.
+    NOTE: daemon.log is NOT used — in production the extension disables file logging,
+    so sandboxId entries in daemon.log come only from the Python daemon.
+    """
+    import socket as _socket
+    token_path = Path(_DAEMON_DIR) / "daemon.token"
+    if not token_path.exists():
+        return False  # Fast path: no token file → extension not running
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(("127.0.0.1", 31337))
+        s.close()
+        return True
+    except OSError:
+        return False
 
 
 def _daemon_running(deployment_id: str) -> bool:
@@ -590,14 +596,14 @@ def run_setup(args: list) -> None:
         sys.exit(1)
 
     # ── Detect VS Code/Cursor extension or derive deployment ID from key ─────
-    vscode_id = _vscode_extension_deployment_id()
+    vscode_running = _vscode_extension_running()
 
-    if vscode_id:
-        _setup_deployment_id = vscode_id
-        print(f"\nVS Code/Cursor extension detected (ID: {vscode_id[:8]}…).")
+    if vscode_running:
+        _setup_deployment_id = _derive_deployment_id(secret_key)
+        print("\nVS Code/Cursor extension detected (localhost:31337 is live).")
         print("Authentication: not required — extension daemon handles task execution.")
     else:
-        _setup_deployment_id = _derive_deployment_id(secret_key)
+        _setup_deployment_id = _derive_deployment_id(secret_key)  # no-extension path
 
         # ── Authentication (OAuth for Python daemon) ──────────────────────────
         # The MCP server tracks task status via thread_id using the API key — no
@@ -629,7 +635,7 @@ def run_setup(args: list) -> None:
         deployment_id = _setup_deployment_id
         print(f"\nDeployment ID: {deployment_id}")
 
-        if vscode_id:
+        if vscode_running:
             print("Daemon: VS Code/Cursor extension is handling execution — no daemon needed.")
         elif _daemon_running(deployment_id):
             print("Daemon: already running.")
@@ -647,7 +653,7 @@ def run_setup(args: list) -> None:
                     file=sys.stderr,
                 )
 
-        if not vscode_id:
+        if not vscode_running:
             # Persist deployment ID so daemon.py can reuse it on restart
             try:
                 os.makedirs(_DAEMON_DIR, exist_ok=True)

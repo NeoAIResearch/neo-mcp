@@ -776,14 +776,15 @@ class TestNeoSubmitTask(unittest.TestCase):
 
     # -- VS Code extension / daemon auto-start routing tests ----------------
 
-    def test_vscode_extension_present_skips_daemon_autostart(self):
-        """When VS Code extension daemon.log is found, Python daemon must NOT start."""
+    def test_vscode_extension_running_skips_daemon_autostart(self):
+        """When _register_with_daemon succeeds (VS Code extension on 31337), Python daemon must NOT start."""
         resp_ok = make_response(200, {"thread_id": "tid-ext-skip"})
         ext_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         mock_daemon = AsyncMock()
 
         with patch("neo_mcp.server._get_deployment_id", return_value=ext_id), \
-             patch("neo_mcp.server._vscode_daemon_deployment_id", return_value=ext_id), \
+             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=True), \
              patch("neo_mcp.server._auto_start_daemon", mock_daemon), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
@@ -794,15 +795,15 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_daemon.assert_not_called()
         self.assertIn("tid-ext-skip", text_of(result))
 
-    def test_vscode_extension_absent_autostart_daemon(self):
-        """When no VS Code extension, Python daemon must be auto-started."""
+    def test_no_extension_no_python_daemon_autostart_triggered(self):
+        """When no VS Code extension and no Python daemon, auto-start must be called."""
         resp_ok = make_response(200, {"thread_id": "tid-no-ext"})
         mock_daemon = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value=""), \
-             patch("neo_mcp.server._vscode_daemon_deployment_id", return_value=""), \
              patch("neo_mcp.server._get_or_create_persistent_deployment_id", return_value="key-uuid"), \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
              patch("neo_mcp.server._auto_start_daemon", mock_daemon), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
@@ -814,15 +815,16 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_daemon.assert_called_once()
         self.assertIn("tid-no-ext", text_of(result))
 
-    def test_vscode_extension_absent_daemon_already_running_no_restart(self):
-        """If our Python daemon is already running, don't start a second one."""
+    def test_python_daemon_already_running_no_restart(self):
+        """If our Python daemon is already running, skip _register_with_daemon and auto-start."""
         resp_ok = make_response(200, {"thread_id": "tid-already-running"})
         mock_daemon = AsyncMock()
+        mock_register = AsyncMock(return_value=False)
 
         with patch("neo_mcp.server._get_deployment_id", return_value=""), \
-             patch("neo_mcp.server._vscode_daemon_deployment_id", return_value=""), \
              patch("neo_mcp.server._get_or_create_persistent_deployment_id", return_value="key-uuid"), \
              patch("neo_mcp.server._python_daemon_running", return_value=True), \
+             patch("neo_mcp.server._register_with_daemon", mock_register), \
              patch("neo_mcp.server._auto_start_daemon", mock_daemon), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
@@ -831,8 +833,31 @@ class TestNeoSubmitTask(unittest.TestCase):
             call_tool("neo_submit_task", {"description": "train model"})
 
         mock_daemon.assert_not_called()
+        mock_register.assert_not_called()  # Short-circuits before trying extension
 
-    def test_vscode_extension_id_sent_in_submit_body(self):
+    def test_stale_daemon_log_does_not_block_autostart(self):
+        """Stale sandboxId in daemon.log must NOT prevent daemon auto-start.
+        This was the core bug: _vscode_daemon_deployment_id() returned a stale Python
+        daemon entry, blocking auto-start even when the daemon was dead."""
+        resp_ok = make_response(200, {"thread_id": "tid-stale"})
+        stale_id = "deadbeef-0000-0000-0000-000000000000"
+        mock_daemon = AsyncMock(return_value=True)
+
+        with patch("neo_mcp.server._get_deployment_id", return_value=stale_id), \
+             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
+             patch("neo_mcp.server._auto_start_daemon", mock_daemon), \
+             patch("asyncio.sleep", new_callable=AsyncMock), \
+             patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
+             patch("asyncio.create_task"):
+            ctx, _ = make_async_client({"DEFAULT": resp_ok})
+            MockClient.return_value = ctx
+            call_tool("neo_submit_task", {"description": "train model"})
+
+        # Daemon MUST be started even though daemon.log had a stale entry
+        mock_daemon.assert_called_once()
+
+    def test_extension_id_sent_in_submit_body(self):
         """Extension deployment_id must be forwarded to init-chat-direct."""
         captured = {}
         resp_ok = make_response(200, {"thread_id": "tid-body"})
@@ -849,7 +874,8 @@ class TestNeoSubmitTask(unittest.TestCase):
         ctx.__aexit__ = AsyncMock(return_value=False)
 
         with patch("neo_mcp.server._get_deployment_id", return_value=ext_id), \
-             patch("neo_mcp.server._vscode_daemon_deployment_id", return_value=ext_id), \
+             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
              patch("asyncio.create_task"):
             call_tool("neo_submit_task", {"description": "task"})
@@ -874,7 +900,6 @@ class TestNeoSubmitTask(unittest.TestCase):
         ctx.__aexit__ = AsyncMock(return_value=False)
 
         with patch("neo_mcp.server._get_deployment_id", return_value=""), \
-             patch("neo_mcp.server._vscode_daemon_deployment_id", return_value=""), \
              patch("neo_mcp.server._get_or_create_persistent_deployment_id", return_value=key_uuid), \
              patch("neo_mcp.server._python_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
