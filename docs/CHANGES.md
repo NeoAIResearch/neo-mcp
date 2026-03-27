@@ -1,236 +1,151 @@
-# Neo MCP — Authentication & Setup: What Was Built and What Still Needs Backend Changes
+# Neo MCP — Required Backend Changes
 
-## Current State (as of v0.2.4)
-
-The MCP client side is fully implemented. Here's what works today, what requires backend changes,
-and the exact steps to use the package.
+Two backend changes would eliminate all setup friction for users. Everything on the MCP client side is already built and working. These are the only remaining blockers.
 
 ---
 
-## Quickstart: pip install + API key only
+## Change 1 — Cloud execution fallback (highest impact)
+
+### The problem
+
+Every task submission requires a `deployment_id` pointing to an active daemon process. If no daemon is running, the backend returns:
+
+```
+HTTP 400: No healthy deployments available
+```
+
+This forces every user to run a local process before they can use Neo at all — either the VS Code extension or `neo-mcp daemon`. New users hit this wall immediately.
+
+### What needs to change
+
+Add a cloud execution fallback in the `init-chat-direct` routing layer:
+
+```python
+# Today
+if not get_healthy_deployment(deployment_id):
+    return HTTP_400("No healthy deployments available")
+
+# After change
+if not get_healthy_deployment(deployment_id):
+    cloud_container = allocate_cloud_sandbox()
+    route_to_cloud(thread_id, cloud_container)
+    return HTTP_200({"thread_id": thread_id})
+```
+
+When no active daemon is registered for the given `deployment_id` (or no `deployment_id` is provided at all), the backend spins up a cloud container and runs the task there instead of rejecting it.
+
+### What stays the same
+
+The MCP server doesn't change. `neo_submit_task` → `neo_task_status` → `neo_get_messages` / `neo_get_files` — same API, same tools, same flow. The backend handles execution transparently.
+
+Users with the VS Code extension or `neo-mcp daemon` running continue to get local execution (files write to their machine). Users without either get cloud execution automatically — no change needed on their end.
+
+### File output difference
+
+| Execution path | Where files land |
+|---|---|
+| Local daemon (extension or `neo-mcp daemon`) | User's filesystem (`~/project/model.py`) |
+| Cloud fallback | Neo cloud storage → retrievable via `neo_get_files` |
+
+For most ML tasks (train a model, analyze data, generate code), files via `neo_get_files` is fine. Local execution is only required when the task must read/write the user's actual filesystem in real time.
+
+### User experience after this change
 
 ```bash
-# 1. Install
-pip install neo-mcp
-
-# 2. Set your key
-export NEO_SECRET_KEY=sk-v1-your-key
-
-# 3. Register with Claude Code (stdio mode — runs on your machine)
-claude mcp add --scope user neo \
-  -e NEO_SECRET_KEY=your-key \
-  -- neo-mcp
-
-# 4. Submit tasks — no login, no extra setup
-# Claude Code → neo_submit_task → MCP server auto-starts daemon → task executes locally
-```
-
-**That's it.** No `neo-mcp login`, no `neo-mcp daemon` pre-start, no browser OAuth.
-
-### How it works under the hood
-
-```
-Claude Code
-    │
-    │  neo_submit_task("train a classifier")
-    ▼
-MCP server (neo-mcp process on your machine)
-    │
-    ├─ 1. Derives stable deployment UUID from SHA-256(NEO_SECRET_KEY)
-    │      → same UUID every time for the same API key, no files needed
-    │
-    ├─ 2. Checks if VS Code/Cursor extension is running (localhost:31337)
-    │      → if yes: skip daemon, extension handles execution
-    │
-    ├─ 3. No extension → auto-starts Python daemon in background
-    │      → daemon polls /v2/poll/{uuid} using NEO_SECRET_KEY as Bearer token
-    │
-    ├─ 4. POST /v2/thread/init-chat-direct with deployment_id
-    │      → backend routes task to the daemon
-    │      → daemon executes: writes files, runs code, returns output
-    │
-    └─ 5. Background polling of /v2/thread/status/{thread_id} with API key
-           → neo_task_status / neo_get_messages return results
-```
-
-### What "auto-start daemon" means
-
-When `neo_submit_task` is called and no daemon is detected:
-1. Server spawns `neo-mcp daemon` as a detached background process
-2. Daemon looks for OAuth token in `~/.neo/daemon/mcp_auth.json` — **falls back to `NEO_SECRET_KEY`**
-   if no OAuth token exists
-3. Server waits up to 5s for daemon to register, then submits with the derived UUID
-
-**The daemon falls back to the API key for polling.** This means `neo-mcp login` is optional
-for the pip-installed stdio flow.
-
----
-
-## Flow Comparison
-
-| Setup | Login needed | Daemon needed | Task execution |
-|---|---|---|---|
-| VS Code/Cursor extension | No (extension handles it) | No (extension IS the daemon) | Local, on your machine |
-| `pip install` + API key | **No** (key fallback) | Auto-started by MCP server | Local, on your machine |
-| `pip install` + `neo-mcp login` | Yes (explicit OAuth) | Auto-started or manual | Local, full OAuth refresh |
-| Hosted server (`mcpserver.heyneo.com`) | Yes (need daemon + deployment ID header) | Must run locally | Local via explicit daemon |
-
----
-
-## The Two Auth Layers (unchanged — architectural context)
-
-```
-Editor / Claude Code
-       │
-       │  API key (sk-v1-...)
-       ▼
-MCP server (neo-mcp)            ← API key is sufficient for all MCP calls
-  neo_submit_task   ──────────► POST /v2/thread/init-chat-direct   ✓ API key
-  neo_task_status   ──────────► GET  /v2/thread/status/{thread_id} ✓ API key
-  neo_get_messages  ──────────► GET  /v2/thread/thread-messages     ✓ API key
-       │
-       │  deployment_id (UUID derived from API key)
-       ▼
-Neo backend routes task to daemon
-       │
-       │  Bearer token (OAuth or API key fallback)
-       ▼
-Daemon on user's machine        ← execution layer, polls for commands
-  polls ──────────────────────► GET /v2/poll/{deployment_id}
-  executes locally, writes files
-```
-
----
-
-## Hosted Server Flow (mcpserver.heyneo.com)
-
-The hosted server is stateless — it cannot auto-start a daemon on your machine. You must run
-the daemon yourself and tell the server your deployment ID via header.
-
-```bash
-# Step 1: Authenticate (one-time)
-neo-mcp login
-# → opens browser → writes ~/.neo/daemon/mcp_auth.json
-
-# Step 2: Start daemon (keep running)
-neo-mcp daemon
-# → polls /v2/poll/{uuid}, executes tasks locally
-# → writes UUID to ~/.neo/daemon/standalone_deployment_id
-
-# Step 3: Register MCP server with your deployment ID
+# One command. No extension, no pip, no daemon, no UUID.
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
-  --header "Authorization: Bearer sk-v1-your-key" \
-  --header "X-Neo-Deployment-Id: $(cat ~/.neo/daemon/standalone_deployment_id)"
+  --header "Authorization: Bearer sk-v1-..."
+
+# Submit tasks. They just run.
 ```
+
+This is the same UX as Linear, Stripe, and Sentry MCP servers — one command, works immediately.
 
 ---
 
-## VS Code / Cursor Extension Flow
+## Change 2 — Accept API key on `/v2/poll` (eliminates OAuth login)
 
-No setup beyond installing the extension and logging in via the extension UI.
+### The problem
+
+The daemon polls `/v2/poll/{deployment_id}` to receive task execution commands. This endpoint currently requires an OAuth token — it rejects the `NEO_SECRET_KEY` API key with 401.
+
+This forces users who run `neo-mcp daemon` manually (without the VS Code extension) to go through a browser OAuth flow (`neo-mcp login`) before the daemon works. On remote servers and headless environments, this is broken — the localhost OAuth callback never fires.
+
+### What the daemon already does
+
+The Python daemon already sends `NEO_SECRET_KEY` as a Bearer token fallback when no OAuth token is present. The only reason it fails is the backend rejects it.
+
+```
+# What the daemon sends today (when no OAuth token):
+GET /v2/poll/de9d7297-580c-587c-b0e4-7ebb0fe7314c
+Authorization: Bearer sk-v1-a63a...   ← backend returns 401
+
+# What needs to work:
+GET /v2/poll/de9d7297-580c-587c-b0e4-7ebb0fe7314c
+Authorization: Bearer sk-v1-a63a...   ← backend returns 200
+```
+
+### Why this is safe
+
+The deployment UUID is derived deterministically from the API key:
+
+```
+UUID = SHA-256(NEO_SECRET_KEY)[:16]  →  formatted as UUID
+```
+
+Properties:
+- 128-bit — not guessable by brute force
+- Derived from a private API key — only the key holder can compute it
+- Possession of the UUID = proof of API key ownership
+
+Accepting the API key on the poll endpoint adds no security risk — it's equivalent to what OAuth provides, just without the browser ceremony.
+
+Both the hosted MCP server and the user's local daemon independently compute the same UUID from the same API key. This is already implemented and tested on the client side.
+
+### What needs to change
+
+```python
+# Today — poll endpoint
+if not is_valid_oauth_token(bearer_token):
+    return HTTP_401("Unauthorized")
+
+# After change — also accept API key
+if not is_valid_oauth_token(bearer_token) and not is_valid_api_key(bearer_token):
+    return HTTP_401("Unauthorized")
+```
+
+Endpoints to update:
+- `GET /v2/poll/{deployment_id}` — receive task commands
+- `POST /v2/poll/response` — send execution results back
+
+### User experience after this change
 
 ```bash
-# MCP server (HTTP, hosted — recommended with extension)
+# Start daemon. No browser, no login, works on SSH/headless.
+NEO_SECRET_KEY=sk-v1-... neo-mcp daemon &
+
+# Add MCP. No X-Neo-Deployment-Id header needed.
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
-  --header "Authorization: Bearer sk-v1-your-key"
-# Extension auto-detected → no deployment ID header needed
-
-# MCP server (stdio, local install)
-claude mcp add --scope user neo \
-  -e NEO_SECRET_KEY=sk-v1-your-key \
-  -- neo-mcp
-# Extension detected on localhost:31337 → auto-used as daemon
+  --header "Authorization: Bearer sk-v1-..."
 ```
 
-Detection: MCP server checks for `~/.neo/daemon/daemon.token` + open socket on `127.0.0.1:31337`.
+`neo-mcp login` becomes entirely optional — useful for users who want OAuth-based auth with automatic token refresh, but never required.
 
 ---
 
-## What Was Implemented in v0.2.x
+## Current state without these changes
 
-### v0.2.2 — Key-derived deployment ID + socket-based extension detection
+| User setup | Works today? | What fails |
+|---|---|---|
+| VS Code/Cursor extension | Yes | Nothing — extension handles everything |
+| `pip install` + API key (local stdio) | Yes | Daemon auto-starts, extension UUID used via registration |
+| Hosted server + extension UUID header | Yes | User must manually find and paste extension UUID |
+| Hosted server, no extension, no pip | **No** | 400 on submit — no daemon registered (Change 1 fixes this) |
+| `neo-mcp daemon` without OAuth login | **No** | 401 on poll — API key rejected (Change 2 fixes this) |
+| Headless server / SSH | **No** | OAuth callback never fires (Change 2 fixes this) |
 
-**Before:** Daemon ID was read from `daemon.log` (only written by the Python daemon, not the
-VS Code extension in production). Extension detection was unreliable; stale log entries blocked
-auto-start after daemon died.
+## After both changes
 
-**After:**
-- Deployment UUID derived from `SHA-256(NEO_SECRET_KEY)[:16]` — stable per user, no files needed
-- VS Code extension detected by: `daemon.token` file exists + port 31337 open (live socket check)
-- Auto-start flow: check `_register_with_daemon()` (VS Code extension) → check `_python_daemon_running()`
-  → only auto-start if neither is active
-- Fixed stale log bug: stale `daemon.log` entry no longer blocks daemon re-launch after crash
-
-### v0.2.3 — Daemon auth fallback + setup wizard fix
-
-- Daemon falls back to `NEO_SECRET_KEY` for `/v2/poll` auth when no OAuth token exists
-- `neo-mcp setup` uses socket detection (not log parsing) for VS Code extension
-- `run_setup()`: extension running → skip login + skip daemon start; no extension → login + daemon
-
-### v0.2.4 — End-to-end test suite
-
-- 29 e2e tests covering auth/connectivity, MCP tools, task submission, daemon detection,
-  error handling, HTTP app routes — all passing against live Neo backend
-- One test intentionally skipped: full poll-until-terminal cycle (requires daemon running)
-
----
-
-## What Still Needs Backend Changes
-
-### Change 1 (recommended) — Accept API key on `/v2/poll/{deployment_id}`
-
-The Python daemon already sends `NEO_SECRET_KEY` as a fallback Bearer token. If the backend
-stops rejecting non-OAuth tokens, OAuth login becomes completely optional.
-
-```
-# Current: 401 when API key sent to poll endpoint
-# Proposed: 200 — deployment UUID is the capability credential (128-bit, derived from private key)
-
-GET /v2/poll/{deployment_id}?max_messages=10&wait_time=5
-Authorization: Bearer sk-v1-your-key   ← should be accepted
-```
-
-**Impact:** `neo-mcp login` is never needed. `neo-mcp daemon` works on first run with just the API key.
-
-### Change 2 — Allow task submission without a running daemon
-
-```
-# Current: HTTP 400 when no healthy deployment registered
-# Proposed: route to Neo cloud execution when no local daemon is available
-
-POST /v2/thread/init-chat-direct
-{ "message": "train a classifier", "deployment_type": "vscode" }
-→ HTTP 200: { "thread_id": "..." }   ← cloud execution, no daemon needed
-```
-
-**Impact:** Zero-setup experience — add MCP server, set API key, tasks work immediately
-without running any local process.
-
-### Change 3 — Whitelist login relay redirect domain
-
-For the remote server login relay (`mcpserver.heyneo.com/auth/callback`) to work, `heyneo.so/login`
-must allow redirects to `mcpserver.heyneo.com`.
-
-```
-# Add to OAuth redirect allowlist on heyneo.so:
-https://mcpserver.heyneo.com
-```
-
-**Impact:** `neo-mcp login` works on SSH/headless/remote servers where localhost callbacks fail.
-
----
-
-## Priority Order
-
-1. **Change 1** (accept API key on poll) — makes `neo-mcp login` entirely optional. The daemon
-   already sends the key as fallback — just stop rejecting it.
-
-2. **Change 2** (cloud execution fallback) — zero-setup for users who don't need local file access.
-
-3. **Change 3** (login relay) — fixes broken login on remote servers. Only needed while Change 1
-   is pending.
-
-After Changes 1 + 2: any user can `pip install neo-mcp`, set `NEO_SECRET_KEY`, and submit tasks
-with no additional steps — whether they want local or cloud execution.
+Every user experience works with just an API key. OAuth login and local daemons become optional enhancements, not requirements.
