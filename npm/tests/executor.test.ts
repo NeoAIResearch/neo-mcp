@@ -171,6 +171,28 @@ describe('dispatch: run_subprocess', () => {
     expect((statusResult.data?.['stdout'] as string).trim()).toBe('neo-test');
     expect(statusResult.data?.['exit_code']).toBe(0);
   });
+
+  it('supports non-detached execution when detach=false', async () => {
+    const result = await dispatch(makeCmd({
+      action: 'run_subprocess',
+      command: 'echo inline-run',
+      payload: { detach: false },
+    }), workspace);
+    expect(result.status).toBe('completed');
+    expect(result.data?.['detached']).toBe(false);
+    expect(result.data?.['completed']).toBe(true);
+    expect((result.data?.['stdout'] as string).trim()).toBe('inline-run');
+    expect(result.data?.['exit_code']).toBe(0);
+  });
+
+  it('reads command from payload when top-level command is missing', async () => {
+    const result = await dispatch(makeCmd({
+      action: 'run_subprocess',
+      payload: { command: 'echo payload-cmd' },
+    }), workspace);
+    expect(result.status).toBe('success');
+    expect(result.data?.['job_id']).toBeTruthy();
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ import { randomUUID } from 'crypto';
 import { spawn, ChildProcess } from 'child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs';
 import { homedir, tmpdir } from 'os';
-import { dirname, isAbsolute, join, resolve } from 'path';
+import { dirname, isAbsolute, join, relative, resolve } from 'path';
 
 // Directories skipped during file listing — matches Python/TS daemon
 const SKIP_DIRS = new Set([
@@ -67,13 +67,36 @@ export function safeResolve(workspace: string, pathStr: string): string | null {
   const home = homedir();
   const tmp = tmpdir();
   // On macOS, /tmp is a symlink to /private/tmp — include both so resolve() never surprises us
-  const allowed = new Set([workspace, home, tmp, resolve(tmp)].filter(Boolean));
+  const allowed = [workspace, home, tmp, resolve(tmp)].filter(Boolean).map(p => resolve(p));
+
+  function isWithin(root: string, target: string): boolean {
+    const rel = relative(root, target);
+    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  }
+
   if (isAbsolute(pathStr)) {
     const r = resolve(pathStr);
-    return [...allowed].some(a => r === a || r.startsWith(a + '/')) ? r : null;
+    return allowed.some(a => isWithin(a, r)) ? r : null;
   }
-  const r = resolve(join(workspace, pathStr));
-  return r === workspace || r.startsWith(workspace + '/') ? r : null;
+  const w = resolve(workspace);
+  const r = resolve(join(w, pathStr));
+  return isWithin(w, r) ? r : null;
+}
+
+function fieldString(cmd: Command, key: string): string | undefined {
+  const direct = (cmd as unknown as Record<string, unknown>)[key];
+  if (typeof direct === 'string' && direct.length > 0) return direct;
+  const nested = cmd.payload?.[key];
+  if (typeof nested === 'string' && nested.length > 0) return nested;
+  return undefined;
+}
+
+function fieldBoolean(cmd: Command, key: string, fallback: boolean): boolean {
+  const direct = (cmd as unknown as Record<string, unknown>)[key];
+  if (typeof direct === 'boolean') return direct;
+  const nested = cmd.payload?.[key];
+  if (typeof nested === 'boolean') return nested;
+  return fallback;
 }
 
 // ---------------------------------------------------------------------------
@@ -93,11 +116,12 @@ function hCreateSession(cmd: Command): ActionResult {
 }
 
 function hWriteCode(cmd: Command, workspace: string): ActionResult {
-  const { filename, code } = cmd;
+  const filename = fieldString(cmd, 'filename');
+  const code = fieldString(cmd, 'code') ?? (typeof cmd.code === 'string' ? cmd.code : undefined);
   if (!filename || code === undefined) {
     return { request_id: cmd.request_id, status: 'error', error: 'filename and code are required' };
   }
-  const workdir = cmd.workdir ?? '';
+  const workdir = fieldString(cmd, 'workdir') ?? '';
   // Use resolve() not join() so absolute workdir replaces workspace (mirrors Python os.path.join behaviour)
   const base = workdir ? (isAbsolute(workdir) ? workdir : join(workspace, workdir)) : workspace;
   const full = safeResolve(base, filename) ?? safeResolve(workspace, filename);
@@ -116,7 +140,7 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
 }
 
 function hGetFile(cmd: Command, workspace: string): ActionResult {
-  const fp = cmd.file_path;
+  const fp = fieldString(cmd, 'file_path');
   if (!fp) {
     return { request_id: cmd.request_id, status: 'error', error: 'file_path is required' };
   }
@@ -132,16 +156,51 @@ function hGetFile(cmd: Command, workspace: string): ActionResult {
   };
 }
 
-function hRunSubprocess(cmd: Command, workspace: string): ActionResult {
-  const { command } = cmd;
+async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionResult> {
+  const command = fieldString(cmd, 'command');
   if (!command) {
     return { request_id: cmd.request_id, status: 'error', error: 'command is required' };
   }
+
+  const detach = fieldBoolean(cmd, 'detach', true);
+  const cmdWorkdir = fieldString(cmd, 'workdir');
+  const cwd = cmdWorkdir
+    ? (isAbsolute(cmdWorkdir) ? cmdWorkdir : join(workspace, cmdWorkdir))
+    : workspace;
+  const safeCwd = safeResolve(workspace, cwd) ?? workspace;
+
   // Ensure workspace exists before spawning — cwd must exist or spawn throws ENOENT
-  mkdirSync(workspace, { recursive: true });
-  console.log(`[run_subprocess] cwd=${workspace} cmd=${command.slice(0, 120)}`);
+  mkdirSync(safeCwd, { recursive: true });
+  console.log(`[run_subprocess] cwd=${safeCwd} cmd=${command.slice(0, 120)} detach=${detach}`);
+
+  if (!detach) {
+    const proc = spawn(command, { shell: true, cwd: safeCwd });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+
+    const exitCode = await new Promise<number>((resolveExit) => {
+      proc.on('close', (code: number | null) => resolveExit(code ?? -1));
+      proc.on('error', () => resolveExit(-1));
+    });
+
+    return {
+      request_id: cmd.request_id,
+      status: exitCode === 0 ? 'completed' : 'error',
+      data: {
+        detached: false,
+        completed: true,
+        exit_code: exitCode,
+        stdout,
+        stderr,
+      },
+      ...(exitCode === 0 ? {} : { error: `Command failed with exit code ${exitCode}` }),
+    };
+  }
+
   const jobId = randomUUID();
-  const proc = spawn(command, { shell: true, cwd: workspace });
+  const proc = spawn(command, { shell: true, cwd: safeCwd });
   const job: Job = { proc, stdout: '', stderr: '', exitCode: null };
   _jobs.set(jobId, job);
 
@@ -157,7 +216,7 @@ function hRunSubprocess(cmd: Command, workspace: string): ActionResult {
 }
 
 function hGetJobStatus(cmd: Command): ActionResult {
-  const { job_id } = cmd;
+  const job_id = fieldString(cmd, 'job_id');
   const job = job_id ? _jobs.get(job_id) : undefined;
   if (!job) {
     return { request_id: cmd.request_id, status: 'error', error: `Job not found: ${job_id ?? ''}` };
@@ -177,7 +236,7 @@ function hGetJobStatus(cmd: Command): ActionResult {
 }
 
 function hTerminateJob(cmd: Command): ActionResult {
-  const { job_id } = cmd;
+  const job_id = fieldString(cmd, 'job_id');
   const job = job_id ? _jobs.get(job_id) : undefined;
   if (!job) {
     return { request_id: cmd.request_id, status: 'error', error: `Job not found: ${job_id ?? ''}` };
@@ -194,7 +253,7 @@ function hTerminateJob(cmd: Command): ActionResult {
 
 function hListFiles(cmd: Command, workspace: string): ActionResult {
   const payload = cmd.payload ?? {};
-  const directory = cmd.directory ?? (payload['directory'] as string | undefined) ?? workspace;
+  const directory = fieldString(cmd, 'directory') ?? (payload['directory'] as string | undefined) ?? workspace;
   const maxDepth = Number(cmd.max_depth ?? payload['max_depth'] ?? 10);
   const includeHidden = Boolean(cmd.include_hidden ?? payload['include_hidden'] ?? false);
 
@@ -250,7 +309,7 @@ export async function dispatch(cmd: Command, workspace: string): Promise<ActionR
       case 'create_session':  return hCreateSession(cmd);
       case 'write_code':      return hWriteCode(cmd, workspace);
       case 'get_file':        return hGetFile(cmd, workspace);
-      case 'run_subprocess':  return hRunSubprocess(cmd, workspace);
+      case 'run_subprocess':  return await hRunSubprocess(cmd, workspace);
       case 'get_job_status':  return hGetJobStatus(cmd);
       case 'terminate_job':   return hTerminateJob(cmd);
       case 'list_files':      return hListFiles(cmd, workspace);
