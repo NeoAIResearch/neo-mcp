@@ -12,7 +12,7 @@ pip install neo-mcp
 neo-mcp daemon &
 ```
 
-
+wh
 **After:**
 ```bash
 npx neo-mcp-daemon &

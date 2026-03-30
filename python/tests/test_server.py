@@ -1237,14 +1237,21 @@ class TestNeoGetFiles(unittest.TestCase):
         self._orig_polls = dict(srv._active_polls)
         srv._active_polls.clear()
         self._orig_tid = srv._THREAD_ID_FILE
+        self._orig_ws_file = srv._THREAD_WORKSPACES_FILE
+        self._orig_cwd = srv._server_cwd
         self._tmpdir = tempfile.mkdtemp()
         srv._THREAD_ID_FILE = os.path.join(self._tmpdir, "tid")
+        # Point workspace file into tmp so tests don't touch ~/.neo
+        self._ws_file = os.path.join(self._tmpdir, "thread-workspaces.json")
+        srv._THREAD_WORKSPACES_FILE = self._ws_file
 
     def tearDown(self):
         srv.NEO_SECRET_KEY = self._orig_key
         srv._active_polls.clear()
         srv._active_polls.update(self._orig_polls)
         srv._THREAD_ID_FILE = self._orig_tid
+        srv._THREAD_WORKSPACES_FILE = self._orig_ws_file
+        srv._server_cwd = self._orig_cwd
 
     def test_no_thread_id_returns_error(self):
         with patch("neo_mcp.server.httpx.AsyncClient") as MockClient:
@@ -1255,35 +1262,14 @@ class TestNeoGetFiles(unittest.TestCase):
         txt = text_of(result)
         self.assertIn("No thread_id", txt)
 
-    def test_export_failure_returns_error(self):
+    def test_no_files_in_empty_workspace(self):
+        # Workspace mapped to empty dir — should report no files
+        workspace = tempfile.mkdtemp()
+        with open(self._ws_file, "w") as f:
+            json.dump({"tid-f2": workspace}, f)
+
         with patch("neo_mcp.server.httpx.AsyncClient") as MockClient:
-            ctx, _ = make_async_client({"DEFAULT": make_response(500)})
-            MockClient.return_value = ctx
-            result = call_tool("neo_get_files", {"thread_id": "tid-f1"})
-
-        txt = text_of(result)
-        self.assertIn("Export failed", txt)
-
-    def test_no_files_returns_message(self):
-        export_resp = make_response(200, {"job_id": None})
-        files_resp = make_response(200, {"files": []})
-
-        mock_client = AsyncMock()
-
-        async def mock_post(url, **kwargs):
-            return export_resp
-
-        async def mock_get(url, **kwargs):
-            return files_resp
-
-        mock_client.post = AsyncMock(side_effect=mock_post)
-        mock_client.get = AsyncMock(side_effect=mock_get)
-
-        with patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
-             patch("asyncio.sleep", new_callable=AsyncMock):
-            ctx = MagicMock()
-            ctx.__aenter__ = AsyncMock(return_value=mock_client)
-            ctx.__aexit__ = AsyncMock(return_value=False)
+            ctx, _ = make_async_client({})
             MockClient.return_value = ctx
             result = call_tool("neo_get_files", {"thread_id": "tid-f2"})
 
@@ -1291,41 +1277,40 @@ class TestNeoGetFiles(unittest.TestCase):
         self.assertIn("No files", txt)
 
     def test_files_returned_with_contents(self):
-        export_resp = make_response(200, {"job_id": None})
-        files_resp = make_response(200, {"files": [
-            {"file_name": "model.pkl", "file_type": "python", "size": 100,
-             "download_url": "http://s3.example.com/model.pkl"},
-        ]})
-        download_resp = MagicMock()
-        download_resp.status_code = 200
-        download_resp.text = "binary content"
+        # Create a workspace with two files written by the daemon
+        workspace = tempfile.mkdtemp()
+        with open(os.path.join(workspace, "model.py"), "w") as f:
+            f.write("# model code\nprint('hello')\n")
+        with open(os.path.join(workspace, "README.md"), "w") as f:
+            f.write("# Project\nSome description.\n")
+        with open(self._ws_file, "w") as f:
+            json.dump({"tid-f3": workspace}, f)
 
-        mock_client = AsyncMock()
-        call_count = [0]
-
-        async def mock_post(url, **kwargs):
-            return export_resp
-
-        async def mock_get(url, **kwargs):
-            call_count[0] += 1
-            if "files" in str(url):
-                return files_resp
-            return download_resp
-
-        mock_client.post = AsyncMock(side_effect=mock_post)
-        mock_client.get = AsyncMock(side_effect=mock_get)
-
-        with patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
-             patch("asyncio.sleep", new_callable=AsyncMock):
-            ctx = MagicMock()
-            ctx.__aenter__ = AsyncMock(return_value=mock_client)
-            ctx.__aexit__ = AsyncMock(return_value=False)
+        with patch("neo_mcp.server.httpx.AsyncClient") as MockClient:
+            ctx, _ = make_async_client({})
             MockClient.return_value = ctx
             result = call_tool("neo_get_files", {"thread_id": "tid-f3"})
 
         txt = text_of(result)
-        self.assertIn("model.pkl", txt)
-        self.assertIn("binary content", txt)
+        self.assertIn("model.py", txt)
+        self.assertIn("# model code", txt)
+        self.assertIn("README.md", txt)
+
+    def test_falls_back_to_server_cwd_when_no_workspace_map(self):
+        # No workspaces file — should fall back to _server_cwd
+        workspace = tempfile.mkdtemp()
+        with open(os.path.join(workspace, "output.txt"), "w") as f:
+            f.write("result data\n")
+        srv._server_cwd = workspace
+
+        with patch("neo_mcp.server.httpx.AsyncClient") as MockClient:
+            ctx, _ = make_async_client({})
+            MockClient.return_value = ctx
+            result = call_tool("neo_get_files", {"thread_id": "tid-f4"})
+
+        txt = text_of(result)
+        self.assertIn("output.txt", txt)
+        self.assertIn("result data", txt)
 
 
 # ---------------------------------------------------------------------------
