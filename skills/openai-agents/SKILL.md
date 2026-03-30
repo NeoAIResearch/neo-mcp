@@ -9,7 +9,7 @@ Use Neo's MCP server as a toolset inside the OpenAI Agents SDK. Neo runs AI/ML w
 
 ## Option A: MCP Server tool (recommended)
 
-The OpenAI Agents SDK has native MCP support via `MCPServerHTTP`. This loads all 9 Neo tools automatically.
+The OpenAI Agents SDK has native MCP support via `MCPServerHTTP`. This loads all 10 Neo tools automatically.
 
 ```python
 import asyncio
@@ -188,6 +188,17 @@ def neo_send_feedback(message: str, thread_id: str = "") -> str:
 
 
 @function_tool
+def neo_list_tasks() -> str:
+    """List running or recent Neo tasks associated with your API key.
+
+    Use when the user has closed a window or lost track of a task. Discovers
+    tasks from in-memory state, the local thread ID file, and the Neo API.
+    Reconnects background pollers automatically for any active tasks found.
+    """
+    return _call_neo("neo_list_tasks", {})
+
+
+@function_tool
 def neo_stop_task(thread_id: str = "", delete_remote_artifacts: bool = False) -> str:
     """Stop and clean up a running or paused task.
 
@@ -210,6 +221,7 @@ Use neo_submit_task for any ML/AI work. Poll with neo_task_plan until COMPLETED,
 then call neo_get_messages for the final output.""",
     tools=[
         neo_submit_task,
+        neo_list_tasks,
         neo_task_plan,
         neo_task_status,
         neo_get_messages,

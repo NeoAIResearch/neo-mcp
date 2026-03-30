@@ -67,6 +67,7 @@ When invoked as `/neo <task>`, immediately call `neo_submit_task` with the provi
 | Tool | When to call | Notes |
 |---|---|---|
 | `neo_submit_task` | Starting any AI/ML task | Returns `thread_id` immediately; use `wait_for_completion: true` only for tasks under ~3 min |
+| `neo_list_tasks` | User closed a window / lost track of a task | Lists all running/recent tasks from in-memory state, local file, and the API; reconnects pollers automatically |
 | `neo_task_status` | Checking if still running | Reads from in-memory cache — fast, no API call if poller is active |
 | `neo_task_plan` | Checking mid-run progress | Much cheaper than `neo_get_messages`; shows step-by-step plan with per-step status |
 | `neo_get_messages` | Reading output when COMPLETED | Paginated; capped at ~20 000 tokens |

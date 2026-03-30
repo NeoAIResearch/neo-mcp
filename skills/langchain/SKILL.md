@@ -9,7 +9,7 @@ Use Neo's MCP server as a toolset inside LangChain agents. Neo runs AI/ML worklo
 
 ## Option A: MCP Toolset (recommended)
 
-LangChain's `langchain-mcp-adapters` package loads all 9 Neo tools from the MCP server automatically.
+LangChain's `langchain-mcp-adapters` package loads all 10 Neo tools from the MCP server automatically.
 
 ```pythontest
 import asyncio
@@ -183,6 +183,17 @@ neo_send_feedback = StructuredTool.from_function(
     args_schema=FeedbackInput,
 )
 
+neo_list_tasks = StructuredTool.from_function(
+    func=lambda: _call_neo("neo_list_tasks", {}),
+    name="neo_list_tasks",
+    description=(
+        "List running or recent Neo tasks. Use when the user has closed a window or lost track of a task. "
+        "Discovers tasks from in-memory state, local file, and the Neo API. "
+        "Reconnects background pollers automatically for any active tasks found."
+    ),
+    args_schema=None,
+)
+
 neo_stop_task = StructuredTool.from_function(
     func=lambda thread_id=None, delete_remote_artifacts=False: _call_neo(
         "neo_stop_task",
@@ -201,6 +212,7 @@ neo_stop_task = StructuredTool.from_function(
 
 NEO_TOOLS = [
     neo_submit_task,
+    neo_list_tasks,
     neo_task_plan,
     neo_task_status,
     neo_get_messages,
