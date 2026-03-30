@@ -6,9 +6,8 @@ Polls GET /v2/poll/{deployment_id} for commands and executes them locally,
 then sends results back via POST /v2/poll/response.
 
 Authentication:
-    Uses the OAuth access_token stored in ~/.neo/daemon/mcp_auth.json.
-    Run `neo-mcp login` once to authenticate and write this file.
-    The VS Code/Cursor extension also writes this file when logged in.
+    Uses NEO_SECRET_KEY as a Bearer token — the same API key used by all
+    other neo-mcp requests. No OAuth or browser login needed.
 
 Supported actions (matches DaemonActionHandlers.ts exactly):
   create_session, write_code, get_file, run_subprocess,
@@ -18,7 +17,8 @@ Usage:
     neo-mcp daemon [/path/to/workspace] [--deployment-id UUID]
 
 Environment:
-    NEO_API_URL      — optional, defaults to https://master.heyneo.so
+    NEO_API_URL       — optional, defaults to https://master.heyneo.so
+    NEO_SECRET_KEY    — required, API key (sk-v1-...)
     NEO_DEPLOYMENT_ID — optional, pin to a specific UUID
 """
 
@@ -44,10 +44,8 @@ import httpx
 _NEO_ENV: str = os.environ.get("NEO_ENV", "prod").lower()
 _DEFAULT_URL: str = "https://alpha.heyneo.so" if _NEO_ENV == "staging" else "https://master.heyneo.so"
 NEO_API_URL: str = os.environ.get("NEO_API_URL", _DEFAULT_URL)
-NEO_AUTH_URL: str = os.environ.get("NEO_AUTH_URL", _DEFAULT_URL)
 
 _DAEMON_DIR = os.path.expanduser("~/.neo/daemon")
-_MCP_AUTH_FILE = os.path.join(_DAEMON_DIR, "mcp_auth.json")
 _STANDALONE_UUID_FILE = os.path.join(_DAEMON_DIR, "standalone_deployment_id")
 _DAEMON_LOG = os.path.join(_DAEMON_DIR, "daemon.log")
 _PID_FILE = os.path.join(_DAEMON_DIR, "python_daemon.pid")
@@ -68,65 +66,12 @@ _SKIP_DIRS = {"venv", "node_modules", "env", ".venv", "__pycache__", ".git", ".t
 
 
 # ---------------------------------------------------------------------------
-# OAuth token management
+# Auth
 # ---------------------------------------------------------------------------
 
-def _load_mcp_auth() -> dict:
-    """Load the OAuth credentials written by VS Code extension or neo-mcp login."""
-    try:
-        return json.loads(Path(_MCP_AUTH_FILE).read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _save_mcp_auth(data: dict) -> None:
-    os.makedirs(_DAEMON_DIR, exist_ok=True)
-    Path(_MCP_AUTH_FILE).write_text(json.dumps(data, indent=2))
-
-
-def _get_oauth_token() -> str:
-    """Return the best available polling token.
-
-    Priority:
-    1. OAuth access_token from ~/.neo/daemon/mcp_auth.json (written by VS Code
-       extension or neo-mcp login) — full OAuth with refresh support
-    2. NEO_SECRET_KEY env var — API key usable when no OAuth session exists,
-       e.g. when running on the hosted MCP server without a browser login
-    """
-    auth = _load_mcp_auth()
-    token = auth.get("access_token", "")
-    # Treat obviously invalid tokens as missing
-    if not token or token in ("\\", "null", "undefined") or len(token) < 10:
-        # Fall back to the API key — Neo accepts it as a Bearer token for polling too
-        token = os.environ.get("NEO_SECRET_KEY", "")
-    return token
-
-
-async def _refresh_oauth_token() -> str:
-    """Try to refresh the OAuth token using the stored refresh_token.
-    Returns the new access_token on success, empty string on failure.
-    """
-    auth = _load_mcp_auth()
-    refresh_token = auth.get("refresh_token", "")
-    username = auth.get("username", "")
-    if not refresh_token or not username:
-        return ""
-    try:
-        async with httpx.AsyncClient(base_url=NEO_AUTH_URL, timeout=10.0) as c:
-            r = await c.post(
-                "/auth/refresh-token",
-                json={"username": username, "refreshToken": refresh_token},
-            )
-            if r.status_code == 200:
-                data = r.json()
-                new_token = data.get("token") or data.get("access_token") or data.get("accessToken", "")
-                if new_token:
-                    auth["access_token"] = new_token
-                    _save_mcp_auth(auth)
-                    return new_token
-    except Exception:
-        pass
-    return ""
+def _get_secret_key() -> str:
+    """Return the NEO_SECRET_KEY API key used for all requests."""
+    return os.environ.get("NEO_SECRET_KEY", "")
 
 
 # ---------------------------------------------------------------------------
@@ -235,41 +180,33 @@ async def _poll_backend(
     dep_id: str,
     token: str,
 ) -> tuple[list[dict], str]:
-    """GET /v2/poll/{dep_id} — returns (commands, updated_token).
+    """GET /v2/poll/{dep_id} — returns (commands, token).
 
-    Handles 401 by attempting a token refresh once.
     Returns ([], token) on error.
     """
-    for attempt in range(2):
-        try:
-            r = await client.get(
-                f"/v2/poll/{dep_id}",
-                params={"max_messages": 10, "wait_time": 5},
-                headers=_auth(token),
-                timeout=15.0,
+    try:
+        r = await client.get(
+            f"/v2/poll/{dep_id}",
+            params={"max_messages": 10, "wait_time": 5},
+            headers=_auth(token),
+            timeout=15.0,
+        )
+        if r.status_code == 401:
+            print(
+                "ERROR: Auth rejected (401). Check that NEO_SECRET_KEY is set correctly.",
+                file=sys.stderr,
+                flush=True,
             )
-            if r.status_code == 401 and attempt == 0:
-                new_token = await _refresh_oauth_token()
-                if new_token:
-                    token = new_token
-                    continue
-                print(
-                    "ERROR: Auth rejected (401). Check NEO_SECRET_KEY is correct, "
-                    "or refresh OAuth with 'neo-mcp login'.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return [], token
-            if r.status_code not in (200, 404):
-                return [], token
-            if r.status_code == 404:
-                return [], token
-            data = r.json()
-            commands = data if isinstance(data, list) else data.get("messages", [])
-            return commands, token
-        except Exception:
             return [], token
-    return [], token
+        if r.status_code not in (200, 404):
+            return [], token
+        if r.status_code == 404:
+            return [], token
+        data = r.json()
+        commands = data if isinstance(data, list) else data.get("messages", [])
+        return commands, token
+    except Exception:
+        return [], token
 
 
 async def _send_response(
@@ -507,15 +444,11 @@ async def run_daemon(workspace: Optional[str] = None, deployment_id: Optional[st
     ws = os.path.realpath(workspace or os.getcwd())
     dep_id = deployment_id or get_or_create_deployment_id()
 
-    # Load best available auth token:
-    #   1. OAuth from mcp_auth.json (VS Code extension or neo-mcp login)
-    #   2. NEO_SECRET_KEY API key as fallback (works when auto-started by the MCP server)
-    token = _get_oauth_token()
+    token = _get_secret_key()
     if not token:
         print(
-            "ERROR: No auth token found.\n"
-            "Set your API key: export NEO_SECRET_KEY=sk-v1-...\n"
-            "Or run 'neo-mcp login' to authenticate via browser OAuth.",
+            "ERROR: NEO_SECRET_KEY is not set.\n"
+            "Set your API key: export NEO_SECRET_KEY=sk-v1-...",
             file=sys.stderr,
             flush=True,
         )
@@ -587,8 +520,7 @@ def main() -> None:
         prog="neo-mcp daemon",
         description=(
             "Neo daemon — polls the Neo backend for commands and executes them locally.\n\n"
-            "Requires authentication: run 'neo-mcp login' first, or log in via the\n"
-            "Neo VS Code/Cursor extension (it writes the token automatically)."
+            "Requires NEO_SECRET_KEY to be set (export NEO_SECRET_KEY=sk-v1-...)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

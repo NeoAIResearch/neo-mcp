@@ -67,9 +67,6 @@ cd python && pip install -e . && neo-mcp
 # Start the Python daemon manually (normally auto-started by the agent on first task)
 neo-mcp daemon
 
-# Optional: browser OAuth login (only needed if daemon poll endpoint still requires OAuth)
-neo-mcp login
-
 # Run unit tests (no key needed)
 python3 -m pytest python/tests/ -v
 
@@ -173,14 +170,7 @@ When no daemon is running (stdio mode):
 
 ### Python daemon authentication (`src/neo_mcp/daemon.py`)
 
-**Current state (pending backend change):** The daemon poll endpoint currently requires an OAuth token. The daemon reads `~/.neo/daemon/mcp_auth.json` written by `neo-mcp login` or the VS Code extension.
-
-**Pending:** The backend team is adding API key support to the daemon poll endpoint (exact path TBD — likely `v2/thread/poll` or similar). Once shipped:
-- Daemon authenticates with `NEO_SECRET_KEY` directly — no OAuth, no login step
-- `neo-mcp login` becomes fully optional (only needed for OAuth-based token refresh)
-- Every workflow becomes zero-touch: add the MCP server once, submit tasks, daemon auto-starts
-
-Until that change ships, the daemon needs OAuth auth. `neo-mcp login` handles this and now **auto-starts the daemon** after successful login.
+The daemon authenticates with `NEO_SECRET_KEY` as a Bearer token — the same API key used for all other Neo API requests. No OAuth, no login step. Every workflow is zero-touch: set the key, add the MCP server, submit tasks.
 
 ### Other design points
 - `NEO_READ_ONLY=true` strips all write tools at `list_tools()` time — only `neo_task_status`, `neo_task_plan`, `neo_get_messages`, and `neo_get_files` remain.
@@ -204,9 +194,8 @@ Until that change ships, the daemon needs OAuth auth. `neo-mcp login` handles th
 
 Auth on every request: `Authorization: Bearer $NEO_SECRET_KEY`
 
-## Known constraints / pending backend changes
+## Known constraints
 
-- **Daemon poll endpoint requires OAuth (pending fix):** The endpoint the daemon polls to receive execution commands currently only accepts OAuth tokens, not API keys. Once the backend adds API key support (path TBD — likely `v2/thread/poll` or similar), `neo-mcp login` becomes unnecessary and the entire setup collapses to a single `claude mcp add` command.
 - Without the extension or Python daemon running, tasks submit and track correctly via thread_id polling — but local file execution depends on the daemon being active.
 - Do NOT send a fabricated `NEO_DEPLOYMENT_ID` unless it matches a real running sandbox — it causes a 30 s ReadTimeout.
 

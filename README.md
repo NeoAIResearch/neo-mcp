@@ -2,7 +2,7 @@
 
 Run AI/ML tasks on Neo's remote backend from any AI editor — Claude Code, Cursor, Windsurf, Zed, VS Code, Continue.dev, OpenAI Codex CLI, Claude.ai, and ChatGPT.
 
-> **Task execution runs on your local machine** via the Neo VS Code/Cursor extension or the Python daemon. The daemon receives commands from Neo's backend and executes them locally — writing files, running scripts. Your agent starts the daemon automatically on first use.
+> **Task execution runs on your local machine** via the Neo VS Code/Cursor extension or the npm daemon (`npx neo-mcp-daemon`). The daemon receives commands from Neo's backend and executes them locally — writing files, running scripts. Your agent starts the daemon automatically on first use.
 
 ---
 
@@ -16,7 +16,7 @@ claude mcp add --scope user neo \
   --header "Authorization: Bearer sk-v1-YOUR_KEY"
 ```
 
-Open a **new Claude Code session**, then submit an AI/ML task. On first run, your agent will offer to start the local daemon — click yes. That's it.
+Open a **new Claude Code session**, then submit an AI/ML task. On first run, your agent will offer to start the local daemon (`npx neo-mcp-daemon`) — click yes. That's it. No install, no login.
 
 ---
 
@@ -35,7 +35,7 @@ claude mcp add --scope user neo \
   -- neo-mcp
 ```
 
-The daemon starts automatically and silently on your first task. Open a **new Claude Code session** after running these commands.
+The pip server auto-starts the npm daemon on your first task. Open a **new Claude Code session** after running these commands.
 
 ---
 
@@ -293,9 +293,9 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for the full guide including Docker, scop
 |---|---|
 | `Invalid API key` (401) | Re-check `NEO_SECRET_KEY` at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys |
 | `Trial or quota ended` (403) | Top up at the Neo dashboard |
-| `No healthy deployments available` (400) | No daemon running. Your agent will offer to start it — click yes, or run `neo-mcp daemon &` manually. Or install the Neo VS Code/Cursor extension. |
+| `No healthy deployments available` (400) | No daemon running. Your agent will offer to start it — click yes, or run `npx neo-mcp-daemon &` manually. Or install the Neo VS Code/Cursor extension. |
 | `Task submitted but no files written locally` | Daemon must be running for local file writes — agent will offer to start it |
-| Task submission hangs or times out | Daemon has stopped — agent will offer to restart it, or run `neo-mcp daemon &` manually |
+| Task submission hangs or times out | Daemon has stopped — agent will offer to restart it, or run `npx neo-mcp-daemon &` manually |
 | `neo-mcp` not found | Re-run `pip install neo-mcp` and verify `which neo-mcp` |
 | Neo tools don't appear after `claude mcp add` | Open a **new Claude Code session** — tools load at session start |
 | Output truncated | Cap is ~20 000 tokens — use `neo_task_plan` for a concise step summary |

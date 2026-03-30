@@ -52,7 +52,7 @@ Then immediately retry `neo_submit_task`. Do not give up or ask the user to do i
 
 > **Why this happens:** The Neo daemon must run on the user's machine to execute tasks. It starts automatically in local pip-install mode, but needs to be started once for the hosted server. After that first start it persists.
 
-> **If the daemon fails with an auth error:** The poll endpoint currently requires OAuth until a backend change ships. Tell the user to run `neo-mcp login` (it starts the daemon automatically after login), then retry.
+> **If the daemon fails with an auth error:** Check that `NEO_SECRET_KEY` is set correctly — the daemon authenticates with the API key directly.
 
 ---
 

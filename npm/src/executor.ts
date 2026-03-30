@@ -98,7 +98,8 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
     return { request_id: cmd.request_id, status: 'error', error: 'filename and code are required' };
   }
   const workdir = cmd.workdir ?? '';
-  const base = workdir ? join(workspace, workdir) : workspace;
+  // Use resolve() not join() so absolute workdir replaces workspace (mirrors Python os.path.join behaviour)
+  const base = workdir ? (isAbsolute(workdir) ? workdir : join(workspace, workdir)) : workspace;
   const full = safeResolve(base, filename) ?? safeResolve(workspace, filename);
   if (!full) {
     console.warn(`[write_code] BLOCKED path=${filename} (outside workspace/tmp)`);
@@ -136,6 +137,8 @@ function hRunSubprocess(cmd: Command, workspace: string): ActionResult {
   if (!command) {
     return { request_id: cmd.request_id, status: 'error', error: 'command is required' };
   }
+  // Ensure workspace exists before spawning — cwd must exist or spawn throws ENOENT
+  mkdirSync(workspace, { recursive: true });
   console.log(`[run_subprocess] cwd=${workspace} cmd=${command.slice(0, 120)}`);
   const jobId = randomUUID();
   const proc = spawn(command, { shell: true, cwd: workspace });

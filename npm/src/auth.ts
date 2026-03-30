@@ -1,13 +1,4 @@
 import { createHash } from 'crypto';
-import { readFileSync } from 'fs';
-import { MCP_AUTH_FILE } from './paths.js';
-import { NEO_API_URL } from './config.js';
-
-interface McpAuth {
-  access_token?: string;
-  refresh_token?: string;
-  username?: string;
-}
 
 /**
  * Derive a stable deployment UUID from an API key.
@@ -34,63 +25,7 @@ export function deriveDeploymentId(secretKey: string): string {
   ].join('-');
 }
 
-export function loadMcpAuth(): McpAuth {
-  try {
-    return JSON.parse(readFileSync(MCP_AUTH_FILE, 'utf8')) as McpAuth;
-  } catch {
-    return {};
-  }
-}
-
-/**
- * Return the best available auth token.
- * Priority: OAuth access_token from mcp_auth.json → NEO_SECRET_KEY env var.
- */
+/** Return the NEO_SECRET_KEY API key used for all requests. */
 export function getAuthToken(): string {
-  const auth = loadMcpAuth();
-  const token = auth.access_token ?? '';
-  const invalid = ['', '\\', 'null', 'undefined'];
-  if (!invalid.includes(token) && token.length >= 10) {
-    return token;
-  }
   return process.env['NEO_SECRET_KEY'] ?? '';
-}
-
-export function saveMcpAuth(data: McpAuth): void {
-  const { writeFileSync, mkdirSync } = require('fs') as typeof import('fs');
-  const { dirname } = require('path') as typeof import('path');
-  mkdirSync(dirname(MCP_AUTH_FILE), { recursive: true });
-  writeFileSync(MCP_AUTH_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
-}
-
-export async function refreshAuthToken(): Promise<string> {
-  const auth = loadMcpAuth();
-  const { refresh_token, username } = auth;
-  if (!refresh_token || !username) return '';
-
-  // Auth refresh uses the same base URL as the API
-  const authUrl = process.env['NEO_AUTH_URL'] ?? NEO_API_URL;
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10_000);
-    const res = await fetch(`${authUrl}/auth/refresh-token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, refreshToken: refresh_token }),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    if (res.ok) {
-      const data = await res.json() as Record<string, string>;
-      const newToken = data['token'] ?? data['access_token'] ?? data['accessToken'] ?? '';
-      if (newToken) {
-        saveMcpAuth({ ...auth, access_token: newToken });
-        return newToken;
-      }
-    }
-  } catch {
-    // network error or abort — fall through
-  }
-  return '';
 }

@@ -12,6 +12,7 @@ pip install neo-mcp
 neo-mcp daemon &
 ```
 
+
 **After:**
 ```bash
 npx neo-mcp-daemon &
@@ -98,7 +99,7 @@ function deriveDeploymentId(secretKey: string): string {
 
 Same UUID as the hosted MCP server and Python daemon — routing works automatically, no headers needed.
 
-Once the backend poll endpoint accepts API keys, OAuth/login is never needed. Until then, read OAuth token from `~/.neo/daemon/mcp_auth.json` as fallback (written by VS Code extension or `neo-mcp login`).
+The daemon authenticates with `NEO_SECRET_KEY` directly — no OAuth, no login step.
 
 ---
 
