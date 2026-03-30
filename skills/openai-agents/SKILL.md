@@ -270,6 +270,4 @@ orchestrator = Agent(
 - Task execution requires a daemon on the user's machine. Options (simplest first):
   1. **Neo VS Code/Cursor extension** — handles everything automatically, zero setup
   2. **Agent auto-start** — agents with terminal access offer to run `neo-mcp daemon &` on first task (user approves)
-  3. **`neo-mcp login`** — runs browser OAuth and auto-starts daemon (needed until backend adds API key support to the poll endpoint)
-- Once the backend poll endpoint accepts API keys, no login or manual daemon step is needed — the daemon authenticates with `NEO_SECRET_KEY` directly.
 - Get your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.

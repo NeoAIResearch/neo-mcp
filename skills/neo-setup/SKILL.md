@@ -14,20 +14,11 @@ fixing auth issues, or starting the daemon.
 
 ## How Neo auth works
 
-Neo MCP has two layers:
+Everything uses a single credential: `NEO_SECRET_KEY` (`sk-v1-...`).
 
-| Layer | Credential | Used for |
-|---|---|---|
-| MCP server | `NEO_SECRET_KEY` (`sk-v1-...`) | Task submission, status, messages — all thread APIs |
-| Daemon | API key (pending) / OAuth token (current) | Polling the backend to receive execution commands |
+The API key is used for all requests — task submission, status polling, messages, and daemon polling. No OAuth, no browser login, no separate daemon credential.
 
-**The MCP server only needs the API key.** The daemon currently needs OAuth — this is a known
-limitation. Once the backend adds API key support to the poll endpoint (path TBD), `neo-mcp login`
-becomes fully optional and the setup collapses to a single command.
-
-**Zero-friction path (works today for agent users):** Agents with terminal access (Claude Code,
-Cursor, Codex CLI, Windsurf) will automatically offer to run `neo-mcp daemon &` on first task
-submission. The user just clicks yes. OAuth is still needed for the daemon until the backend change ships.
+Agents with terminal access (Claude Code, Cursor, Codex CLI, Windsurf) automatically offer to start the daemon on first task submission — the user just clicks yes.
 
 ---
 
@@ -54,13 +45,7 @@ Your agent will detect no daemon is running and offer to start it:
 ```
 Neo daemon needs to run locally. Can I start it?  [Yes / No]
 ```
-Click **Yes** — the daemon starts and the task proceeds.
-
-> **Note:** Until the backend adds API key support to the poll endpoint, the daemon needs
-> a one-time OAuth login. If the daemon fails with an auth error, run:
-> ```bash
-> neo-mcp login   # opens browser — daemon starts automatically after login
-> ```
+Click **Yes** — the daemon starts with your API key and the task proceeds.
 
 ### Alternative: VS Code/Cursor extension
 Install the Neo extension and log in. It manages the daemon completely automatically — no manual steps, no CLI.
@@ -70,15 +55,15 @@ Install the Neo extension and log in. It manages the daemon completely automatic
 ## Troubleshooting
 
 ### `DAEMON_NOT_RUNNING` on first task
-Agent will offer to start the daemon — click yes. If running a web client (ChatGPT, Claude.ai):
+Agent will offer to start the daemon — click yes. If running a web client (ChatGPT, Claude.ai), run manually:
 ```bash
-neo-mcp login   # opens browser, daemon starts on success
+NEO_SECRET_KEY=sk-v1-... neo-mcp daemon &
 ```
 
 ### Daemon exits immediately / auth error
-The poll endpoint requires OAuth until the backend change ships:
+Check that `NEO_SECRET_KEY` is set correctly:
 ```bash
-neo-mcp login   # refreshes token, daemon starts automatically after login
+echo $NEO_SECRET_KEY   # should print sk-v1-...
 ```
 
 ### `Failed to connect` in `claude mcp list`
@@ -92,13 +77,13 @@ Re-check your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API
 
 ---
 
-## Final state (after backend poll endpoint change ships)
+## Current state
 
 ```bash
-# One command. Done. No login, no daemon, no deployment ID.
+# One command. Done. No login, no daemon startup needed manually.
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
   --header "Authorization: Bearer sk-v1-your-key"
 ```
 
-Submit a task → agent auto-starts daemon → daemon polls with API key → everything works.
+Submit a task → agent auto-starts daemon → daemon polls with `NEO_SECRET_KEY` → everything works.

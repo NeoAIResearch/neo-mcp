@@ -4,14 +4,13 @@
  * Polls GET /v2/poll/{deployment_id} for commands and dispatches them via executor.ts.
  * Sends results back via POST /v2/poll/response.
  *
- * Auth priority: OAuth token from mcp_auth.json → NEO_SECRET_KEY env var.
+ * Auth: NEO_SECRET_KEY API key used as Bearer token for all requests.
  * Same wire protocol as the Python daemon.
  */
 
 import { appendFileSync, mkdirSync, writeFileSync } from 'fs';
-import { homedir } from 'os';
 import { resolve } from 'path';
-import { deriveDeploymentId, getAuthToken, loadMcpAuth, refreshAuthToken, saveMcpAuth } from './auth.js';
+import { deriveDeploymentId, getAuthToken } from './auth.js';
 import { NEO_API_URL } from './config.js';
 import { Command, dispatch } from './executor.js';
 import {
@@ -77,35 +76,27 @@ async function pollBackend(
   depId: string,
   token: string,
 ): Promise<{ commands: Command[]; token: string }> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15_000);
-      const res = await fetch(
-        `${NEO_API_URL}/v2/poll/${depId}?max_messages=10&wait_time=5`,
-        { headers: { 'Authorization': `Bearer ${token}` }, signal: controller.signal },
-      );
-      clearTimeout(timeout);
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    const res = await fetch(
+      `${NEO_API_URL}/v2/poll/${depId}?max_messages=10&wait_time=5`,
+      { headers: { 'Authorization': `Bearer ${token}` }, signal: controller.signal },
+    );
+    clearTimeout(timeout);
 
-      if (res.status === 401 && attempt === 0) {
-        const newToken = await refreshAuthToken();
-        if (newToken) { token = newToken; continue; }
-        console.error(
-          'ERROR: Auth rejected (401). Check NEO_SECRET_KEY is correct, ' +
-          "or run 'neo-mcp login' to re-authenticate.",
-        );
-        return { commands: [], token };
-      }
-      if (res.status === 404 || !res.ok) return { commands: [], token };
-
-      const data = await res.json() as Command[] | { messages?: Command[] };
-      const commands = Array.isArray(data) ? data : (data.messages ?? []);
-      return { commands, token };
-    } catch {
+    if (res.status === 401) {
+      console.error('ERROR: Auth rejected (401). Check that NEO_SECRET_KEY is set correctly.');
       return { commands: [], token };
     }
+    if (res.status === 404 || !res.ok) return { commands: [], token };
+
+    const data = await res.json() as Command[] | { messages?: Command[] };
+    const commands = Array.isArray(data) ? data : (data.messages ?? []);
+    return { commands, token };
+  } catch {
+    return { commands: [], token };
   }
-  return { commands: [], token };
 }
 
 async function sendResponse(depId: string, token: string, response: Record<string, unknown>): Promise<void> {
@@ -127,15 +118,14 @@ async function sendResponse(depId: string, token: string, response: Record<strin
 // ---------------------------------------------------------------------------
 
 export async function runDaemon(opts: { workspace?: string; deploymentId?: string; signal?: AbortSignal } = {}): Promise<void> {
-  const ws = resolve(opts.workspace ?? homedir());
+  const ws = resolve(opts.workspace ?? process.cwd());
   const depId = opts.deploymentId ?? getOrCreateDeploymentId();
 
   let token = getAuthToken();
   if (!token) {
     console.error(
-      'ERROR: No auth token found.\n' +
-      'Set your API key:  export NEO_SECRET_KEY=sk-v1-...\n' +
-      "Or run 'neo-mcp login' to authenticate via browser OAuth.",
+      'ERROR: NEO_SECRET_KEY is not set.\n' +
+      'Set your API key:  export NEO_SECRET_KEY=sk-v1-...',
     );
     process.exit(1);
   }

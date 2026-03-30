@@ -1,10 +1,10 @@
 {
-  "name": "test-neo-mcp-daemon",
+  "name": "neo-mcp-daemon",
   "version": "1.0.1",
   "description": "Neo local execution daemon — runs AI/ML tasks locally, no Python required",
   "main": "dist/index.js",
   "bin": {
-    "test-neo-mcp-daemon": "bin/test-neo-mcp-daemon"
+    "neo-mcp-daemon": "bin/neo-mcp-daemon"
   },
   "scripts": {
     "build": "tsc",

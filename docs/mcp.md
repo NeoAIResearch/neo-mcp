@@ -89,7 +89,7 @@ Backend:  updates thread, marks step complete
 Daemon:   GET /v2/poll/de9d7297?wait_time=5   ← immediately polls again
 ```
 
-**This endpoint currently requires an OAuth token.** API keys (`sk-v1-...`) are rejected with 401. This is the single biggest blocker for the no-OAuth-login workflow.
+The daemon authenticates with `NEO_SECRET_KEY` as a Bearer token — the same API key used for all other Neo API requests.
 
 ---
 
@@ -172,23 +172,17 @@ server.py — neo_submit_task():
        GET /v2/thread/thread-messages → full output
 ```
 
-### What backend change is needed
+### Current auth
 
-`GET /v2/poll/{deployment_id}` and `POST /v2/poll/response` must accept API keys:
+`GET /v2/poll/{deployment_id}` and `POST /v2/poll/response` accept `NEO_SECRET_KEY` as a Bearer token — the same API key used for all other Neo endpoints. No OAuth required.
 
-```python
-# Today
-if not is_valid_oauth_token(bearer_token):
-    return HTTP_401("Unauthorized")
-
-# After change
-if not is_valid_oauth_token(bearer_token) and not is_valid_api_key(bearer_token):
-    return HTTP_401("Unauthorized")
-```
-
-### After the change — user experience
+### User experience
 
 ```bash
+# npx (primary — no install)
+claude mcp add --scope user neo --transport http https://mcpserver.heyneo.com/mcp --header "Authorization: Bearer sk-v1-..."
+
+# pip (alternative)
 pip install neo-mcp
 claude mcp add --scope user neo -e NEO_SECRET_KEY=sk-v1-... -- neo-mcp
 # Done. Daemon auto-starts on first task. No login, no browser, no UUID.
@@ -488,19 +482,7 @@ claude mcp add --scope user neo \
 
 ## Recommended Priority
 
-### 1. Backend: accept API key on `/v2/poll` (highest impact)
-
-Unlocks Path 1 and Path 2. Users with pip can run the daemon on any machine — SSH servers, headless boxes, CI/CD — with just their API key. No browser OAuth required.
-
-```python
-# Change on /v2/poll/{deployment_id} and /v2/poll/response
-if not is_valid_oauth_token(token) and not is_valid_api_key(token):
-    return HTTP_401("Unauthorized")
-```
-
-Result: `pip install neo-mcp && claude mcp add ... -e NEO_SECRET_KEY=sk-v1-...` works end-to-end.
-
-### 2. Extension: auto-configure on login (~15 lines)
+### 1. Extension: auto-configure on login (~15 lines)
 
 Extension calls `claude mcp add` with its UUID when the user logs in. Zero terminal commands for VS Code/Cursor users.
 
