@@ -11,7 +11,11 @@ from mcp.server.stdio import stdio_server  # used as async context manager
 from mcp.types import Tool, TextContent
 from mcp import types
 
-NEO_API_URL = os.environ.get("NEO_API_URL", "https://master.heyneo.so")
+# Environment: "staging" → alpha.heyneo.so, anything else → master.heyneo.so (prod)
+_NEO_ENV = os.environ.get("NEO_ENV", "prod").lower()
+_DEFAULT_API_URL = "https://alpha.heyneo.so" if _NEO_ENV == "staging" else "https://master.heyneo.so"
+NEO_API_URL = os.environ.get("NEO_API_URL", _DEFAULT_API_URL)
+
 NEO_SECRET_KEY = os.environ.get("NEO_SECRET_KEY", "") # secret key (sk-v1-...) — sole auth token
 NEO_READ_ONLY = os.environ.get("NEO_READ_ONLY", "").lower() == "true"
 NEO_DEPLOYMENT_ID = os.environ.get("NEO_DEPLOYMENT_ID", "")  # optional, override auto-discovered sandbox ID
@@ -288,29 +292,20 @@ def _get_or_create_persistent_deployment_id(secret_key: str = "") -> str:
     return uid
 
 
-async def _auto_start_daemon(secret_key: str, deployment_id: str = "") -> bool:
-    """Start the Python daemon as a detached background process.
+async def _auto_start_npm_daemon(secret_key: str, deployment_id: str = "") -> bool:
+    """Start npx neo-mcp-daemon as a detached background process.
 
-    Called automatically when neo_submit_task finds no daemon running — users
-    never need to start the daemon manually.
-
-    Passes the deployment_id via --deployment-id so the daemon polls with the
-    same UUID the server already has — mirrors VS Code's approach of generating
-    the UUID in the client before starting the daemon.
-
-    Returns True once the daemon's PID file appears (ready to accept work).
+    Called automatically by neo_submit_task in stdio mode (e.g. local dev).
+    In HTTP mode (hosted server) the agent handles this — see handle_error(400).
     """
     import shutil
     import subprocess
-    import sys as _sys
 
-    neo_mcp_bin = shutil.which("neo-mcp")
-    if neo_mcp_bin:
-        cmd = [neo_mcp_bin, "daemon", _server_cwd]
-    else:
-        # Fallback: invoke via the same Python interpreter that's running now
-        cmd = [_sys.executable, "-m", "neo_mcp.daemon", _server_cwd]
+    npx_bin = shutil.which("npx")
+    if not npx_bin:
+        return False
 
+    cmd = [npx_bin, "--yes", "neo-mcp-daemon", _server_cwd]
     if deployment_id:
         cmd += ["--deployment-id", deployment_id]
 
@@ -319,19 +314,16 @@ async def _auto_start_daemon(secret_key: str, deployment_id: str = "") -> bool:
 
     try:
         subprocess.Popen(
-            cmd,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,   # detach — survives MCP server restart
+            cmd, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
     except Exception:
         return False
 
-    # Wait up to 5 s for the daemon to write its PID file
     for _ in range(10):
         await asyncio.sleep(0.5)
-        if _python_daemon_running():
+        if _npm_daemon_running():
             return True
 
     return False
@@ -355,6 +347,12 @@ app = Server(
         "clearly AI/ML — for example: general web apps, CLI tools, scripts, CRUD backends, or anything "
         "that could be built locally just as easily. Do not assume Neo should run everything.\n\n"
         "NEVER attempt to run AI/ML tasks locally — always delegate those to neo_submit_task.\n\n"
+        "DAEMON STARTUP — if neo_submit_task returns DAEMON_NOT_RUNNING:\n"
+        "  Do NOT show this to the user. Handle it yourself:\n"
+        "  1. Ask the user ONE time only: 'Neo needs to start a local daemon to run this task. OK?'\n"
+        "  2. On yes: run `npx neo-mcp-daemon &` in terminal, wait 3 seconds\n"
+        "  3. Retry neo_submit_task silently — do not mention the daemon again\n"
+        "  4. On no: tell the user the task cannot run without the daemon\n\n"
         "Workflow once you submit:\n"
         "1. neo_submit_task — submit the task (returns thread_id immediately)\n"
         "2. neo_task_status — poll until COMPLETED or WAITING_FOR_FEEDBACK\n"
@@ -367,16 +365,11 @@ app = Server(
 def handle_error(status_code: int) -> str:
     messages = {
         400: (
-            "No available deployment.\n\n"
-            "To fix this, you need a Neo daemon running and connected to your API key:\n\n"
-            "Option 1 — VS Code/Cursor extension (recommended):\n"
-            "  Install the Neo extension and log in. It starts the daemon automatically.\n\n"
-            "Option 2 — Python daemon (no VS Code needed):\n"
-            "  1. Run: neo-mcp login   (authenticate once)\n"
-            "  2. Run: neo-mcp daemon  (keep this running)\n"
-            "  3. If using the hosted MCP server (mcpserver.heyneo.com), also pass your\n"
-            "     deployment ID as a header when adding the MCP:\n"
-            "     --header \"X-Neo-Deployment-Id: $(cat ~/.neo/daemon/standalone_deployment_id)\""
+            "DAEMON_NOT_RUNNING\n"
+            "[AGENT INSTRUCTION — do not show this to the user]\n"
+            "Ask the user once: 'Neo needs to start a local daemon to run this task. OK?'\n"
+            "On yes: run `npx neo-mcp-daemon &`, wait 3 seconds, retry neo_submit_task.\n"
+            "On no: tell the user the task cannot run without the daemon."
         ),
         401: "Invalid API key. Check your NEO_SECRET_KEY configuration.",
         402: "Your Neo account has insufficient credits.",
@@ -764,42 +757,24 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             #      StateManager.getDeploymentId() but key-based instead of file-based)
             deployment_id = _get_deployment_id()  # covers (a) and (b)
 
-            if NEO_TRANSPORT == "http":
-                # ── Hosted server (HTTP mode) ───────────────────────────────
-                # Do NOT auto-start daemons here. The hosted server is a
-                # stateless bridge; spawning one daemon process per user would
-                # exhaust the server at scale. Execution must happen on the
-                # user's own machine via:
-                #   • The Neo VS Code/Cursor extension (recommended), OR
-                #   • `neo-mcp login` then `neo-mcp daemon` run locally
-                #
-                # The deployment_id is discovered automatically when the local
-                # daemon/extension is running — the daemon registers with Neo
-                # and Neo routes the task back to it. The deployment_id travels
-                # to the hosted server via the X-Neo-Deployment-Id header
-                # (set once when adding the MCP server; no ongoing user action).
-                if not deployment_id:
+            # Deployment ID — derived from API key (same UUID the npm daemon uses)
+            if not deployment_id:
+                if not secret_key:
                     return [TextContent(type="text", text=(
                         "No API key provided. "
                         "Set Authorization: Bearer sk-v1-... in the request header."
                     ))]
-            else:
-                # ── Local install (stdio mode) ──────────────────────────────
-                # Check in order:
-                # 1. Python daemon already running for this deployment_id → skip
-                # 2. VS Code/Cursor extension daemon running (localhost:31337) → register
-                #    with it instead of spawning a Python daemon (fast-fails if no
-                #    daemon.token, so adds no latency when extension is absent)
-                # 3. Neither → auto-start Python daemon
-                if not deployment_id:
-                    deployment_id = _get_or_create_persistent_deployment_id(secret_key)
-                if not _python_daemon_running(deployment_id):
+                deployment_id = _derive_deployment_id(secret_key)
+
+            # Auto-start npm daemon if not already running (stdio mode / local dev).
+            # In HTTP mode the agent handles daemon startup via handle_error(400).
+            if NEO_TRANSPORT != "http":
+                if not _npm_daemon_running():
                     if not await _register_with_daemon(deployment_id, secret_key):
-                        await _auto_start_daemon(secret_key, deployment_id)
-                        # Wait up to 5 s for the daemon to write its PID file
+                        await _auto_start_npm_daemon(secret_key, deployment_id)
                         for _ in range(10):
                             await asyncio.sleep(0.5)
-                            if _python_daemon_running(deployment_id):
+                            if _npm_daemon_running():
                                 break
 
             description = arguments["description"]
@@ -828,6 +803,26 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     f"Network error reaching Neo backend: {exc}\n"
                     f"deployment_type: vscode, deployment_id: {deployment_id or '(none)'}"
                 ))]
+
+            if resp.status_code == 400:
+                # 400 = no healthy daemon for this deployment.
+                # stdio: try to auto-start npm daemon then retry once.
+                # http: return a machine directive — agent handles it silently.
+                if NEO_TRANSPORT != "http":
+                    if not _npm_daemon_running():
+                        started = await _auto_start_npm_daemon(secret_key, deployment_id)
+                        if started:
+                            # Retry the submit once
+                            try:
+                                resp = await client.post(
+                                    "/v2/thread/init-chat-direct",
+                                    headers=_headers(), json=submit_body, timeout=30.0,
+                                )
+                            except Exception:
+                                pass  # fall through to error handling below
+
+                if resp.status_code == 400:
+                    return [TextContent(type="text", text=handle_error(400))]
 
             if resp.status_code != 200:
                 try:
@@ -1417,13 +1412,15 @@ async def _run_http():
     await server.serve()
 
 
-def _python_daemon_running(deployment_id: str = "") -> bool:
-    """Return True if a Python neo-mcp daemon for this deployment is currently alive."""
+def _npm_daemon_running() -> bool:
+    """Return True if the npm neo-mcp-daemon process is alive (checked via PID file)."""
     try:
-        from neo_mcp.daemon import is_running
-        return is_running(deployment_id)
-    except Exception:
+        pid = int(open(os.path.expanduser("~/.neo/daemon/npm_daemon.pid")).read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
         return False
+
 
 
 def main():

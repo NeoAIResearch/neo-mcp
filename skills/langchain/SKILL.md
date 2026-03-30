@@ -268,5 +268,5 @@ chain = prompt | llm | StrOutputParser()
 ## Notes
 
 - `thread_id` is optional — the server auto-recovers the last active thread.
-- Task execution requires the **Neo VS Code/Cursor extension** running, or the **Neo Python daemon** started via `neo-mcp daemon` after `neo-mcp login`.
+- Task execution requires a daemon on the user's machine: install the **Neo VS Code/Cursor extension** (zero setup), or let an agent with terminal access start it automatically on first task, or run **`neo-mcp login`** (auto-starts daemon, needed until backend adds API key support to the poll endpoint).
 - Get your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.

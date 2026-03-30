@@ -6,7 +6,7 @@
 
 - Neo account with a secret key (`sk-v1-...`) — from [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys
 - Neo MCP connected to your editor — see [CLIENTS.md](CLIENTS.md) for setup instructions
-- For local task execution: either the Neo VS Code/Cursor extension, or nothing — the local daemon starts automatically when you submit your first task
+- For local task execution: either the Neo VS Code/Cursor extension (zero setup), or `neo-mcp login` (daemon starts automatically after login), or nothing — if no daemon is found your agent will offer to start one for you
 
 ---
 

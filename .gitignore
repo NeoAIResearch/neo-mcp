@@ -11,3 +11,7 @@ vscode_extension/
 test_demo/
 test_project/
 neo_artifacts/
+node_modules/
+*.pid
+image.png
+python/=42

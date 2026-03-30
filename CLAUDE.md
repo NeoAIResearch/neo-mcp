@@ -64,11 +64,11 @@ python3 python/src/neo_mcp/server.py
 # Or after pip install (from python/ directory):
 cd python && pip install -e . && neo-mcp
 
-# Authenticate for local daemon (opens browser OAuth flow)
-neo-mcp login
-
-# Start the Python daemon (for local file execution, after login)
+# Start the Python daemon manually (normally auto-started by the agent on first task)
 neo-mcp daemon
+
+# Optional: browser OAuth login (only needed if daemon poll endpoint still requires OAuth)
+neo-mcp login
 
 # Run unit tests (no key needed)
 python3 -m pytest python/tests/ -v
@@ -83,22 +83,15 @@ docker build -t neo-mcp-test ./python
 docker run -i --rm -e NEO_SECRET_KEY=your-secret \
   -v ~/.neo:/root/.neo:ro neo-mcp-test
 
-# Register with Claude Code (pip install)
+# Register with Claude Code (pip install — daemon auto-starts on first task)
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=your-secret \
   -- neo-mcp
 
-# Register with Claude Code (hosted HTTP server — with VS Code extension, daemon auto-discovered)
+# Register with Claude Code (hosted HTTP server — recommended, works for all editors)
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
   --header "Authorization: Bearer your-secret"
-
-# Register with Claude Code (hosted HTTP server — without VS Code extension)
-# First: neo-mcp login && neo-mcp daemon (then get your deployment UUID)
-claude mcp add --scope user neo \
-  --transport http https://mcpserver.heyneo.com/mcp \
-  --header "Authorization: Bearer your-secret" \
-  --header "X-Neo-Deployment-Id: $(cat ~/.neo/daemon/standalone_deployment_id)"
 
 # Register with Claude Code (Docker, after publish)
 claude mcp add --scope user neo \
@@ -123,52 +116,44 @@ claude mcp logs neo
 
 `neo_submit_task` always submits with `deployment_type: "vscode"`. The submission path:
 
-1. `_get_deployment_id()` — tries (in order): `X-Neo-Deployment-Id` header context var → `NEO_DEPLOYMENT_ID` env var → `_discover_sandbox_id()`
-2. If no deployment_id found: `_auto_start_daemon()` launches the Python daemon in the background, waits up to 5 s for it to write its sandboxId to `daemon.log`, then calls `_get_deployment_id()` again
-3. POSTs to `/v2/thread/init-chat-direct` with `deployment_type: "vscode"` and `deployment_id` if found (omitted if not)
-4. Returns `thread_id` immediately; background polling starts via `asyncio.create_task(_poll_task_bg(thread_id))`
+1. `_get_deployment_id()` — tries (in order): `X-Neo-Deployment-Id` header context var → `NEO_DEPLOYMENT_ID` env var → `_discover_sandbox_id()` → derives UUID from API key
+2. In stdio mode, if daemon not running: `_auto_start_daemon()` launches the Python daemon automatically
+3. In HTTP mode, if daemon not running: returns `DAEMON_NOT_RUNNING` message with `neo-mcp daemon &` command — the agent asks user permission and runs it
+4. POSTs to `/v2/thread/init-chat-direct` with `deployment_type: "vscode"` and `deployment_id`
+5. Returns `thread_id` immediately; background polling starts via `asyncio.create_task(_poll_task_bg(thread_id))`
 
-**Important:** A `deployment_id` is **required** for Neo to route the task to an active daemon. Submitting without one returns HTTP 400 "No healthy deployments available". The deployment ID identifies a daemon process actively polling `/v2/poll/{deployment_id}` — either the VS Code/Cursor extension daemon or the Python daemon. Sending a UUID with no daemon polling it causes a 30-second `ReadTimeout`.
+**Important:** A `deployment_id` is **required** for Neo to route the task to an active daemon. The deployment UUID is derived deterministically from the API key (`SHA-256(key)[:16]` formatted as UUID) — same key always produces the same UUID, no files or headers needed.
 
 ### Deployment ID discovery
 `_get_deployment_id()` checks (in priority order):
-1. `_ctx_deployment_id` context var — set from `X-Neo-Deployment-Id` request header (HTTP mode)
+1. `_ctx_deployment_id` context var — set from `X-Neo-Deployment-Id` request header (HTTP mode override)
 2. `NEO_DEPLOYMENT_ID` env var
 3. `_discover_sandbox_id()`:
-   a. Reads `~/.neo/daemon/daemon.log` line by line — takes the last `{"sandboxId": "<uuid>"}` entry
+   a. Reads `~/.neo/daemon/daemon.log` — takes the last `{"sandboxId": "<uuid>"}` entry
    b. Reads `~/.neo/daemon/standalone_deployment_id` — UUID persisted by the Python daemon on first run
    c. Falls back to `~/.neo/daemon/thread-workspaces.json`
-
-The VS Code/Cursor extension writes `daemon.log` when it starts up. The Python daemon writes `standalone_deployment_id` and `daemon.log` when it initializes.
+4. `_derive_deployment_id(secret_key)` — deterministic UUID from API key (always available when key is set)
 
 ### Hosted server vs local install — architecture split
 
-The hosted server (`mcpserver.heyneo.com`) is a **stateless bridge** — it translates MCP calls to Neo API requests but never runs daemons. Spawning one daemon per user would exhaust the server at scale (1000 users → 1000 polling processes).
+The hosted server (`mcpserver.heyneo.com`) is a **stateless bridge** — it translates MCP calls to Neo API requests but never runs daemons.
 
 **Execution always happens on the user's machine**, via:
-- The Neo VS Code/Cursor extension (recommended — handles everything automatically), OR
-- `neo-mcp login` + `neo-mcp daemon` running locally (no VS Code needed)
+- The Neo VS Code/Cursor extension (zero setup — handles everything automatically), OR
+- The Python daemon — started automatically by the agent on first task submission
 
-The daemon registers with Neo backend and polls `/v2/poll/{deployment_id}`. When the hosted server submits a task with that `deployment_id`, Neo routes it to the user's local daemon.
-
-**Deployment ID discovery for the hosted server:**
-Since the server can't read local files, the deployment ID must come from the `X-Neo-Deployment-Id` header — set once when adding the MCP server:
-
-```bash
-# After running: neo-mcp login && neo-mcp daemon
-claude mcp add --scope user neo \
-  --transport http https://mcpserver.heyneo.com/mcp \
-  --header "Authorization: Bearer your-secret" \
-  --header "X-Neo-Deployment-Id: $(cat ~/.neo/daemon/standalone_deployment_id)"
+**Agent-driven daemon start (HTTP mode):**
+When no daemon is found, `neo_submit_task` returns a `DAEMON_NOT_RUNNING` message with the exact command:
 ```
+neo-mcp daemon &
+```
+Agents with terminal access (Claude Code, Cursor, Windsurf, Codex CLI) will ask user permission and run it. The user just clicks yes — no manual terminal work required.
 
-The header is stored per-session in `_session_deployment_ids`, set into `_ctx_deployment_id` on every request, and takes highest priority in `_get_deployment_id()`.
-
-**VS Code extension users** don't need the header — the extension handles everything.
+**VS Code extension users** don't need any of this — the extension manages the daemon automatically.
 
 ### stdio mode (local pip install / Docker on user's machine)
 
-In stdio mode the server and daemon run on the same machine. `neo_submit_task` auto-starts the daemon if it's not running, using a key-derived UUID (`_derive_deployment_id(secret_key)`) — same UUID every time for the same API key, no files required. The daemon falls back to `NEO_SECRET_KEY` for polling auth if no OAuth token exists, so `neo-mcp login` is optional for local use.
+In stdio mode the server and daemon run on the same machine. `neo_submit_task` auto-starts the daemon silently if it's not running, using a key-derived UUID. No user action needed.
 
 ### Thread-ID based polling — the core loop
 After submission, `init-chat-direct` returns a `thread_id`. **All status and message queries use `thread_id`** — these APIs work with API key auth:
@@ -183,20 +168,19 @@ When the VS Code/Cursor extension daemon is running:
 - `_register_with_daemon(deployment_id, secret_key)` reads `~/.neo/daemon/daemon.token` and POSTs to `http://127.0.0.1:31337/register`
 - `_heartbeat_loop(deployment_id)` sends a keepalive every 60 s to prevent the daemon from evicting the registration
 
-When no daemon is running:
-- `_auto_start_daemon(secret_key)` spawns the Python daemon (`neo-mcp daemon <cwd>`) as a detached subprocess, waits up to 3 s for its PID file
+When no daemon is running (stdio mode):
+- `_auto_start_daemon(secret_key)` spawns the Python daemon (`neo-mcp daemon <cwd>`) as a detached subprocess, waits up to 5 s for its PID file
 
 ### Python daemon authentication (`src/neo_mcp/daemon.py`)
-The Python daemon polls `/v2/poll/{deployment_id}` which requires an **OAuth token**, not the `NEO_SECRET_KEY` API key.
 
-**Auth file:** `~/.neo/daemon/mcp_auth.json` — `{"access_token": "...", "refresh_token": "...", "username": "..."}`
+**Current state (pending backend change):** The daemon poll endpoint currently requires an OAuth token. The daemon reads `~/.neo/daemon/mcp_auth.json` written by `neo-mcp login` or the VS Code extension.
 
-This file is written by:
-- **`neo-mcp login`** (`src/neo_mcp/login.py`) — opens `https://heyneo.so/login?redirect=http://localhost:{port}/callback` in the browser, waits for the OAuth callback, then writes the token. Fallback: manual token paste prompt.
-- **VS Code/Cursor extension** — writes the file automatically when logged in via the extension UI.
+**Pending:** The backend team is adding API key support to the daemon poll endpoint (exact path TBD — likely `v2/thread/poll` or similar). Once shipped:
+- Daemon authenticates with `NEO_SECRET_KEY` directly — no OAuth, no login step
+- `neo-mcp login` becomes fully optional (only needed for OAuth-based token refresh)
+- Every workflow becomes zero-touch: add the MCP server once, submit tasks, daemon auto-starts
 
-The daemon exits with a clear error if no valid token is found: `"Run 'neo-mcp login' to authenticate"`.
-On 401 from the poll endpoint, the daemon calls `POST /auth/refresh-token` with `{username, refreshToken}` and retries once.
+Until that change ships, the daemon needs OAuth auth. `neo-mcp login` handles this and now **auto-starts the daemon** after successful login.
 
 ### Other design points
 - `NEO_READ_ONLY=true` strips all write tools at `list_tools()` time — only `neo_task_status`, `neo_task_plan`, `neo_get_messages`, and `neo_get_files` remain.
@@ -220,10 +204,11 @@ On 401 from the poll endpoint, the daemon calls `POST /auth/refresh-token` with 
 
 Auth on every request: `Authorization: Bearer $NEO_SECRET_KEY`
 
-## What does NOT work / known constraints
-- `/v2/poll/{deployment_id}` — requires OAuth token (browser login), not API keys. The VS Code/Cursor extension handles that side of polling using its own OAuth token. The Python daemon also polls this endpoint and requires the key to be exchanged for an OAuth token via the Neo auth flow.
-- Without the extension or Python daemon running, tasks still submit and track correctly via thread_id polling — but local file execution (writing files to your machine) depends on the daemon being active.
-- Do NOT send a fabricated or pinned `NEO_DEPLOYMENT_ID` unless it matches a real running sandbox — it causes a 30 s ReadTimeout.
+## Known constraints / pending backend changes
+
+- **Daemon poll endpoint requires OAuth (pending fix):** The endpoint the daemon polls to receive execution commands currently only accepts OAuth tokens, not API keys. Once the backend adds API key support (path TBD — likely `v2/thread/poll` or similar), `neo-mcp login` becomes unnecessary and the entire setup collapses to a single `claude mcp add` command.
+- Without the extension or Python daemon running, tasks submit and track correctly via thread_id polling — but local file execution depends on the daemon being active.
+- Do NOT send a fabricated `NEO_DEPLOYMENT_ID` unless it matches a real running sandbox — it causes a 30 s ReadTimeout.
 
 ## Docker / CI
 
