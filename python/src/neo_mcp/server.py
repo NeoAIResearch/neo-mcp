@@ -113,10 +113,7 @@ def _discover_sandbox_id() -> str:
     Sources (in priority order):
     1. daemon.log — sandboxId entries written by the extension or standalone setup
     2. standalone_deployment_id — UUID persisted by the Python daemon on first run
-    3. thread-workspaces.json — sandbox-to-workspace mapping
     """
-    cwd = os.getcwd()
-
     for log_name in ("daemon.log", "daemon.log.1"):
         log_path = os.path.expanduser(f"~/.neo/daemon/{log_name}")
         try:
@@ -142,18 +139,6 @@ def _discover_sandbox_id() -> str:
     except OSError:
         pass
 
-    ws_path = os.path.expanduser("~/.neo/daemon/thread-workspaces.json")
-    try:
-        with open(ws_path, "r", errors="ignore") as f:
-            workspaces: dict = json.load(f)
-        for sandbox_id, ws_dir in reversed(list(workspaces.items())):
-            if cwd == ws_dir or cwd.startswith(ws_dir.rstrip("/") + "/"):
-                return sandbox_id
-        if workspaces:
-            return list(workspaces.keys())[-1]
-    except (OSError, ValueError):
-        pass
-
     return ""
 
 
@@ -163,16 +148,16 @@ def _get_deployment_id() -> str:
     Priority:
     1. Per-request X-Neo-Deployment-Id header (HTTP mode — set by context var)
     2. NEO_DEPLOYMENT_ID env var
-    3. VS Code/Cursor extension daemon.log
-    4. Python daemon standalone_deployment_id file
-    5. thread-workspaces.json
-    6. Derived from API key — both the hosted server and the user's daemon compute
-       the same UUID from the same NEO_SECRET_KEY, so no header or file needed.
+    3. Derived from API key — primary path for npm daemon routing
+    4. VS Code/Cursor extension daemon.log
+    5. Python daemon standalone_deployment_id file (legacy fallback)
     """
-    if dep := _ctx_deployment_id.get() or NEO_DEPLOYMENT_ID or _discover_sandbox_id():
+    if dep := _ctx_deployment_id.get() or NEO_DEPLOYMENT_ID:
         return dep
     sk = _ctx_secret_key.get() or NEO_SECRET_KEY
-    return _derive_deployment_id(sk) if sk else ""
+    if sk:
+        return _derive_deployment_id(sk)
+    return _discover_sandbox_id()
 
 
 async def _heartbeat_loop(deployment_id: str) -> None:
@@ -313,6 +298,10 @@ async def _auto_start_npm_daemon(secret_key: str, deployment_id: str = "", works
     env = os.environ.copy()
     env["NEO_SECRET_KEY"] = secret_key
 
+    # Avoid spawning duplicates if the target deployment is already alive.
+    if _npm_daemon_running(deployment_id):
+        return True
+
     try:
         subprocess.Popen(
             cmd, env=env,
@@ -324,7 +313,7 @@ async def _auto_start_npm_daemon(secret_key: str, deployment_id: str = "", works
 
     for _ in range(10):
         await asyncio.sleep(0.5)
-        if _daemon_running():
+        if _npm_daemon_running(deployment_id):
             return True
 
     return False
@@ -805,13 +794,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # Auto-start npm daemon if not already running (stdio mode / local dev).
             # In HTTP mode the agent handles daemon startup via handle_error(400).
             if NEO_TRANSPORT != "http":
-                if not _npm_daemon_running():
-                    if not await _register_with_daemon(deployment_id, secret_key):
-                        await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
-                        for _ in range(10):
-                            await asyncio.sleep(0.5)
-                            if _npm_daemon_running():
-                                break
+                # Try local extension registration first; if unavailable, ensure a daemon
+                # is running for this specific deployment ID.
+                registered = await _register_with_daemon(deployment_id, secret_key)
+                if not registered and not _npm_daemon_running(deployment_id):
+                    await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
+                    for _ in range(10):
+                        await asyncio.sleep(0.5)
+                        if _npm_daemon_running(deployment_id):
+                            break
 
             prefix = f"Working directory: {workspace}\n\nCreate all files inside this directory.\n\n"
             message = f"{prefix}{description}"
@@ -841,17 +832,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # stdio: try to auto-start npm daemon then retry once.
                 # http: return a machine directive — agent handles it silently.
                 if NEO_TRANSPORT != "http":
-                    if not _npm_daemon_running():
-                        started = await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
-                        if started:
-                            # Retry the submit once
-                            try:
-                                resp = await client.post(
-                                    "/v2/thread/init-chat-direct",
-                                    headers=_headers(), json=submit_body, timeout=30.0,
-                                )
-                            except Exception:
-                                pass  # fall through to error handling below
+                    # Retry path must handle deployment-ID mismatch, not only daemon absence.
+                    started = await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
+                    if started:
+                        # Retry the submit once
+                        try:
+                            resp = await client.post(
+                                "/v2/thread/init-chat-direct",
+                                headers=_headers(), json=submit_body, timeout=30.0,
+                            )
+                        except Exception:
+                            pass  # fall through to error handling below
 
                 if resp.status_code == 400:
                     return [TextContent(type="text", text=handle_error(400))]
@@ -1514,20 +1505,27 @@ async def _run_http():
     await server.serve()
 
 
-def _daemon_running() -> bool:
-    """Return True if any Neo daemon process is alive (npm or Python)."""
+def _daemon_running(deployment_id: str = "") -> bool:
+    """Return True if a Neo daemon process is alive.
+
+    If deployment_id is provided, checks that deployment-specific PID file first.
+    """
     pid_files = [
         os.path.expanduser("~/.neo/daemon/npm_daemon.pid"),
         os.path.expanduser("~/.neo/daemon/python_daemon.pid"),
     ]
+    if deployment_id:
+        dep_pid = os.path.expanduser(f"~/.neo/daemon/daemon_{deployment_id[:8]}.pid")
+        pid_files = [dep_pid]
     # Also check per-deployment PID files written by the Python daemon
     daemon_dir = os.path.expanduser("~/.neo/daemon")
-    try:
-        for name in os.listdir(daemon_dir):
-            if name.startswith("daemon_") and name.endswith(".pid"):
-                pid_files.append(os.path.join(daemon_dir, name))
-    except OSError:
-        pass
+    if not deployment_id:
+        try:
+            for name in os.listdir(daemon_dir):
+                if name.startswith("daemon_") and name.endswith(".pid"):
+                    pid_files.append(os.path.join(daemon_dir, name))
+        except OSError:
+            pass
     for pid_path in pid_files:
         try:
             pid = int(open(pid_path).read().strip())
@@ -1538,9 +1536,30 @@ def _daemon_running() -> bool:
     return False
 
 
-# Keep old name as alias so nothing else breaks
-def _npm_daemon_running() -> bool:
-    return _daemon_running()
+def _npm_daemon_running(deployment_id: str = "") -> bool:
+    """Return True only when the npm daemon process is alive.
+
+    deployment_id-aware checks ensure we don't confuse a legacy Python daemon
+    with the npm daemon primary path.
+    """
+    npm_pid_path = os.path.expanduser("~/.neo/daemon/npm_daemon.pid")
+
+    try:
+        npm_pid = int(open(npm_pid_path).read().strip())
+        os.kill(npm_pid, 0)
+    except (OSError, ValueError):
+        return False
+
+    if not deployment_id:
+        return True
+
+    dep_pid_path = os.path.expanduser(f"~/.neo/daemon/daemon_{deployment_id[:8]}.pid")
+    try:
+        dep_pid = int(open(dep_pid_path).read().strip())
+        os.kill(dep_pid, 0)
+        return dep_pid == npm_pid
+    except (OSError, ValueError):
+        return False
 
 
 

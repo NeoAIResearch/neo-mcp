@@ -6,6 +6,7 @@ export default defineConfig({
     environment: 'node',
     globals: false,
     isolate: true,
+    setupFiles: ['tests/setup-env.ts'],
     // Each test file gets fresh module state
     pool: 'forks',
     testTimeout: 10_000,

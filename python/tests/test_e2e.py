@@ -103,7 +103,10 @@ import mcp.types as mcp_types
 
 def _set_key():
     import neo_mcp.server as srv
-    srv.NEO_SECRET_KEY = NEO_SECRET_KEY
+    # Keep existing in-process test key when no real key is provided.
+    # This avoids mutating global module state in ways that break later tests.
+    if NEO_SECRET_KEY:
+        srv.NEO_SECRET_KEY = NEO_SECRET_KEY
 
 def call_tool(name: str, arguments: dict | None = None):
     import neo_mcp.server as srv

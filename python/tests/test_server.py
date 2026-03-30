@@ -307,11 +307,11 @@ class TestDiscoverSandboxId(unittest.TestCase):
         result = srv._discover_sandbox_id()
         self.assertEqual(result, uid2)
 
-    def test_falls_back_to_workspaces_json(self):
+    def test_does_not_read_workspaces_json(self):
         uid = "33333333-3333-3333-3333-333333333333"
         self._write_workspaces({uid: "/some/workspace"})
         result = srv._discover_sandbox_id()
-        self.assertEqual(result, uid)
+        self.assertEqual(result, "")
 
     def test_returns_empty_when_no_files(self):
         result = srv._discover_sandbox_id()
@@ -322,15 +322,13 @@ class TestDiscoverSandboxId(unittest.TestCase):
         result = srv._discover_sandbox_id()
         self.assertEqual(result, "")
 
-    def test_daemon_log_parse_error_falls_back(self):
-        # Corrupt log but valid workspaces
-        uid = "44444444-4444-4444-4444-444444444444"
+    def test_daemon_log_parse_error_returns_empty_without_standalone(self):
         self._write_log(["THIS IS NOT JSON AT ALL"])
-        self._write_workspaces({uid: "/workspace"})
+        self._write_workspaces({"44444444-4444-4444-4444-444444444444": "/workspace"})
         result = srv._discover_sandbox_id()
-        self.assertEqual(result, uid)
+        self.assertEqual(result, "")
 
-    def test_prefers_log_over_workspaces(self):
+    def test_log_entry_wins_even_if_workspaces_file_exists(self):
         uid_log = "55555555-5555-5555-5555-555555555555"
         uid_ws = "66666666-6666-6666-6666-666666666666"
         self._write_log([f'{{"sandboxId": "{uid_log}"}}'])
@@ -432,9 +430,11 @@ class TestVscodeDaemonDeploymentId(unittest.TestCase):
 class TestGetDeploymentId(unittest.TestCase):
     def setUp(self):
         self._orig = srv.NEO_DEPLOYMENT_ID
+        self._orig_key = srv.NEO_SECRET_KEY
 
     def tearDown(self):
         srv.NEO_DEPLOYMENT_ID = self._orig
+        srv.NEO_SECRET_KEY = self._orig_key
 
     def test_env_override_takes_priority(self):
         srv.NEO_DEPLOYMENT_ID = "env-override-id"
@@ -442,8 +442,17 @@ class TestGetDeploymentId(unittest.TestCase):
             result = srv._get_deployment_id()
         self.assertEqual(result, "env-override-id")
 
-    def test_falls_back_to_discovery(self):
+    def test_key_derived_takes_priority_over_discovery(self):
         srv.NEO_DEPLOYMENT_ID = ""
+        srv.NEO_SECRET_KEY = "sk-v1-priority-test"
+        with patch("neo_mcp.server._discover_sandbox_id", return_value="discovered-id"):
+            result = srv._get_deployment_id()
+        self.assertRegex(result, r"^[a-f0-9\-]{36}$")
+        self.assertNotEqual(result, "discovered-id")
+
+    def test_falls_back_to_discovery_when_no_key(self):
+        srv.NEO_DEPLOYMENT_ID = ""
+        srv.NEO_SECRET_KEY = ""
         with patch("neo_mcp.server._discover_sandbox_id", return_value="discovered-id"):
             result = srv._get_deployment_id()
         self.assertEqual(result, "discovered-id")
@@ -481,6 +490,45 @@ class TestGetDeploymentId(unittest.TestCase):
             self.assertNotEqual(result, result3)
         finally:
             srv.NEO_SECRET_KEY = orig_key
+
+
+class TestNpmDaemonRunning(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._patch = patch(
+            "neo_mcp.server.os.path.expanduser",
+            side_effect=lambda p: p.replace("~", self._tmpdir),
+        )
+        self._patch.start()
+        os.makedirs(os.path.join(self._tmpdir, ".neo", "daemon"), exist_ok=True)
+        self._daemon_dir = os.path.join(self._tmpdir, ".neo", "daemon")
+
+    def tearDown(self):
+        self._patch.stop()
+
+    def _write_pid(self, name: str, pid: int):
+        with open(os.path.join(self._daemon_dir, name), "w") as f:
+            f.write(str(pid))
+
+    def test_false_when_only_legacy_pid_exists(self):
+        dep = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        self._write_pid("daemon_aaaaaaaa.pid", 1234)
+        with patch("neo_mcp.server.os.kill", return_value=None):
+            self.assertFalse(srv._npm_daemon_running(dep))
+
+    def test_true_when_npm_and_deployment_pid_match(self):
+        dep = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        self._write_pid("npm_daemon.pid", 4321)
+        self._write_pid("daemon_aaaaaaaa.pid", 4321)
+        with patch("neo_mcp.server.os.kill", return_value=None):
+            self.assertTrue(srv._npm_daemon_running(dep))
+
+    def test_false_when_npm_and_deployment_pid_differ(self):
+        dep = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        self._write_pid("npm_daemon.pid", 1111)
+        self._write_pid("daemon_aaaaaaaa.pid", 2222)
+        with patch("neo_mcp.server.os.kill", return_value=None):
+            self.assertFalse(srv._npm_daemon_running(dep))
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +892,7 @@ class TestNeoSubmitTask(unittest.TestCase):
         self.assertIn("tid-no-ext", text_of(result))
 
     def test_npm_daemon_already_running_no_restart(self):
-        """If npm daemon is already running, skip _register_with_daemon and auto-start."""
+        """If daemon already running for deployment, skip auto-start."""
         resp_ok = make_response(200, {"thread_id": "tid-already-running"})
         mock_daemon = AsyncMock()
         mock_register = AsyncMock(return_value=False)
@@ -860,7 +908,7 @@ class TestNeoSubmitTask(unittest.TestCase):
             call_tool("neo_submit_task", {"description": "train model"})
 
         mock_daemon.assert_not_called()
-        mock_register.assert_not_called()  # Short-circuits before trying extension
+        mock_register.assert_called_once()
 
     def test_stale_daemon_log_does_not_block_autostart(self):
         """Stale sandboxId in daemon.log must NOT prevent daemon auto-start.

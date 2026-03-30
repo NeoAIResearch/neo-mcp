@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+
 import { deriveDeploymentId } from '../src/auth.js';
 import { pidFileForDeployment, DAEMON_LOG, NPM_PID_FILE } from '../src/paths.js';
 import { runDaemon } from '../src/daemon.js';
