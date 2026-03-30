@@ -1,34 +1,36 @@
-# Neo MCP — Required Backend Change
+# Neo MCP — Pending Backend Change
 
-One backend change: accept the API key on `/v2/poll`.
+One backend change needed to complete the zero-friction setup experience.
 
 ---
 
 ## The problem
 
-When `neo-mcp daemon` runs with only `NEO_SECRET_KEY` set (no OAuth login), it sends:
+When `neo-mcp daemon` runs with only `NEO_SECRET_KEY` set (no OAuth login), it polls the execution command endpoint:
 
 ```
-GET /v2/poll/de9d7297-580c-587c-b0e4-7ebb0fe7314c
+GET <daemon-poll-endpoint>/<deployment_id>
 Authorization: Bearer sk-v1-a63a...
 ```
 
 The backend returns 401. The daemon cannot receive execution commands. Tasks submitted with this deployment_id time out.
 
-**This is the only thing blocking the no-extension workflow.**
+**This is the only thing blocking fully zero-touch setup.**
 
 ---
 
-## What `/v2/poll` does
+## What the daemon poll endpoint does
 
-The backend delivers execution commands through `/v2/poll/{deployment_id}`. When a user submits a task:
+The backend delivers execution commands through the poll endpoint. When a user submits a task:
 
 1. `POST /v2/thread/init-chat-direct` — routes task to `deployment_id` ✅ works with API key
 2. Backend queues commands for the daemon (run this script, write this file, etc.)
-3. Daemon picks up commands via `GET /v2/poll/{deployment_id}` ❌ 401 with API key
-4. Daemon executes and replies via `POST /v2/poll/response` ❌ 401 with API key
+3. Daemon picks up commands via `GET <poll-endpoint>/<deployment_id>` ❌ 401 with API key
+4. Daemon executes and replies via `POST <poll-response-endpoint>` ❌ 401 with API key
 
-Steps 1, status polling (`/v2/thread/status`), and message retrieval (`/v2/thread/thread-messages`) all work with the API key today. The poll endpoint is the only exception.
+Steps 1, status polling (`/v2/thread/status`), and message retrieval (`/v2/thread/thread-messages`) all work with the API key today. The daemon poll endpoint is the only exception.
+
+> **Note:** The exact endpoint path is TBD — likely `v2/thread/poll` or similar. Update this doc when confirmed.
 
 ---
 
@@ -44,9 +46,9 @@ if not is_valid_oauth_token(bearer_token) and not is_valid_api_key(bearer_token)
     return HTTP_401("Unauthorized")
 ```
 
-Two endpoints:
-- `GET /v2/poll/{deployment_id}`
-- `POST /v2/poll/response`
+Two endpoints need this change:
+- `GET <daemon-poll-endpoint>/{deployment_id}`
+- `POST <daemon-poll-response-endpoint>`
 
 ---
 
@@ -62,19 +64,18 @@ Knowing the UUID proves you hold the API key. It's 128-bit, not guessable, and d
 
 ---
 
-## What works after this change
+## Final UX once this ships
 
 ```bash
-# Terminal 1: start daemon with just the API key — no login, no OAuth
-NEO_SECRET_KEY=sk-v1-... neo-mcp daemon &
-
-# Terminal 2: add MCP server — no X-Neo-Deployment-Id header needed
+# One command. That's it.
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
   --header "Authorization: Bearer sk-v1-..."
 
-# Done. Submit tasks. They execute locally via the daemon.
+# Submit a task — agent auto-starts daemon, daemon polls with API key, everything works.
 ```
+
+No `neo-mcp login`. No `neo-mcp daemon`. No deployment ID header. No OAuth.
 
 ---
 
@@ -83,8 +84,9 @@ claude mcp add --scope user neo \
 | Workflow | Works today? |
 |---|---|
 | VS Code/Cursor extension | ✅ Extension polls with its own OAuth token |
-| `pip install` + `neo-mcp login` + `neo-mcp daemon` | ✅ Daemon has OAuth token |
-| `pip install` + `NEO_SECRET_KEY` + `neo-mcp daemon` (no login) | ❌ 401 on `/v2/poll` |
-| Headless / SSH server | ❌ OAuth browser callback never fires |
+| `pip install` + `neo-mcp login` | ✅ Login auto-starts daemon; daemon has OAuth token |
+| Agent with terminal (Claude Code, Cursor, Codex CLI, Windsurf) | ✅ Agent runs `neo-mcp daemon &` on first task (user approves) — still needs login for OAuth |
+| `pip install` + API key only + `neo-mcp daemon` (no login) | ❌ 401 on poll endpoint |
+| Headless / SSH server (no browser) | ❌ OAuth browser callback cannot fire |
 
-After the change: the bottom two rows become ✅.
+After the poll endpoint change: **all rows become ✅** and `neo-mcp login` is fully optional.

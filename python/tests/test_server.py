@@ -128,7 +128,8 @@ class TestHandleError(unittest.TestCase):
 
     def test_400_deployment_message(self):
         msg = srv.handle_error(400)
-        self.assertIn("deployment", msg.lower())
+        self.assertIn("daemon", msg.lower())
+        self.assertIn("npx neo-mcp-daemon", msg)
 
     def test_all_codes_return_nonempty_string(self):
         for code in [400, 401, 402, 403, 404, 429, 500, 502, 503, 504]:
@@ -664,7 +665,7 @@ class TestNeoSubmitTask(unittest.TestCase):
         resp_ok = make_response(200, {"thread_id": "tid-submit-1"})
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-123"), \
-             patch("neo_mcp.server._auto_start_daemon", new_callable=AsyncMock), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
             ctx, client = make_async_client({"DEFAULT": resp_ok})
@@ -678,7 +679,7 @@ class TestNeoSubmitTask(unittest.TestCase):
         resp_400 = make_response(400, {"detail": "No healthy deployments"})
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-123"), \
-             patch("neo_mcp.server._auto_start_daemon", new_callable=AsyncMock), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
             ctx, client = make_async_client({"DEFAULT": resp_400})
@@ -686,14 +687,14 @@ class TestNeoSubmitTask(unittest.TestCase):
             result = call_tool("neo_submit_task", {"description": "train a model"})
 
         txt = text_of(result)
-        self.assertIn("400", txt)
-        self.assertIn("deployment", txt.lower())
+        self.assertIn("DAEMON_NOT_RUNNING", txt)
+        self.assertIn("npx neo-mcp-daemon", txt)
 
     def test_submit_401_returns_invalid_key_error(self):
         resp_401 = make_response(401, {"detail": "Unauthorized"})
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-123"), \
-             patch("neo_mcp.server._auto_start_daemon", new_callable=AsyncMock), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
             ctx, _ = make_async_client({"DEFAULT": resp_401})
@@ -707,7 +708,7 @@ class TestNeoSubmitTask(unittest.TestCase):
         resp_ok = make_response(200, {"thread_id": "tid-persist"})
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-123"), \
-             patch("neo_mcp.server._auto_start_daemon", new_callable=AsyncMock), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
             ctx, _ = make_async_client({"DEFAULT": resp_ok})
@@ -717,11 +718,11 @@ class TestNeoSubmitTask(unittest.TestCase):
         self.assertEqual(srv._load_thread_id(), "tid-persist")
 
     def test_submit_no_deployment_id_still_works(self):
-        """When no deployment found, submit_body omits deployment_id — Neo returns 200."""
+        """When no deployment found, key-derived UUID is used — Neo returns 200."""
         resp_ok = make_response(200, {"thread_id": "tid-no-dep"})
 
         with patch("neo_mcp.server._get_deployment_id", return_value=""), \
-             patch("neo_mcp.server._auto_start_daemon", new_callable=AsyncMock, return_value=False), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
             ctx, mock_client = make_async_client({"DEFAULT": resp_ok})
@@ -747,7 +748,7 @@ class TestNeoSubmitTask(unittest.TestCase):
         ctx.__aexit__ = AsyncMock(return_value=False)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-abc"), \
-             patch("neo_mcp.server._auto_start_daemon", new_callable=AsyncMock), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
              patch("asyncio.create_task"):
             call_tool("neo_submit_task", {"description": "train model"})
@@ -759,7 +760,7 @@ class TestNeoSubmitTask(unittest.TestCase):
         import httpx as _httpx
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-123"), \
-             patch("neo_mcp.server._auto_start_daemon", new_callable=AsyncMock), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
 
@@ -778,7 +779,7 @@ class TestNeoSubmitTask(unittest.TestCase):
         resp_ok = make_response(200, {"thread_id": "tid-wait"})
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-123"), \
-             patch("neo_mcp.server._auto_start_daemon", new_callable=AsyncMock), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"), \
              patch("asyncio.sleep", new_callable=AsyncMock):
@@ -805,15 +806,15 @@ class TestNeoSubmitTask(unittest.TestCase):
     # -- VS Code extension / daemon auto-start routing tests ----------------
 
     def test_vscode_extension_running_skips_daemon_autostart(self):
-        """When _register_with_daemon succeeds (VS Code extension on 31337), Python daemon must NOT start."""
+        """When _register_with_daemon succeeds (VS Code extension on 31337), npm daemon must NOT start."""
         resp_ok = make_response(200, {"thread_id": "tid-ext-skip"})
         ext_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         mock_daemon = AsyncMock()
 
         with patch("neo_mcp.server._get_deployment_id", return_value=ext_id), \
-             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=True), \
-             patch("neo_mcp.server._auto_start_daemon", mock_daemon), \
+             patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
             ctx, _ = make_async_client({"DEFAULT": resp_ok})
@@ -823,16 +824,15 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_daemon.assert_not_called()
         self.assertIn("tid-ext-skip", text_of(result))
 
-    def test_no_extension_no_python_daemon_autostart_triggered(self):
-        """When no VS Code extension and no Python daemon, auto-start must be called."""
+    def test_no_extension_no_npm_daemon_autostart_triggered(self):
+        """When no VS Code extension and npm daemon not running, auto-start must be called."""
         resp_ok = make_response(200, {"thread_id": "tid-no-ext"})
         mock_daemon = AsyncMock(return_value=True)
 
-        with patch("neo_mcp.server._get_deployment_id", return_value=""), \
-             patch("neo_mcp.server._get_or_create_persistent_deployment_id", return_value="key-uuid"), \
-             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+        with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._auto_start_daemon", mock_daemon), \
+             patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
@@ -843,17 +843,16 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_daemon.assert_called_once()
         self.assertIn("tid-no-ext", text_of(result))
 
-    def test_python_daemon_already_running_no_restart(self):
-        """If our Python daemon is already running, skip _register_with_daemon and auto-start."""
+    def test_npm_daemon_already_running_no_restart(self):
+        """If npm daemon is already running, skip _register_with_daemon and auto-start."""
         resp_ok = make_response(200, {"thread_id": "tid-already-running"})
         mock_daemon = AsyncMock()
         mock_register = AsyncMock(return_value=False)
 
-        with patch("neo_mcp.server._get_deployment_id", return_value=""), \
-             patch("neo_mcp.server._get_or_create_persistent_deployment_id", return_value="key-uuid"), \
-             patch("neo_mcp.server._python_daemon_running", return_value=True), \
+        with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server._register_with_daemon", mock_register), \
-             patch("neo_mcp.server._auto_start_daemon", mock_daemon), \
+             patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
             ctx, _ = make_async_client({"DEFAULT": resp_ok})
@@ -872,9 +871,9 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_daemon = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value=stale_id), \
-             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._auto_start_daemon", mock_daemon), \
+             patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
@@ -902,7 +901,7 @@ class TestNeoSubmitTask(unittest.TestCase):
         ctx.__aexit__ = AsyncMock(return_value=False)
 
         with patch("neo_mcp.server._get_deployment_id", return_value=ext_id), \
-             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
              patch("asyncio.create_task"):
@@ -928,8 +927,8 @@ class TestNeoSubmitTask(unittest.TestCase):
         ctx.__aexit__ = AsyncMock(return_value=False)
 
         with patch("neo_mcp.server._get_deployment_id", return_value=""), \
-             patch("neo_mcp.server._get_or_create_persistent_deployment_id", return_value=key_uuid), \
-             patch("neo_mcp.server._python_daemon_running", return_value=True), \
+             patch("neo_mcp.server._derive_deployment_id", return_value=key_uuid), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
              patch("asyncio.create_task"):
             call_tool("neo_submit_task", {"description": "task"})

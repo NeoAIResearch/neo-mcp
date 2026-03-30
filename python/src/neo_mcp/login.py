@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -41,6 +43,22 @@ _MCP_AUTH_FILE = os.path.join(_DAEMON_DIR, "mcp_auth.json")
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+def _start_daemon() -> None:
+    """Spawn the Neo daemon as a detached background process after login."""
+    neo_mcp_bin = shutil.which("neo-mcp")
+    cmd = [neo_mcp_bin, "daemon"] if neo_mcp_bin else [sys.executable, "-m", "neo_mcp.daemon"]
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        print("Neo daemon started automatically.")
+    except Exception:
+        print("Note: Could not auto-start daemon. Run 'neo-mcp daemon &' manually.")
+
 
 def _write_mcp_auth(access_token: str, refresh_token: str, username: str) -> None:
     os.makedirs(_DAEMON_DIR, exist_ok=True)
@@ -183,6 +201,7 @@ def run_login() -> None:
         _write_mcp_auth(token, refresh, username)
         print(f"Logged in as: {username or '(unknown)'}")
         print(f"Token saved to: {_MCP_AUTH_FILE}")
+        _start_daemon()
         return
 
     # Local callback didn't fire — use relay flow (remote server / headless)
@@ -193,8 +212,7 @@ def run_login() -> None:
         print(f"Logged in as: {username or '(unknown)'}")
         print(f"Token saved to: {_MCP_AUTH_FILE}")
         print()
-        print("You can now start the Neo daemon:")
-        print("  neo-mcp daemon")
+        _start_daemon()
         return
 
     # Last resort: manual paste

@@ -40,8 +40,11 @@ import httpx
 # Config
 # ---------------------------------------------------------------------------
 
-NEO_API_URL: str = os.environ.get("NEO_API_URL", "https://master.heyneo.so")
-NEO_AUTH_URL: str = os.environ.get("NEO_AUTH_URL", "https://master.heyneo.so")
+# Environment: "staging" → alpha.heyneo.so, anything else → master.heyneo.so (prod)
+_NEO_ENV: str = os.environ.get("NEO_ENV", "prod").lower()
+_DEFAULT_URL: str = "https://alpha.heyneo.so" if _NEO_ENV == "staging" else "https://master.heyneo.so"
+NEO_API_URL: str = os.environ.get("NEO_API_URL", _DEFAULT_URL)
+NEO_AUTH_URL: str = os.environ.get("NEO_AUTH_URL", _DEFAULT_URL)
 
 _DAEMON_DIR = os.path.expanduser("~/.neo/daemon")
 _MCP_AUTH_FILE = os.path.join(_DAEMON_DIR, "mcp_auth.json")
