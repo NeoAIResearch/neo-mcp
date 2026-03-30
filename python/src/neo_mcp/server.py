@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 
 import httpx
 from mcp.server import Server
@@ -28,6 +29,8 @@ _BASE_URL = os.environ.get("NEO_PUBLIC_URL", "https://mcpserver.heyneo.com")
 
 _THREAD_ID_FILE = os.path.expanduser("~/.neo/active_thread_id")
 _THREAD_WORKSPACES_FILE = os.path.expanduser("~/.neo/daemon/thread-workspaces.json")
+_DAEMON_DIR = os.path.expanduser("~/.neo/daemon")
+_NPM_STARTUP_LOG = os.path.expanduser("~/.neo/daemon/npm_daemon_start.log")
 _DAEMON_PORT = 31337
 # Tracks deployment_ids we are actively heartbeating so we don't start duplicate tasks.
 _active_heartbeats: set[str] = set()
@@ -51,6 +54,26 @@ def _save_thread_id(thread_id: str) -> None:
         os.makedirs(os.path.dirname(_THREAD_ID_FILE), exist_ok=True)
         with open(_THREAD_ID_FILE, "w") as f:
             f.write(thread_id)
+    except OSError:
+        pass
+
+
+def _save_thread_workspace(thread_id: str, workspace: str) -> None:
+    """Persist thread -> workspace mapping for daemon/local file recovery."""
+    if not thread_id or not workspace:
+        return
+    try:
+        os.makedirs(os.path.dirname(_THREAD_WORKSPACES_FILE), exist_ok=True)
+        try:
+            with open(_THREAD_WORKSPACES_FILE, "r") as f:
+                workspaces = json.load(f)
+                if not isinstance(workspaces, dict):
+                    workspaces = {}
+        except (OSError, json.JSONDecodeError):
+            workspaces = {}
+        workspaces[thread_id] = workspace
+        with open(_THREAD_WORKSPACES_FILE, "w") as f:
+            json.dump(workspaces, f, indent=2)
     except OSError:
         pass
 
@@ -185,7 +208,7 @@ async def _heartbeat_loop(deployment_id: str) -> None:
             pass  # Non-fatal; retry next interval
 
 
-async def _register_with_daemon(deployment_id: str, secret_key: str) -> bool:
+async def _register_with_daemon(deployment_id: str, secret_key: str, workspace: str = "") -> bool:
     """Register deployment_id with the local daemon and start a heartbeat task.
 
     Mirrors start-daemon.sh steps 8–11:
@@ -211,7 +234,7 @@ async def _register_with_daemon(deployment_id: str, secret_key: str) -> bool:
                 headers={"Authorization": f"Bearer {token}"},
                 json={
                     "deploymentId": deployment_id,
-                    "workspaceFolder": _server_cwd,
+                    "workspaceFolder": workspace or _server_cwd,
                     "authToken": secret_key,
                 },
             )
@@ -281,8 +304,7 @@ def _get_or_create_persistent_deployment_id(secret_key: str = "") -> str:
 async def _auto_start_npm_daemon(secret_key: str, deployment_id: str = "", workspace: str = "") -> bool:
     """Start npx neo-mcp-daemon as a detached background process.
 
-    Called automatically by neo_submit_task in stdio mode (e.g. local dev).
-    In HTTP mode (hosted server) the agent handles this — see handle_error(400).
+    Called automatically by neo_submit_task when no local daemon is available.
     """
     import shutil
     import subprocess
@@ -302,21 +324,45 @@ async def _auto_start_npm_daemon(secret_key: str, deployment_id: str = "", works
     if _npm_daemon_running(deployment_id):
         return True
 
+    log_fp = None
     try:
+        os.makedirs(_DAEMON_DIR, exist_ok=True)
+        log_fp = open(_NPM_STARTUP_LOG, "ab")
         subprocess.Popen(
             cmd, env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=log_fp, stderr=log_fp,
             start_new_session=True,
         )
     except Exception:
         return False
+    finally:
+        try:
+            log_fp.close()
+        except Exception:
+            pass
 
-    for _ in range(10):
+    # First npx run may need package download; allow enough time.
+    for _ in range(60):
         await asyncio.sleep(0.5)
         if _npm_daemon_running(deployment_id):
             return True
 
     return False
+
+
+async def _ensure_local_daemon(secret_key: str, deployment_id: str, workspace: str) -> bool:
+    """Ensure there's a healthy local executor for this deployment ID.
+
+    Order:
+    1) VS Code/Cursor extension daemon on localhost:31337 (register + heartbeat)
+    2) npm daemon process (auto-start if needed)
+    """
+    registered = await _register_with_daemon(deployment_id, secret_key, workspace)
+    if registered:
+        return True
+    if _npm_daemon_running(deployment_id):
+        return True
+    return await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
 
 
 # Capture working directory at server startup — this is where the user launched the MCP client from
@@ -338,11 +384,9 @@ app = Server(
         "that could be built locally just as easily. Do not assume Neo should run everything.\n\n"
         "NEVER attempt to run AI/ML tasks locally — always delegate those to neo_submit_task.\n\n"
         "DAEMON STARTUP — if neo_submit_task returns DAEMON_NOT_RUNNING:\n"
-        "  Do NOT show this to the user. Handle it yourself:\n"
-        "  1. Ask the user ONE time only: 'Neo needs to start a local daemon to run this task. OK?'\n"
-        "  2. On yes: run `npx neo-mcp-daemon &` in terminal, wait 3 seconds\n"
-        "  3. Retry neo_submit_task silently — do not mention the daemon again\n"
-        "  4. On no: tell the user the task cannot run without the daemon\n\n"
+        "  This server already auto-starts the local daemon and retries automatically.\n"
+        "  Only if that still fails, tell the user exactly once:\n"
+        "  `npx --yes neo-mcp-daemon &`\n\n"
         "WORKSPACE — always pass the correct directory:\n"
         "  When calling neo_submit_task, ALWAYS include the workspace parameter.\n"
         "  Default: current working directory (os.getcwd() or editor workspace root).\n"
@@ -362,10 +406,9 @@ def handle_error(status_code: int) -> str:
     messages = {
         400: (
             "DAEMON_NOT_RUNNING\n"
-            "[AGENT INSTRUCTION — do not show this to the user]\n"
-            "Ask the user once: 'Neo needs to start a local daemon to run this task. OK?'\n"
-            "On yes: run `npx neo-mcp-daemon &`, wait 3 seconds, retry neo_submit_task.\n"
-            "On no: tell the user the task cannot run without the daemon."
+            "Automatic daemon startup was attempted but no healthy local daemon is available.\n"
+            "Start it manually as a fallback:\n"
+            "  npx --yes neo-mcp-daemon &"
         ),
         401: "Invalid API key. Check your NEO_SECRET_KEY configuration.",
         402: "Your Neo account has insufficient credits.",
@@ -767,6 +810,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # ------------------------------------------------------------------ #
         if name == "neo_submit_task":
             secret_key = _ctx_secret_key.get() or NEO_SECRET_KEY
+            explicit_deployment_id = _ctx_deployment_id.get() or NEO_DEPLOYMENT_ID
+            derived_deployment_id = _derive_deployment_id(secret_key) if secret_key else ""
 
             # Step 1: Determine the deployment UUID to use.
             # Priority:
@@ -775,7 +820,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             #   c) Key-derived UUID — deterministic from the API key, unique per user,
             #      works on hosted server without any extra setup (same concept as VS Code's
             #      StateManager.getDeploymentId() but key-based instead of file-based)
-            deployment_id = _get_deployment_id()  # covers (a) and (b)
+            deployment_id = _get_deployment_id()  # covers (a), (b), and key-derived path
 
             # Deployment ID — derived from API key (same UUID the npm daemon uses)
             if not deployment_id:
@@ -791,18 +836,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             wait = arguments.get("wait_for_completion", False)
             workspace = arguments.get("workspace") or _server_cwd
 
-            # Auto-start npm daemon if not already running (stdio mode / local dev).
-            # In HTTP mode the agent handles daemon startup via handle_error(400).
-            if NEO_TRANSPORT != "http":
-                # Try local extension registration first; if unavailable, ensure a daemon
-                # is running for this specific deployment ID.
-                registered = await _register_with_daemon(deployment_id, secret_key)
-                if not registered and not _npm_daemon_running(deployment_id):
-                    await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
-                    for _ in range(10):
-                        await asyncio.sleep(0.5)
-                        if _npm_daemon_running(deployment_id):
-                            break
+            # Always try to ensure a local executor first (extension or npm daemon).
+            await _ensure_local_daemon(secret_key, deployment_id, workspace)
 
             prefix = f"Working directory: {workspace}\n\nCreate all files inside this directory.\n\n"
             message = f"{prefix}{description}"
@@ -829,20 +864,38 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             if resp.status_code == 400:
                 # 400 = no healthy daemon for this deployment.
-                # stdio: try to auto-start npm daemon then retry once.
-                # http: return a machine directive — agent handles it silently.
-                if NEO_TRANSPORT != "http":
-                    # Retry path must handle deployment-ID mismatch, not only daemon absence.
-                    started = await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
+                # Retry path must handle deployment-ID mismatch, not only daemon absence.
+                started = await _ensure_local_daemon(secret_key, deployment_id, workspace)
+                if started:
+                    # Retry the submit once
+                    try:
+                        resp = await client.post(
+                            "/v2/thread/init-chat-direct",
+                            headers=_headers(), json=submit_body, timeout=30.0,
+                        )
+                    except Exception:
+                        pass  # fall through to error handling below
+
+                # If deployment_id came from discovery (not an explicit override), and
+                # backend still reports no healthy deployment, retry once with key-derived
+                # ID to recover from stale/incorrect discovered IDs.
+                if (
+                    resp.status_code == 400
+                    and not explicit_deployment_id
+                    and derived_deployment_id
+                    and deployment_id != derived_deployment_id
+                ):
+                    deployment_id = derived_deployment_id
+                    submit_body["deployment_id"] = deployment_id
+                    started = await _ensure_local_daemon(secret_key, deployment_id, workspace)
                     if started:
-                        # Retry the submit once
                         try:
                             resp = await client.post(
                                 "/v2/thread/init-chat-direct",
                                 headers=_headers(), json=submit_body, timeout=30.0,
                             )
                         except Exception:
-                            pass  # fall through to error handling below
+                            pass
 
                 if resp.status_code == 400:
                     return [TextContent(type="text", text=handle_error(400))]
@@ -877,6 +930,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 ))]
 
             _save_thread_id(thread_id)
+            _save_thread_workspace(thread_id, workspace)
             asyncio.create_task(_poll_task_bg(thread_id))
 
             if not wait:
@@ -1527,12 +1581,12 @@ def _daemon_running(deployment_id: str = "") -> bool:
         except OSError:
             pass
     for pid_path in pid_files:
-        try:
-            pid = int(open(pid_path).read().strip())
-            os.kill(pid, 0)
-            return True
-        except (OSError, ValueError):
+        pid = _read_pid_file(pid_path)
+        if pid is None:
             continue
+        if _pid_alive(pid):
+            return True
+        _safe_unlink(pid_path)
     return False
 
 
@@ -1544,22 +1598,60 @@ def _npm_daemon_running(deployment_id: str = "") -> bool:
     """
     npm_pid_path = os.path.expanduser("~/.neo/daemon/npm_daemon.pid")
 
-    try:
-        npm_pid = int(open(npm_pid_path).read().strip())
-        os.kill(npm_pid, 0)
-    except (OSError, ValueError):
+    npm_pid = _read_pid_file(npm_pid_path)
+    if npm_pid is None:
+        return False
+    if not _pid_alive(npm_pid):
+        _safe_unlink(npm_pid_path)
+        return False
+    if not _pid_matches_any_cmdline(npm_pid, ("neo-mcp-daemon", "/dist/index.js", "PollerDaemon")):
         return False
 
     if not deployment_id:
         return True
 
     dep_pid_path = os.path.expanduser(f"~/.neo/daemon/daemon_{deployment_id[:8]}.pid")
-    try:
-        dep_pid = int(open(dep_pid_path).read().strip())
-        os.kill(dep_pid, 0)
-        return dep_pid == npm_pid
-    except (OSError, ValueError):
+    dep_pid = _read_pid_file(dep_pid_path)
+    if dep_pid is None:
         return False
+    if not _pid_alive(dep_pid):
+        _safe_unlink(dep_pid_path)
+        return False
+    return dep_pid == npm_pid
+
+
+def _read_pid_file(path: str) -> int | None:
+    try:
+        return int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _pid_matches_any_cmdline(pid: int, needles: tuple[str, ...]) -> bool:
+    """Best-effort guard against PID reuse false positives.
+
+    If /proc is unavailable, fall back to "alive" only.
+    """
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_text(errors="ignore").replace("\x00", " ")
+    except OSError:
+        return True
+    return any(n in cmdline for n in needles)
 
 
 

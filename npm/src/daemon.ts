@@ -174,6 +174,11 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
       backoff = 1_000;
       for (const cmd of commands) {
         const tid = cmd.thread_id;
+        // Refresh mapping from disk before first command for a thread.
+        // server.py writes thread-workspaces.json right after init-chat returns thread_id.
+        if (tid && !threadWorkspaces[tid]) {
+          Object.assign(threadWorkspaces, loadThreadWorkspaces());
+        }
         const effectiveWs = (tid && threadWorkspaces[tid]) ? threadWorkspaces[tid] : ws;
 
         const result = await dispatch(cmd, effectiveWs);
