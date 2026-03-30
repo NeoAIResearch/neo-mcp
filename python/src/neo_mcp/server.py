@@ -293,7 +293,7 @@ def _get_or_create_persistent_deployment_id(secret_key: str = "") -> str:
     return uid
 
 
-async def _auto_start_npm_daemon(secret_key: str, deployment_id: str = "") -> bool:
+async def _auto_start_npm_daemon(secret_key: str, deployment_id: str = "", workspace: str = "") -> bool:
     """Start npx neo-mcp-daemon as a detached background process.
 
     Called automatically by neo_submit_task in stdio mode (e.g. local dev).
@@ -306,7 +306,7 @@ async def _auto_start_npm_daemon(secret_key: str, deployment_id: str = "") -> bo
     if not npx_bin:
         return False
 
-    cmd = [npx_bin, "--yes", "neo-mcp-daemon", _server_cwd]
+    cmd = [npx_bin, "--yes", "neo-mcp-daemon", workspace or _server_cwd]
     if deployment_id:
         cmd += ["--deployment-id", deployment_id]
 
@@ -354,8 +354,14 @@ app = Server(
         "  2. On yes: run `npx neo-mcp-daemon &` in terminal, wait 3 seconds\n"
         "  3. Retry neo_submit_task silently — do not mention the daemon again\n"
         "  4. On no: tell the user the task cannot run without the daemon\n\n"
+        "WORKSPACE — always pass the correct directory:\n"
+        "  When calling neo_submit_task, ALWAYS include the workspace parameter.\n"
+        "  Default: current working directory (os.getcwd() or editor workspace root).\n"
+        "  Override: if the user specifies a different location (e.g. 'create this in ~/projects/foo'\n"
+        "  or 'put it on the Desktop'), use that path as workspace instead.\n"
+        "  This ensures Neo creates files exactly where the user expects them.\n\n"
         "Workflow once you submit:\n"
-        "1. neo_submit_task — submit the task (returns thread_id immediately)\n"
+        "1. neo_submit_task — submit the task with workspace=<cwd> (returns thread_id immediately)\n"
         "2. neo_task_status — poll until COMPLETED or WAITING_FOR_FEEDBACK\n"
         "3. neo_send_feedback — reply if Neo asks a question\n"
         "4. neo_get_messages — read the final output when COMPLETED"
@@ -645,6 +651,8 @@ async def list_tools() -> list[Tool]:
                 "Submit a task to the Neo AI/ML backend. Use this ONLY for AI/ML work: training models, "
                 "building AI agents, RAG pipelines, LLM integrations, or ML data pipelines. "
                 "For anything outside AI/ML, ask the user first: 'Should I use Neo to build this?' "
+                "ALWAYS pass workspace=<directory>: default to current working directory, but use whatever "
+                "location the user specifies (e.g. '~/projects/foo', '/Desktop/myapp'). "
                 "Returns immediately with a thread_id; background polling tracks progress. "
                 "Follow up with neo_task_status, neo_send_feedback (if Neo asks a question), "
                 "and neo_get_messages to read the final output."
@@ -653,6 +661,15 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "description": {"type": "string", "description": "The task description to send to Neo."},
+                    "workspace": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path to the working directory where Neo should create files. "
+                            "Pass the current project directory (e.g. os.getcwd() or the editor's "
+                            "workspace root). Overrides the server's startup directory. "
+                            "Omit only if the server was started from the correct folder."
+                        ),
+                    },
                     "auto_mode": {
                         "type": "boolean",
                         "description": "Whether to run in auto mode (default: false).",
@@ -780,22 +797,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     ))]
                 deployment_id = _derive_deployment_id(secret_key)
 
+            description = arguments["description"]
+            auto_mode = arguments.get("auto_mode", False)
+            wait = arguments.get("wait_for_completion", False)
+            workspace = arguments.get("workspace") or _server_cwd
+
             # Auto-start npm daemon if not already running (stdio mode / local dev).
             # In HTTP mode the agent handles daemon startup via handle_error(400).
             if NEO_TRANSPORT != "http":
                 if not _npm_daemon_running():
                     if not await _register_with_daemon(deployment_id, secret_key):
-                        await _auto_start_npm_daemon(secret_key, deployment_id)
+                        await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
                         for _ in range(10):
                             await asyncio.sleep(0.5)
                             if _npm_daemon_running():
                                 break
 
-            description = arguments["description"]
-            auto_mode = arguments.get("auto_mode", False)
-            wait = arguments.get("wait_for_completion", False)
-
-            prefix = f"Working directory: {_server_cwd}\n\nCreate all files inside this directory.\n\n"
+            prefix = f"Working directory: {workspace}\n\nCreate all files inside this directory.\n\n"
             message = f"{prefix}{description}"
 
             submit_body: dict = {
@@ -824,7 +842,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # http: return a machine directive — agent handles it silently.
                 if NEO_TRANSPORT != "http":
                     if not _npm_daemon_running():
-                        started = await _auto_start_npm_daemon(secret_key, deployment_id)
+                        started = await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
                         if started:
                             # Retry the submit once
                             try:
