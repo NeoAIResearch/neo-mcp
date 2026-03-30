@@ -9,7 +9,7 @@ Use Neo's MCP server as a set of tools inside any Vercel AI SDK application. Neo
 
 ## Option A: MCP Client (recommended — zero tool duplication)
 
-Connect to the hosted server with the Vercel AI SDK's built-in MCP client. All 9 Neo tools are loaded automatically — no manual schema definitions needed.
+Connect to the hosted server with the Vercel AI SDK's built-in MCP client. All 10 Neo tools are loaded automatically — no manual schema definitions needed.
 
 ```typescript
 // lib/neo.ts
@@ -192,6 +192,14 @@ export const neoTools = {
       thread_id: z.string().optional().describe('Thread ID. Omit for last active thread.'),
     }),
     execute: async (args) => callNeoTool('neo_send_feedback', args),
+  }),
+
+  neo_list_tasks: tool({
+    description:
+      'List running or recent Neo tasks. Use when the user has closed a window or lost track of a task. ' +
+      'Reconnects background pollers automatically so other tools work immediately after.',
+    parameters: z.object({}),
+    execute: async () => callNeoTool('neo_list_tasks', {}),
   }),
 
   neo_stop_task: tool({

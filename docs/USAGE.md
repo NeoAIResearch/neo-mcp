@@ -34,6 +34,7 @@ neo_task_status   →  check overall status at any time
 | Tool | When to use |
 |---|---|
 | `neo_submit_task` | Start a task. Use `wait_for_completion=true` for short tasks (< 3 min) to get output immediately. |
+| `neo_list_tasks` | Find running or recent tasks — useful after closing a window or losing track of a task. Reconnects pollers automatically. |
 | `neo_task_plan` | Check what Neo is doing right now — step statuses, result summaries, files created. Faster than fetching full messages. |
 | `neo_task_status` | Quick overall status check: RUNNING / COMPLETED / WAITING_FOR_FEEDBACK / PAUSED / TERMINATED. |
 | `neo_get_messages` | Full conversation output once COMPLETED. Caps at ~20 000 tokens. |

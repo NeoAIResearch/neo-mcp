@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 9 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — via stdio or HTTP transport. The hosted server runs at `https://mcpserver.heyneo.com/mcp`.
+A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 10 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — via stdio or HTTP transport. The hosted server runs at `https://mcpserver.heyneo.com/mcp`.
 
 ## Project structure
 
@@ -14,7 +14,7 @@ Each concern lives in its own top-level folder.
 neo-mcp/
 ├── python/                         # pip-installable MCP server (neo-mcp package)
 │   ├── src/neo_mcp/
-│   │   ├── server.py               # MCP server — all 9 tools, single file
+│   │   ├── server.py               # MCP server — all 10 tools, single file
 │   │   ├── oauth.py                # OAuth 2.0 PKCE authorization server (HTTP mode)
 │   │   ├── setup.py                # setup wizard (neo-mcp setup)
 │   │   ├── daemon.py               # Python daemon for local task execution
@@ -185,6 +185,7 @@ The daemon authenticates with `NEO_SECRET_KEY` as a Bearer token — the same AP
 | Tool | Method | Path |
 |---|---|---|
 | `neo_submit_task` | POST | `/v2/thread/init-chat-direct` |
+| `neo_list_tasks` | GET (optional) | `/v2/thread/list` + in-memory + `~/.neo/active_thread_id` |
 | `neo_task_status` | GET | `/v2/thread/status/{thread_id}` |
 | `neo_get_messages` | GET | `/v2/thread/thread-messages` |
 | `neo_send_feedback` | POST | `/v2/thread/feedback/{thread_id}` |

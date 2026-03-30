@@ -111,6 +111,7 @@ All polling uses only `NEO_SECRET_KEY` — no OAuth required.
 | Tool | When to use |
 |---|---|
 | `neo_submit_task` | Start a task. Returns `thread_id` immediately. Use `wait_for_completion=true` for short tasks (< 3 min) to get output directly. |
+| `neo_list_tasks` | Find running or recent tasks — use when you've closed a window or lost track of a task. Reconnects pollers automatically. |
 | `neo_task_plan` | See live step-by-step progress with per-step status. Much cheaper than fetching full messages. Use while RUNNING. |
 | `neo_task_status` | Quick overall status check: RUNNING / COMPLETED / WAITING_FOR_FEEDBACK / PAUSED / TERMINATED. |
 | `neo_get_messages` | Full conversation output once COMPLETED. Capped at ~20 000 tokens. |

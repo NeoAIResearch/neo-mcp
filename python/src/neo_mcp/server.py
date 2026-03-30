@@ -546,6 +546,20 @@ async def _reconnect_inflight_task() -> None:
 async def list_tools() -> list[Tool]:
     read_tools = [
         Tool(
+            name="neo_list_tasks",
+            description=(
+                "List running or recent Neo tasks associated with your API key. "
+                "Useful when you've closed a window or lost track of a task — returns any active, "
+                "paused, or recently completed tasks so you can reconnect and continue tracking them. "
+                "No arguments required."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        Tool(
             name="neo_task_status",
             description=(
                 "Check the current status of a Neo task. "
@@ -899,6 +913,97 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 f"Task still running after timeout. thread_id: {thread_id}\n"
                 "Use neo_task_status / neo_task_plan to continue tracking."
             ))]
+
+        # ------------------------------------------------------------------ #
+        # neo_list_tasks — discover running/recent tasks for this API key    #
+        # ------------------------------------------------------------------ #
+        elif name == "neo_list_tasks":
+            # Collect thread IDs from all available sources.
+            found: dict[str, str] = {}  # thread_id -> source label
+
+            # 1. In-memory poller state (tasks submitted this session)
+            for tid in list(_active_polls.keys()):
+                found[tid] = "in-memory"
+
+            # 2. Persisted last-active thread ID
+            persisted = _load_thread_id()
+            if persisted and persisted not in found:
+                found[persisted] = "local file"
+
+            # 3. thread-workspaces.json — written by the npm/Python daemon; maps thread_id → workspace.
+            #    This is the richest local source: every thread the daemon ever received commands for.
+            ws_path = os.path.expanduser("~/.neo/daemon/thread-workspaces.json")
+            try:
+                with open(ws_path, "r", errors="ignore") as _f:
+                    workspaces: dict = json.load(_f)
+                for tid in workspaces:
+                    if tid and tid not in found:
+                        found[tid] = "daemon workspace log"
+            except (OSError, ValueError):
+                pass
+
+            # 4. Try the Neo API for a broader list (endpoint may not exist on all deployments)
+            try:
+                lr = await client.get("/v2/thread/list", headers=_headers(), params={"limit": 20})
+                if lr.status_code == 200:
+                    ldata = lr.json()
+                    threads = ldata.get("threads") or ldata.get("data") or []
+                    for t in threads:
+                        tid = t.get("thread_id") or t.get("id") or t.get("threadId")
+                        if tid and tid not in found:
+                            found[tid] = "api"
+            except Exception:
+                pass  # API doesn't support listing — continue with local sources
+
+            if not found:
+                return [TextContent(type="text", text=(
+                    "No tasks found.\n\n"
+                    "No in-memory tasks, no saved thread ID, and no tasks returned from the API.\n"
+                    "Submit a task with neo_submit_task to get started."
+                ))]
+
+            # Fetch current status for each discovered thread
+            lines = [f"Found {len(found)} task(s):\n"]
+            status_icons = {
+                "RUNNING": "⏳", "WAITING_FOR_FEEDBACK": "💬", "PAUSED": "⏸",
+                "COMPLETED": "✅", "TERMINATED": "❌",
+            }
+            hints = {
+                "RUNNING": "call neo_task_status or neo_task_plan to track progress",
+                "WAITING_FOR_FEEDBACK": "call neo_send_feedback to reply",
+                "PAUSED": "call neo_resume_task to continue",
+                "COMPLETED": "call neo_get_messages to read output",
+                "TERMINATED": "task ended",
+            }
+            for tid, source in found.items():
+                # Use in-memory state first to avoid extra API calls
+                state = _active_polls.get(tid)
+                if state:
+                    status = state["status"]
+                else:
+                    try:
+                        sr = await client.get(f"/v2/thread/status/{tid}", headers=_headers())
+                        if sr.status_code == 200:
+                            status = sr.json().get("status", "UNKNOWN")
+                        else:
+                            status = f"HTTP {sr.status_code}"
+                    except Exception as e:
+                        status = f"error ({e})"
+
+                icon = status_icons.get(status, "•")
+                hint = hints.get(status, "")
+                line = f"{icon} {tid}  [{status}]  (source: {source})"
+                if hint:
+                    line += f"\n   → {hint}"
+                lines.append(line)
+
+                # Reconnect background poller for active tasks not already tracked
+                if status in ("RUNNING", "PAUSED", "WAITING_FOR_FEEDBACK") and tid not in _active_polls:
+                    _active_polls[tid] = {"status": status, "messages": None, "capped": False, "plan": []}
+                    asyncio.create_task(_poll_task_bg(tid))
+                    lines[-1] += "\n   ✓ background poller reconnected"
+
+            return [TextContent(type="text", text="\n".join(lines))]
 
         # ------------------------------------------------------------------ #
         # neo_task_status — status + inline plan steps                       #
