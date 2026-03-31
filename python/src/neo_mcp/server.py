@@ -689,12 +689,14 @@ app = Server(
         "that could be built locally just as easily. Do not assume Neo should run everything.\n\n"
         "NEVER attempt to run AI/ML tasks locally — always delegate those to neo_submit_task.\n\n"
         "DAEMON STARTUP — if neo_submit_task returns DAEMON_NOT_RUNNING:\n"
-        "  In stdio mode this server auto-starts daemon locally (go binary, then npx, then python fallback).\n"
-        "  In HTTP mode, run startup commands on the USER MACHINE and retry submit:\n"
-        "  Always ask the user for permission before running startup commands.\n"
-        "    1) ~/.neo/agent --daemon\n"
-        "    2) npx --yes neo-mcp-daemon &\n"
-        "    3) neo-mcp daemon\n\n"
+        "  In stdio mode the server auto-starts the daemon automatically — no action needed.\n"
+        "  In HTTP mode the response includes ASK_USER_PERMISSION_THEN_RUN_EXACTLY_ONE_OF with the\n"
+        "  exact shell command (NEO_SECRET_KEY already embedded). Do this:\n"
+        "    1. Ask the user: 'I need to start your local Neo daemon. May I run this command?'\n"
+        "    2. Show them the command from the response.\n"
+        "    3. On approval, run it with your bash tool.\n"
+        "    4. Wait 3-5 seconds for startup, then retry neo_submit_task automatically.\n"
+        "  Do NOT ask the user to open a terminal manually — run it yourself.\n\n"
         "WORKSPACE — always pass the correct directory:\n"
         "  When calling neo_submit_task, ALWAYS include the workspace parameter.\n"
         "  Default: current working directory (os.getcwd() or editor workspace root).\n"
@@ -751,6 +753,34 @@ def handle_error(status_code: int, transport: str = "") -> str:
         )
 
     return messages.get(status_code, f"Unexpected error (HTTP {status_code}).")
+
+
+def _daemon_not_running_message(secret_key: str = "", transport: str = "") -> str:
+    """Return a DAEMON_NOT_RUNNING message with the actual key embedded in the
+    startup commands so the agent can run them directly (one permission click)."""
+    mode = (transport or NEO_TRANSPORT).lower()
+    key = secret_key or NEO_SECRET_KEY or ""
+    key_prefix = f"NEO_SECRET_KEY={key} " if key else "NEO_SECRET_KEY=<your-key> "
+
+    if mode == "http":
+        return (
+            "DAEMON_NOT_RUNNING\n"
+            "The hosted MCP server cannot start daemons — execution happens on YOUR machine.\n"
+            "USER_ACTION_REQUIRED=true\n"
+            "ASK_USER_PERMISSION_THEN_RUN_EXACTLY_ONE_OF:\n"
+            f"  {key_prefix}~/.neo/agent --daemon >/tmp/neo-daemon.log 2>&1 &\n"
+            f"  {key_prefix}npx --yes neo-mcp-daemon >/tmp/neo-daemon.log 2>&1 &\n"
+            "After running, wait 3 seconds, then retry neo_submit_task."
+        )
+    return (
+        "DAEMON_NOT_RUNNING\n"
+        "Could not start a local daemon automatically.\n"
+        "USER_ACTION_REQUIRED=true\n"
+        "ASK_USER_PERMISSION_THEN_RUN_EXACTLY_ONE_OF:\n"
+        f"  {key_prefix}~/.neo/agent --daemon >/tmp/neo-daemon.log 2>&1 &\n"
+        f"  {key_prefix}npx --yes neo-mcp-daemon >/tmp/neo-daemon.log 2>&1 &\n"
+        "After running, wait 3 seconds, then retry neo_submit_task."
+    )
 
 
 # Per-request key context vars — safe for concurrent async HTTP requests
@@ -1199,7 +1229,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if NEO_TRANSPORT != "http":
                 ready = await _ensure_local_daemon(secret_key, deployment_id, workspace)
                 if not ready:
-                    return [TextContent(type="text", text=handle_error(400, NEO_TRANSPORT))]
+                    return [TextContent(type="text", text=_daemon_not_running_message(secret_key, NEO_TRANSPORT))]
 
             prefix = f"Working directory: {workspace}\n\nCreate all files inside this directory.\n\n"
             message = f"{prefix}{description}"
@@ -1241,7 +1271,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         pass  # fall through to error handling below
 
                 if resp.status_code == 400:
-                    return [TextContent(type="text", text=handle_error(400, NEO_TRANSPORT))]
+                    return [TextContent(type="text", text=_daemon_not_running_message(secret_key, NEO_TRANSPORT))]
 
             if resp.status_code != 200:
                 try:
