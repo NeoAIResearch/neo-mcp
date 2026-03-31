@@ -1384,6 +1384,25 @@ class TestNeoGetFiles(unittest.TestCase):
         self.assertIn("No local workspace mapping found", txt)
         self.assertIn("Refusing server-side filesystem fallback", txt)
 
+    def test_http_mode_returns_local_verification_instructions(self):
+        # In HTTP mode, server must not read local files from hosted environment.
+        workspace = tempfile.mkdtemp()
+        with open(self._ws_file, "w") as f:
+            json.dump({"tid-http-files": workspace}, f)
+        orig_transport = srv.NEO_TRANSPORT
+        try:
+            srv.NEO_TRANSPORT = "http"
+            with patch("neo_mcp.server.httpx.AsyncClient") as MockClient:
+                ctx, _ = make_async_client({})
+                MockClient.return_value = ctx
+                result = call_tool("neo_get_files", {"thread_id": "tid-http-files"})
+        finally:
+            srv.NEO_TRANSPORT = orig_transport
+
+        txt = text_of(result)
+        self.assertIn("HTTP_REMOTE_MODE_NO_LOCAL_FS", txt)
+        self.assertIn("Verify files on the user machine", txt)
+
 
 # ---------------------------------------------------------------------------
 # 13. Tool: neo_send_feedback

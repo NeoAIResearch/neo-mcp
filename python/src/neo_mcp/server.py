@@ -1241,6 +1241,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             except (OSError, ValueError):
                 pass
 
+            # Hosted HTTP transport cannot read user-machine filesystem paths.
+            # Return actionable local commands instead of touching server FS.
+            if NEO_TRANSPORT == "http":
+                ws_hint = workspace or "<your-workspace>"
+                return [TextContent(type="text", text=(
+                    "HTTP_REMOTE_MODE_NO_LOCAL_FS\n"
+                    "neo_get_files cannot read local files via hosted HTTP bridge.\n"
+                    "Verify files on the user machine:\n"
+                    f"1. ls -la {ws_hint}\n"
+                    f"2. find {ws_hint} -maxdepth 3 -type f | head -n 200\n"
+                    "If expected files are missing, ensure local daemon is running:\n"
+                    "  npx --yes neo-mcp-daemon &\n"
+                    "or\n"
+                    "  neo-mcp daemon\n"
+                    "Then retry neo_submit_task with explicit workspace."
+                ))]
+
             if not workspace:
                 return [TextContent(type="text", text=(
                     "No local workspace mapping found for this thread.\n"
