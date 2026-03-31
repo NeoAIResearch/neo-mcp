@@ -55,9 +55,14 @@ Install the Neo extension and log in. It manages the daemon completely automatic
 ## Troubleshooting
 
 ### `DAEMON_NOT_RUNNING` on first task
-Agent will offer to start the daemon — click yes. If running a web client (ChatGPT, Claude.ai), run manually:
+Agent will offer to start the daemon — click yes. If running a web client (ChatGPT, Claude.ai), run manually in this order:
 ```bash
-NEO_SECRET_KEY=sk-v1-... neo-mcp daemon &
+NEO_SECRET_KEY=sk-v1-... ~/.neo/agent --daemon
+```
+Fallbacks:
+```bash
+NEO_SECRET_KEY=sk-v1-... npx --yes neo-mcp-daemon &
+NEO_SECRET_KEY=sk-v1-... neo-mcp daemon
 ```
 
 ### Daemon exits immediately / auth error

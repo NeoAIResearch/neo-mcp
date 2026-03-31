@@ -281,5 +281,5 @@ orchestrator = Agent(
 - `thread_id` is optional — the server auto-recovers the last active thread.
 - Task execution requires a daemon on the user's machine. Options (simplest first):
   1. **Neo VS Code/Cursor extension** — handles everything automatically, zero setup
-  2. **Agent auto-start** — agents with terminal access offer to run `neo-mcp daemon &` on first task (user approves)
+  2. **Agent auto-start** — agents with terminal access offer to run `~/.neo/agent --daemon` first, then npm/pip fallback if needed (user approves)
 - Get your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.

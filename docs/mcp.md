@@ -93,7 +93,7 @@ The daemon authenticates with `NEO_SECRET_KEY` as a Bearer token — the same AP
 
 ---
 
-## Path 1: pip install — Local stdio
+## Path 1: Local stdio (Go daemon primary, npm/pip fallback)
 
 ### What the user runs
 
@@ -102,6 +102,14 @@ pip install neo-mcp
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-... \
   -- neo-mcp
+```
+
+Optional pre-install of Go daemon binary:
+
+```bash
+mkdir -p ~/.neo
+curl -sSL https://heyneo.so/download/agent -o ~/.neo/agent
+chmod +x ~/.neo/agent
 ```
 
 ### What happens
@@ -125,50 +133,26 @@ Claude: calls neo_submit_task("train a classifier on data.csv")
 server.py — neo_submit_task():
   1. _get_deployment_id()
        checks: X-Neo-Deployment-Id header → none (stdio mode)
-       checks: NEO_DEPLOYMENT_ID env var → not set
-       checks: _discover_sandbox_id() → reads ~/.neo/daemon/daemon.log
-                                        reads ~/.neo/daemon/standalone_deployment_id
-                                        → probably finds old UUID or nothing
-       falls back: SHA-256(sk-v1-...)[:16] → de9d7297
+       checks: NEO_DEPLOYMENT_ID env var → optional override
+       otherwise derives from API key: SHA-256(sk-v1-...)[:16] → de9d7297
 
-  2. _python_daemon_running(de9d7297)?
-       checks: ~/.neo/daemon/daemon_de9d7297.pid exists and process is alive → NO
+  2. _ensure_local_daemon(...)
+       startup order:
+         a) use running Go daemon if healthy
+         b) auto-start Go daemon (`~/.neo/agent --daemon`)
+         c) register with extension daemon on localhost:31337 if available
+         d) npm daemon fallback (`npx --yes neo-mcp-daemon`)
+         e) python daemon fallback (`neo-mcp daemon`)
 
-  3. _register_with_daemon(de9d7297, sk-v1-...)
-       tries: POST http://127.0.0.1:31337/register
-       → 31337 is VS Code extension daemon port
-       → if extension running: extension starts polling de9d7297 ← WORKS
-       → if extension not running: connection refused → returns False
-
-  4. _auto_start_daemon(sk-v1-..., de9d7297)
-       spawns: neo-mcp daemon de9d7297
-       waits up to 5s for daemon to write PID file
-
-  neo-mcp daemon starts:
-       reads NEO_SECRET_KEY from env
-       derives same UUID: SHA-256(sk-v1-...)[:16] → de9d7297
-       tries to poll: GET /v2/poll/de9d7297
-                      Authorization: Bearer sk-v1-...
-       TODAY:         → 401 Unauthorized ❌
-       AFTER CHANGE:  → 200 OK ✅
-
-  5. POST /v2/thread/init-chat-direct
+  3. POST /v2/thread/init-chat-direct
        { deployment_id: "de9d7297", deployment_type: "vscode", message: "train..." }
+       backend returns: { thread_id: "..." }
+       backend queues commands under deployment_id
+       local daemon polls /v2/poll/{deployment_id}, executes locally, returns results
+       files are written to the user's local workspace
 
-  TODAY (daemon can't poll):
-       backend: "Failed to connect to sandbox" ❌
-
-  AFTER BACKEND CHANGE (daemon polling successfully):
-       backend: { thread_id: "1bc15e3f-..." } ✅
-
-       backend queues: run_python, write_file commands under de9d7297
-       daemon picks them up via /v2/poll/de9d7297
-       daemon runs: python train.py
-       daemon writes: model.pkl → /home/user/project/model.pkl  ← LOCAL DISK ✅
-       daemon sends results back via POST /v2/poll/response
-
-       thread_id polling (API key works fine):
-       GET /v2/thread/status/1bc15e3f → RUNNING → COMPLETED
+  4. Thread polling:
+       GET /v2/thread/status/{thread_id} → RUNNING / WAITING_FOR_FEEDBACK / COMPLETED
        GET /v2/thread/thread-messages → full output
 ```
 
@@ -179,13 +163,13 @@ server.py — neo_submit_task():
 ### User experience
 
 ```bash
-# npx (primary — no install)
+# hosted bridge (recommended setup command)
 claude mcp add --scope user neo --transport http https://mcpserver.heyneo.com/mcp --header "Authorization: Bearer sk-v1-..."
 
-# pip (alternative)
+# pip stdio (local MCP process)
 pip install neo-mcp
 claude mcp add --scope user neo -e NEO_SECRET_KEY=sk-v1-... -- neo-mcp
-# Done. Daemon auto-starts on first task. No login, no browser, no UUID.
+# Done. In stdio mode, daemon pre-check runs automatically (Go, then npm, then pip fallback).
 ```
 
 Files are written to the user's actual filesystem. Works on SSH servers, headless environments, CI/CD.
@@ -198,7 +182,14 @@ Files are written to the user's actual filesystem. Works on SSH servers, headles
 
 ```bash
 # Option A: with local daemon for file execution
+mkdir -p ~/.neo
+curl -sSL https://heyneo.so/download/agent -o ~/.neo/agent
+chmod +x ~/.neo/agent
+NEO_SECRET_KEY=sk-v1-... ~/.neo/agent --daemon &
+
+# Fallbacks if Go binary is unavailable:
 pip install neo-mcp
+NEO_SECRET_KEY=sk-v1-... npx --yes neo-mcp-daemon &
 NEO_SECRET_KEY=sk-v1-... neo-mcp daemon &
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
@@ -216,12 +207,11 @@ claude mcp add --scope user neo \
 claude mcp add writes config. User opens Claude Code.
 Claude Code: HTTP request to https://mcpserver.heyneo.com/mcp
 
-neo-mcp daemon running locally:
+local daemon running locally:
     derived UUID: SHA-256(sk-v1-...)[:16] → de9d7297
     polling: GET /v2/poll/de9d7297
              Authorization: Bearer sk-v1-...
-    TODAY:   → 401 ❌
-    AFTER CHANGE: → 200 ✅
+    → 200 ✅
 
 User: "train a classifier on data.csv"
 Claude: calls neo_submit_task via hosted MCP server

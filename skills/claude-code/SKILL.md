@@ -45,10 +45,16 @@ Always follow this sequence. Do not skip steps.
 If `neo_submit_task` returns a `DAEMON_NOT_RUNNING` message, **run daemon startup on the user's machine and retry automatically**:
 
 ```bash
-npx --yes neo-mcp-daemon &
+~/.neo/agent --daemon
 ```
 
 If that fails, fallback:
+
+```bash
+npx --yes neo-mcp-daemon &
+```
+
+If that still fails, final fallback:
 
 ```bash
 neo-mcp daemon
@@ -56,7 +62,7 @@ neo-mcp daemon
 
 Then immediately retry `neo_submit_task`. Do not hand the startup steps back to the user unless local command execution is unavailable in the client.
 
-> **Why this happens:** The Neo daemon must run on the user's machine to execute tasks. It starts automatically in local pip-install mode, but needs to be started once for the hosted server. After that first start it persists.
+> **Why this happens:** The Neo daemon must run on the user's machine to execute tasks. In stdio mode, MCP pre-check tries Go first, then npm, then pip fallback.
 
 > **If the daemon fails with an auth error:** Check that `NEO_SECRET_KEY` is set correctly — the daemon authenticates with the API key directly.
 
@@ -77,7 +83,7 @@ When invoked as `/neo <task>`, immediately call `neo_submit_task` with the provi
 | `neo_task_status` | Checking if still running | Reads from in-memory cache — fast, no API call if poller is active |
 | `neo_task_plan` | Checking mid-run progress | Much cheaper than `neo_get_messages`; shows step-by-step plan with per-step status |
 | `neo_get_messages` | Reading output when COMPLETED | Paginated; capped at ~20 000 tokens |
-| `neo_get_files` | Downloading output files | Returns generated code, models, scripts inline from S3 |
+| `neo_get_files` | Reading local output files | Reads files from the local workspace used by the daemon; available in stdio/local mode only (not hosted HTTP bridge) |
 | `neo_send_feedback` | Neo is WAITING_FOR_FEEDBACK | Background poller auto-detects resume; call `neo_task_status` after sending |
 | `neo_pause_task` | User asks to pause | — |
 | `neo_resume_task` | User asks to resume | — |
@@ -112,3 +118,5 @@ claude mcp add --scope user neo \
 ```
 
 After running either command, open a **new Claude Code session** for the tools to load.
+
+Use a different API key per machine to avoid deployment-id collisions across multiple devices.
