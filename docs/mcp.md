@@ -249,35 +249,19 @@ Hosted server:
     GET /v2/thread/thread-messages → works with API key ✅
 ```
 
-### What happens — Option B (no daemon, cloud execution)
+### What happens — Option B (no daemon)
 
 ```
 Hosted server receives request with just API key.
 Derives de9d7297 but nobody is polling it.
 
-TODAY: POST /v2/thread/init-chat-direct { deployment_id: de9d7297 }
-       → "Failed to connect to sandbox" ❌
-
-AFTER BACKEND CHANGE 1 (cloud fallback):
 POST /v2/thread/init-chat-direct { deployment_id: de9d7297 }
-       → backend checks: is any daemon polling de9d7297? NO
-       → backend: spin up cloud container, run task there
-       → { thread_id: "..." } ✅
+       → if no daemon is polling this deployment_id, task execution cannot run locally.
 
-Task runs in cloud container.
-Files stored in Neo S3 cloud storage.
-
-neo_get_files:
-    GET /v2/thread/{thread_id}/files → list of files with presigned S3 URLs
-    downloads each file via S3 presigned URL
-    returns file CONTENTS inline in the conversation
-
-User gets:
-    ### model.py
-    ```python
-    import sklearn
-    ...
-    ```
+Important:
+  - Hosted MCP is a forwarding bridge only.
+  - `neo_get_files` is NOT exposed in hosted mode.
+  - To create files on the user machine, run a local daemon (pip or npx path) and retry.
 
     ### requirements.txt
     ```
@@ -414,10 +398,10 @@ claude mcp add --scope user neo -e NEO_SECRET_KEY=sk-v1-... -- neo-mcp
 | UUID derivation (server + daemon use same key → same UUID) | ✅ Built |
 | Daemon auto-start on first task | ✅ Built |
 | Daemon sends API key to `/v2/poll` | ✅ Built |
-| Backend accepts API key on `/v2/poll` | ❌ **Needs backend change** |
-| Files written to local disk | ✅ Once daemon can poll |
+| Backend accepts API key on `/v2/poll` | ✅ |
+| Files written to local disk | ✅ |
 
-**One backend change away from working perfectly.**
+**This is the primary production path.**
 
 ---
 
@@ -436,8 +420,8 @@ claude mcp add --scope user neo \
 | Hosted server derives UUID from API key | ✅ Built |
 | Daemon derives same UUID from same API key | ✅ Built |
 | Daemon sends API key to `/v2/poll` | ✅ Built |
-| Backend accepts API key on `/v2/poll` | ❌ **Needs backend change** |
-| Files written to local disk | ✅ Once daemon can poll |
+| Backend accepts API key on `/v2/poll` | ✅ |
+| Files written to local disk | ✅ |
 
 **Same backend change as Path 1. 3 commands total, could be reduced to 2 with `neo-mcp setup`.**
 
@@ -460,7 +444,7 @@ claude mcp add --scope user neo \
 
 ---
 
-### Path 4: No pip, no extension (cloud)
+### Path 4: No pip, no extension
 
 ```bash
 claude mcp add --scope user neo \
@@ -471,12 +455,12 @@ claude mcp add --scope user neo \
 | Component | Status |
 |---|---|
 | One command setup | ✅ |
-| Cloud execution when no daemon | ❌ **Needs backend change (cloud fallback)** |
-| Code file contents returned inline | ✅ `neo_get_files` fetches from S3 |
+| Local execution when no daemon | ❌ |
+| `neo_get_files` in hosted mode | ❌ (not exposed) |
 | Binary ML artifacts (model.pkl, weights) | ❌ Not viable via chat |
 | Large files (datasets, trained models) | ❌ Not viable via chat |
 
-**Good for code generation. Not good for actual model training with file outputs.**
+**Not sufficient for local file creation. Start a local daemon first.**
 
 ---
 
@@ -504,14 +488,7 @@ The core Neo use case is training models and running ML pipelines. The outputs a
 
 These **cannot** be delivered via chat message. They must be written to the user's filesystem. This is why the daemon model exists — the daemon runs on the user's machine, writes files directly to their project directory.
 
-Cloud execution (`neo_get_files`) works for:
-- Generated Python scripts (returned as text)
-- Small reports (HTML, markdown)
-- Config files
+Hosted MCP does **not** expose `neo_get_files`.
+To read generated files through MCP and to write outputs on the user's machine, use local stdio mode with a local daemon.
 
-Cloud execution does **not** work for:
-- Any binary file
-- Any file over ~1MB
-- Files that need to be at specific paths for downstream tools
-
-**For Neo's primary use case, the daemon must run locally. Cloud is a secondary convenience.**
+**For Neo's primary use case, the daemon must run locally.**

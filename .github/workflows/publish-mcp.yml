@@ -3,10 +3,62 @@ name: Push the Docker image to AWS ECR Repo
 on:
   push:
     branches:
+      - staging
       - main
 
 jobs:
-  build:
+  validate-cross-platform:
+    name: Validate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Validate Python server tests
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r python/requirements.txt
+          pip install -e python
+          pytest -q python/tests/test_server.py -q
+
+      - name: Validate npm daemon tests
+        shell: bash
+        run: |
+          cd npm
+          npm ci
+          npm test
+
+      - name: Validate Go agent build
+        shell: bash
+        run: |
+          cd neo-agent
+          gofmt -w main.go config/config.go executor/executor.go mcp/handler.go poller/poller.go poller/http.go
+          go build ./...
+
+  build-and-push:
+    name: Build and Push Docker (ubuntu)
+    needs: validate-cross-platform
     runs-on: ubuntu-latest
     ######### update correct repo name
     env:
@@ -15,6 +67,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build Linux Go release artifact
+        run: |
+          cd neo-agent
+          mkdir -p releases
+          GOOS=linux GOARCH=amd64 go build -o releases/neo-agent-linux .
+
+      - name: Upload Go agent artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: neo-agent-linux
+          path: neo-agent/releases/neo-agent-linux
 
       # 1️⃣ Decide environment + region from branch
       - name: Set environment and region
@@ -41,7 +110,7 @@ jobs:
           else
             echo "SECRET EXISTS"
           fi
-          
+
       # 2️⃣ Configure AWS credentials with the correct region
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -81,7 +150,7 @@ jobs:
           IMAGE_TAG: ${{ steps.get-commit-hash.outputs.commit_hash }}-${{ steps.get-timestamp.outputs.timestamp }}
         run: |
           FULL_REPO="$ECR_REGISTRY/$REPO_NAME:$ENV-$IMAGE_TAG"
-          docker build -t "$FULL_REPO" ./python
+          docker build -f python/Dockerfile -t "$FULL_REPO" .
           docker push "$FULL_REPO"
           echo "image_tag=$ENV-$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "full_image=$FULL_REPO" >> $GITHUB_OUTPUT
