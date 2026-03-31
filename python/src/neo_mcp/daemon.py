@@ -29,6 +29,7 @@ import json
 import os
 import signal
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +51,8 @@ _STANDALONE_UUID_FILE = os.path.join(_DAEMON_DIR, "standalone_deployment_id")
 _DAEMON_LOG = os.path.join(_DAEMON_DIR, "daemon.log")
 _PID_FILE = os.path.join(_DAEMON_DIR, "python_daemon.pid")
 _WORKSPACES_FILE = os.path.join(_DAEMON_DIR, "thread-workspaces.json")
+_MAX_THREAD_WORKSPACES = int(os.environ.get("NEO_THREAD_WORKSPACES_MAX", "500"))
+_THREAD_WORKSPACES_TTL_SECONDS = int(os.environ.get("NEO_THREAD_WORKSPACES_TTL_SECONDS", str(7 * 24 * 60 * 60)))
 
 
 def _pid_file_for(deployment_id: str) -> str:
@@ -157,14 +160,64 @@ def is_running(deployment_id: str = "") -> bool:
 
 def _load_thread_workspaces() -> dict[str, str]:
     try:
-        return json.loads(Path(_WORKSPACES_FILE).read_text())
+        data = json.loads(Path(_WORKSPACES_FILE).read_text())
+        if not isinstance(data, dict):
+            return {}
+        out: dict[str, str] = {}
+        for tid, value in data.items():
+            if isinstance(value, str):
+                out[tid] = value
+            elif isinstance(value, dict) and isinstance(value.get("workspace"), str):
+                out[tid] = value["workspace"]
+        return out
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _load_thread_workspaces_meta() -> dict[str, dict[str, int | str]]:
+    try:
+        data = json.loads(Path(_WORKSPACES_FILE).read_text())
+        if not isinstance(data, dict):
+            return {}
+        out: dict[str, dict[str, int | str]] = {}
+        for tid, value in data.items():
+            if isinstance(value, dict):
+                ws = value.get("workspace")
+                ts = value.get("updated_at")
+                if isinstance(ws, str) and isinstance(ts, (int, float)):
+                    out[tid] = {"workspace": ws, "updated_at": int(ts)}
+            elif isinstance(value, str):
+                out[tid] = {"workspace": value, "updated_at": int(time.time())}
+        return out
     except (OSError, json.JSONDecodeError):
         return {}
 
 
 def _save_thread_workspaces(workspaces: dict[str, str]) -> None:
+    now = int(time.time())
+    prev = _load_thread_workspaces_meta()
+    entries: dict[str, dict[str, int | str]] = {}
+    for tid, ws in workspaces.items():
+        if not ws:
+            continue
+        prev_meta = prev.get(tid)
+        if prev_meta and prev_meta.get("workspace") == ws:
+            updated_at = int(prev_meta.get("updated_at", now))
+        else:
+            updated_at = now
+        entries[tid] = {"workspace": ws, "updated_at": updated_at}
+    min_ts = now - _THREAD_WORKSPACES_TTL_SECONDS
+    entries = {
+        tid: meta for tid, meta in entries.items()
+        if int(meta.get("updated_at", 0)) >= min_ts
+    }
+    if len(entries) > _MAX_THREAD_WORKSPACES:
+        ordered = sorted(entries.items(), key=lambda kv: int(kv[1]["updated_at"]))
+        entries = dict(ordered[-_MAX_THREAD_WORKSPACES:])
     os.makedirs(_DAEMON_DIR, exist_ok=True)
-    Path(_WORKSPACES_FILE).write_text(json.dumps(workspaces, indent=2))
+    tmp = Path(f"{_WORKSPACES_FILE}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(entries, indent=2))
+    os.replace(str(tmp), _WORKSPACES_FILE)
 
 
 # ---------------------------------------------------------------------------

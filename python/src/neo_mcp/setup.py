@@ -105,13 +105,16 @@ def _daemon_pid_file(deployment_id: str) -> str:
 def _vscode_extension_running() -> bool:
     """Return True if VS Code/Cursor extension daemon is listening on localhost:31337.
 
-    The extension daemon creates ~/.neo/daemon/daemon.token and listens on port 31337.
+    The extension daemon creates ~/.neo/daemon/ipc_token and listens on port 31337.
     We check the token file first (fast path) then attempt a socket connection.
     NOTE: daemon.log is NOT used — in production the extension disables file logging,
     so sandboxId entries in daemon.log come only from the Python daemon.
     """
     import socket as _socket
-    token_path = Path(_DAEMON_DIR) / "daemon.token"
+    token_path = Path(_DAEMON_DIR) / "ipc_token"
+    legacy = Path(_DAEMON_DIR) / "daemon.token"
+    if not token_path.exists() and legacy.exists():
+        token_path = legacy
     if not token_path.exists():
         return False  # Fast path: no token file → extension not running
     try:

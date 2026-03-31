@@ -8,7 +8,7 @@
  */
 
 import { randomBytes, randomUUID } from 'crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
 import { tmpdir, userInfo } from 'os';
 import { join, resolve } from 'path';
@@ -41,8 +41,11 @@ const HOST = '127.0.0.1';
 const PORT = Number(process.env['NEO_DAEMON_PORT'] ?? 31337);
 const HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
 const IDLE_SHUTDOWN_MS = 5 * 60 * 1000;
+const MAX_THREAD_WORKSPACES = Number(process.env['NEO_THREAD_WORKSPACES_MAX'] ?? 500);
+const THREAD_WORKSPACES_TTL_MS = Number(process.env['NEO_THREAD_WORKSPACES_TTL_SECONDS'] ?? 7 * 24 * 60 * 60) * 1000;
 const LOCK_FILE = join(tmpdir(), `neo-poller-${userInfo().username}.lock`);
-const TOKEN_FILE = join(DAEMON_DIR, 'daemon.token');
+const TOKEN_FILE = join(DAEMON_DIR, 'ipc_token');
+const LEGACY_TOKEN_FILE = join(DAEMON_DIR, 'daemon.token');
 const IPC_ENABLED = process.env['NEO_DAEMON_IPC'] !== '0' && process.env['NODE_ENV'] !== 'test';
 
 function writeSandboxLog(deploymentId: string): void {
@@ -67,15 +70,51 @@ function getOrCreateDeploymentId(): string {
 
 function loadThreadWorkspaces(): Record<string, string> {
   try {
-    return JSON.parse(readFileSync(WORKSPACES_FILE, 'utf8')) as Record<string, string>;
+    const data = JSON.parse(readFileSync(WORKSPACES_FILE, 'utf8')) as Record<string, unknown>;
+    const out: Record<string, string> = {};
+    for (const [tid, value] of Object.entries(data)) {
+      if (typeof value === 'string') out[tid] = value;
+      if (value && typeof value === 'object' && typeof (value as { workspace?: unknown }).workspace === 'string') {
+        out[tid] = (value as { workspace: string }).workspace;
+      }
+    }
+    return out;
   } catch {
     return {};
   }
 }
 
 function saveThreadWorkspaces(workspaces: Record<string, string>): void {
+  const now = Date.now();
+  const minTs = now - THREAD_WORKSPACES_TTL_MS;
+  let previous: Record<string, { workspace: string; updated_at: number }> = {};
+  try {
+    const raw = JSON.parse(readFileSync(WORKSPACES_FILE, 'utf8')) as Record<string, unknown>;
+    for (const [tid, value] of Object.entries(raw)) {
+      if (!value || typeof value !== 'object') continue;
+      const workspace = (value as { workspace?: unknown }).workspace;
+      const updated = (value as { updated_at?: unknown }).updated_at;
+      if (typeof workspace === 'string' && typeof updated === 'number') {
+        previous[tid] = { workspace, updated_at: updated };
+      }
+    }
+  } catch {
+    previous = {};
+  }
+  let entries = Object.entries(workspaces).map(([tid, workspace]) => {
+    const prev = previous[tid];
+    const prevTs = prev && prev.workspace === workspace ? prev.updated_at * 1000 : now;
+    return { tid, workspace, updatedAt: prevTs };
+  });
+  entries = entries.filter((e) => e.updatedAt >= minTs && !!e.workspace);
+  if (entries.length > MAX_THREAD_WORKSPACES) {
+    entries = entries.slice(entries.length - MAX_THREAD_WORKSPACES);
+  }
   mkdirSync(DAEMON_DIR, { recursive: true });
-  writeFileSync(WORKSPACES_FILE, JSON.stringify(workspaces, null, 2));
+  const payload = Object.fromEntries(entries.map((e) => [e.tid, { workspace: e.workspace, updated_at: Math.floor(e.updatedAt / 1000) }]));
+  const tmpFile = `${WORKSPACES_FILE}.tmp-${process.pid}`;
+  writeFileSync(tmpFile, JSON.stringify(payload, null, 2));
+  renameSync(tmpFile, WORKSPACES_FILE);
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
@@ -239,6 +278,13 @@ class NpmPollerDaemon {
     if (existsSync(TOKEN_FILE)) {
       const token = readFileSync(TOKEN_FILE, 'utf8').trim();
       if (token) return token;
+    }
+    if (existsSync(LEGACY_TOKEN_FILE)) {
+      const token = readFileSync(LEGACY_TOKEN_FILE, 'utf8').trim();
+      if (token) {
+        writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
+        return token;
+      }
     }
     const token = randomBytes(32).toString('hex');
     writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
@@ -404,6 +450,8 @@ class NpmPollerDaemon {
         if (threadId) {
           response['thread_id'] = threadId;
           if (!this.threadWorkspaces[threadId]) {
+            // Move to insertion end order for bounded retention.
+            delete this.threadWorkspaces[threadId];
             this.threadWorkspaces[threadId] = workspace;
             saveThreadWorkspaces(this.threadWorkspaces);
           }
