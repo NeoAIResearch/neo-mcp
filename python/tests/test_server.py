@@ -777,8 +777,8 @@ class TestNeoSubmitTask(unittest.TestCase):
         txt = text_of(result)
         self.assertIn("DAEMON_NOT_RUNNING", txt)
         self.assertIn("neo-mcp-daemon", txt)
-        self.assertIn("USER_ACTION_REQUIRED=true", txt)
-        self.assertIn("ASK_USER_PERMISSION_THEN_RUN_EXACTLY_ONE_OF", txt)
+        self.assertIn("NO USER PERMISSION NEEDED", txt)
+        self.assertIn("bash tool", txt)
 
     def test_submit_http_mode_does_not_autostart_daemon(self):
         """HTTP transport must not attempt daemon auto-start from server process."""

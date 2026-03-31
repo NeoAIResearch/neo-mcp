@@ -2,13 +2,46 @@
 
 Run AI/ML tasks on Neo's remote backend from any AI editor — Claude Code, Cursor, Windsurf, Zed, VS Code, Continue.dev, OpenAI Codex CLI, Claude.ai, and ChatGPT.
 
-> **Task execution runs on your local machine** via the local Neo daemon (Go binary preferred, npm/pip fallback). The daemon receives commands from Neo's backend and executes them locally — writing files, running scripts. The MCP server performs a pre-submit daemon check and starts/validates local execution before task submission in stdio mode.
+> **Task execution runs on your local machine** via the local Neo daemon. The daemon receives commands from Neo's backend and executes them locally — writing files, running scripts.
 
 ---
 
 ## Quick start
 
-### One command (recommended)
+### Option A: pip install — stdio mode (RECOMMENDED — fully automatic, no manual daemon setup)
+
+The MCP server runs locally on your machine. Daemon startup is 100% automatic — no agent cooperation needed, no terminal commands, nothing.
+
+```bash
+# On most systems:
+pip install neo-mcp
+
+# On Debian/Ubuntu servers (externally-managed Python):
+pip install neo-mcp --break-system-packages
+# or:
+pip install neo-mcp --user
+```
+
+```bash
+claude mcp add --scope user neo \
+  -e NEO_SECRET_KEY=sk-v1-YOUR_KEY \
+  -- neo-mcp
+```
+
+Open a **new Claude Code session**. On first task submission the server silently auto-starts the daemon:
+
+1. `~/.neo/agent --daemon` (Go binary — preferred, fastest)
+2. `npx --yes neo-mcp-daemon` (npm — auto-downloads and starts Go binary)
+3. `neo-mcp daemon` (Python fallback)
+
+You never have to touch the daemon yourself.
+
+> **Prerequisite:** Node.js must be installed for the npm path (most servers have it).
+> If not: `curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs`
+
+---
+
+### Option B: Hosted HTTP server (no install needed, works across editors)
 
 ```bash
 claude mcp add --scope user neo \
@@ -16,29 +49,23 @@ claude mcp add --scope user neo \
   --header "Authorization: Bearer sk-v1-YOUR_KEY"
 ```
 
-Open a **new Claude Code session** and submit any AI/ML task. On first run the agent will ask:
-> *"I need to start your local Neo daemon. May I run this command?"*
+Open a **new Claude Code session** and submit any AI/ML task.
 
-Click **Allow** once — the Go daemon installs and starts automatically. All subsequent tasks run with no interruption. No terminal, no manual setup required.
-
----
-
-### Option B: VS Code or Cursor extension (zero setup)
-
-Install the [Neo extension](https://marketplace.visualstudio.com/items?itemName=NeoResearch.neo) from the marketplace and log in — the extension manages the daemon automatically. Then add the MCP server with the command above.
-
----
-
-### Option C: pip install (local stdio, daemon auto-starts silently)
+**Important:** The hosted server is a stateless bridge — it cannot start the daemon for you. **Start the daemon yourself once before submitting any task:**
 
 ```bash
-pip install neo-mcp
-claude mcp add --scope user neo \
-  -e NEO_SECRET_KEY=sk-v1-YOUR_KEY \
-  -- neo-mcp
+NEO_SECRET_KEY=sk-v1-YOUR_KEY npx --yes neo-mcp-daemon /path/to/your/workspace >/tmp/neo-daemon.log 2>&1 &
 ```
 
-In stdio mode, pre-submit checks try local daemon startup in this order: Go (`~/.neo/agent --daemon`), npm (`npx --yes neo-mcp-daemon`), then pip daemon fallback (`neo-mcp daemon`). Open a **new Claude Code session** after running these commands.
+The daemon keeps running in the background. You only need to do this once per machine boot (or add it to your startup script).
+
+> **Recommendation:** Use Option A (pip/stdio) on servers. HTTP mode works best with the VS Code/Cursor extension already installed — the extension manages the daemon automatically.
+
+---
+
+### Option C: VS Code or Cursor extension (zero setup)
+
+Install the [Neo extension](https://marketplace.visualstudio.com/items?itemName=NeoResearch.neo) from the marketplace and log in — the extension manages the daemon automatically. Then add the MCP server with Option B above.
 
 ---
 
@@ -54,6 +81,30 @@ curl -o ~/.claude/skills/neo.md \
 Then register the MCP server using any option above, and use `/neo <task>` in any Claude Code conversation.
 
 > **Other agent frameworks:** see [`skills/`](skills/README.md) for Vercel AI SDK, OpenAI Agents SDK, and LangChain integration guides.
+
+---
+
+## Starting the daemon manually
+
+If auto-start fails for any reason, run one of these in your terminal:
+
+```bash
+# Option 1 — Go binary (preferred, fastest)
+NEO_SECRET_KEY=sk-v1-YOUR_KEY ~/.neo/agent --daemon >/tmp/neo-daemon.log 2>&1 &
+
+# Option 2 — npm (installs Go binary automatically on first run)
+NEO_SECRET_KEY=sk-v1-YOUR_KEY npx --yes neo-mcp-daemon /path/to/your/workspace >/tmp/neo-daemon.log 2>&1 &
+
+# Option 3 — Python fallback (if npx unavailable)
+NEO_SECRET_KEY=sk-v1-YOUR_KEY neo-mcp daemon
+```
+
+Check the daemon is running:
+```bash
+cat /tmp/neo-daemon.log
+# or
+cat ~/.neo/daemon/daemon.log
+```
 
 ---
 
@@ -77,10 +128,10 @@ For general coding your assistant works locally — it only routes to Neo for AI
 You:       "Train a fraud detection model on fraud.csv, optimize for recall"
 Assistant: Submitting to Neo…
 
-           Step 1/4 ✅ Load and explore fraud.csv (50 000 rows, 23 features)
-           Step 2/4 ✅ Engineer features + handle class imbalance (SMOTE)
-           Step 3/4 ✅ Train XGBoost — AUC-ROC: 0.942, Recall: 0.91
-           Step 4/4 ✅ Save fraud_model.pkl + evaluation_report.html
+           Step 1/4  Load and explore fraud.csv (50 000 rows, 23 features)
+           Step 2/4  Engineer features + handle class imbalance (SMOTE)
+           Step 3/4  Train XGBoost — AUC-ROC: 0.942, Recall: 0.91
+           Step 4/4  Save fraud_model.pkl + evaluation_report.html
 
            Done. Files available via neo_get_files.
 ```
@@ -92,7 +143,9 @@ Assistant: Submitting to Neo…
 ```
 neo_submit_task
       │
-      ├─ discovers VS Code/Cursor extension sandbox ID
+      ├─ stdio mode: auto-starts daemon if not running
+      ├─ http mode: returns DAEMON_NOT_RUNNING if no daemon → agent runs startup command
+      │
       ├─ POST /v2/thread/init-chat-direct  →  thread_id  (returns immediately)
       │         deployment_type: "vscode"
       │
@@ -156,19 +209,20 @@ neo_send_feedback →  your reply  →  task resumes automatically
 ### Claude Code
 
 ```bash
-# pip (local)
+# pip (local stdio — most reliable, auto-starts daemon)
+pip install neo-mcp
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-... \
   -- neo-mcp
 
-# Hosted server (no install, recommended)
+# Hosted HTTP server (no install needed)
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
   --header "Authorization: Bearer sk-v1-..."
 ```
 
 > Open a **new Claude Code session** after running either command.
-> Important: use a different API key per machine to avoid deployment-id collisions across multiple devices.
+> Use a different API key per machine to avoid deployment-id collisions across devices.
 
 ### Cursor
 
@@ -298,9 +352,11 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for the full guide including Docker, scop
 |---|---|
 | `Invalid API key` (401) | Re-check `NEO_SECRET_KEY` at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys |
 | `Trial or quota ended` (403) | Top up at the Neo dashboard |
-| `No healthy deployments available` (400) | No daemon running. Your agent will offer to start it — click yes, or run `~/.neo/agent --daemon` manually (then npm/pip fallback if needed). Or install the Neo VS Code/Cursor extension. |
-| `Task submitted but no files written locally` | Daemon must be running for local file writes — agent will offer to start it |
-| Task submission hangs or times out | Daemon has stopped — agent will offer to restart it, or run `~/.neo/agent --daemon` manually (then npm/pip fallback) |
+| `No healthy deployments available` (400) | No daemon running — see "Starting the daemon manually" above |
+| Agent shows DAEMON_NOT_RUNNING but doesn't run a command | Run the daemon manually: `NEO_SECRET_KEY=sk-v1-... npx --yes neo-mcp-daemon /your/workspace &` |
+| `~/.neo/agent` not found (Exit 127) | Go binary not installed — use `npx --yes neo-mcp-daemon` instead (installs it automatically) |
+| `Task submitted but no files written locally` | Daemon not running — start it and resubmit |
+| Task submission hangs or times out | Daemon stopped — restart with `npx --yes neo-mcp-daemon /workspace &` |
 | `neo-mcp` not found | Re-run `pip install neo-mcp` and verify `which neo-mcp` |
 | Neo tools don't appear after `claude mcp add` | Open a **new Claude Code session** — tools load at session start |
 | Output truncated | Cap is ~20 000 tokens — use `neo_task_plan` for a concise step summary |
