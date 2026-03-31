@@ -31,6 +31,7 @@ _THREAD_ID_FILE = os.path.expanduser("~/.neo/active_thread_id")
 _THREAD_WORKSPACES_FILE = os.path.expanduser("~/.neo/daemon/thread-workspaces.json")
 _DAEMON_DIR = os.path.expanduser("~/.neo/daemon")
 _NPM_STARTUP_LOG = os.path.expanduser("~/.neo/daemon/npm_daemon_start.log")
+_PYTHON_STARTUP_LOG = os.path.expanduser("~/.neo/daemon/python_daemon_start.log")
 _DAEMON_PORT = 31337
 # Tracks deployment_ids we are actively heartbeating so we don't start duplicate tasks.
 _active_heartbeats: set[str] = set()
@@ -171,16 +172,14 @@ def _get_deployment_id() -> str:
     Priority:
     1. Per-request X-Neo-Deployment-Id header (HTTP mode — set by context var)
     2. NEO_DEPLOYMENT_ID env var
-    3. Derived from API key — primary path for npm daemon routing
-    4. VS Code/Cursor extension daemon.log
-    5. Python daemon standalone_deployment_id file (legacy fallback)
+    3. Derived from API key — primary path for daemon routing
     """
     if dep := _ctx_deployment_id.get() or NEO_DEPLOYMENT_ID:
         return dep
     sk = _ctx_secret_key.get() or NEO_SECRET_KEY
     if sk:
         return _derive_deployment_id(sk)
-    return _discover_sandbox_id()
+    return ""
 
 
 async def _heartbeat_loop(deployment_id: str) -> None:
@@ -270,6 +269,14 @@ def _derive_deployment_id(secret_key: str) -> str:
     return str(_uuid.UUID(bytes=digest, version=5))
 
 
+def _derive_local_daemon_deployment_id(secret_key: str) -> str:
+    """Derive a stdio-local daemon UUID that won't collide with extension/key UUIDs."""
+    import hashlib
+    import uuid as _uuid
+    digest = hashlib.sha256((secret_key + "::neo-local-daemon-v1").encode()).digest()[:16]
+    return str(_uuid.UUID(bytes=digest, version=5))
+
+
 def _get_or_create_persistent_deployment_id(secret_key: str = "") -> str:
     """Return the best available persistent deployment UUID.
 
@@ -350,19 +357,66 @@ async def _auto_start_npm_daemon(secret_key: str, deployment_id: str = "", works
     return False
 
 
+async def _auto_start_python_daemon(secret_key: str, deployment_id: str = "", workspace: str = "") -> bool:
+    """Start `neo-mcp daemon` as a detached background process."""
+    import shutil
+    import subprocess
+
+    neo_mcp_bin = shutil.which("neo-mcp")
+    if not neo_mcp_bin:
+        return False
+
+    cmd = [neo_mcp_bin, "daemon", workspace or _server_cwd]
+    if deployment_id:
+        cmd += ["--deployment-id", deployment_id]
+
+    env = os.environ.copy()
+    env["NEO_SECRET_KEY"] = secret_key
+
+    if _python_daemon_running(deployment_id):
+        return True
+
+    log_fp = None
+    try:
+        os.makedirs(_DAEMON_DIR, exist_ok=True)
+        log_fp = open(_PYTHON_STARTUP_LOG, "ab")
+        subprocess.Popen(
+            cmd, env=env,
+            stdout=log_fp, stderr=log_fp,
+            start_new_session=True,
+        )
+    except Exception:
+        return False
+    finally:
+        try:
+            log_fp.close()
+        except Exception:
+            pass
+
+    for _ in range(30):
+        await asyncio.sleep(0.5)
+        if _python_daemon_running(deployment_id):
+            return True
+
+    return False
+
+
 async def _ensure_local_daemon(secret_key: str, deployment_id: str, workspace: str) -> bool:
     """Ensure there's a healthy local executor for this deployment ID.
 
-    Order:
-    1) VS Code/Cursor extension daemon on localhost:31337 (register + heartbeat)
-    2) npm daemon process (auto-start if needed)
+    Startup order:
+    1) npm daemon process (if already running)
+    2) auto-start npm daemon
+    3) python daemon process (if already running)
+    4) auto-start python daemon (fallback)
     """
-    registered = await _register_with_daemon(deployment_id, secret_key, workspace)
-    if registered:
-        return True
     if _npm_daemon_running(deployment_id):
         return True
-    return await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
+    if await _auto_start_npm_daemon(secret_key, deployment_id, workspace):
+        return True
+    if _python_daemon_running(deployment_id):
+        return True
+    return await _auto_start_python_daemon(secret_key, deployment_id, workspace)
 
 
 # Capture working directory at server startup — this is where the user launched the MCP client from
@@ -407,8 +461,10 @@ def handle_error(status_code: int) -> str:
         400: (
             "DAEMON_NOT_RUNNING\n"
             "Automatic daemon startup was attempted but no healthy local daemon is available.\n"
-            "Start it manually as a fallback:\n"
-            "  npx --yes neo-mcp-daemon &"
+            "Start it manually as a fallback (user machine):\n"
+            "  npx --yes neo-mcp-daemon &\n"
+            "or\n"
+            "  neo-mcp daemon"
         ),
         401: "Invalid API key. Check your NEO_SECRET_KEY configuration.",
         402: "Your Neo account has insufficient credits.",
@@ -811,16 +867,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if name == "neo_submit_task":
             secret_key = _ctx_secret_key.get() or NEO_SECRET_KEY
             explicit_deployment_id = _ctx_deployment_id.get() or NEO_DEPLOYMENT_ID
-            derived_deployment_id = _derive_deployment_id(secret_key) if secret_key else ""
-
-            # Step 1: Determine the deployment UUID to use.
-            # Priority:
-            #   a) X-Neo-Deployment-Id header / NEO_DEPLOYMENT_ID env var (explicit override)
-            #   b) Running VS Code extension / local daemon (discovered via daemon.log)
-            #   c) Key-derived UUID — deterministic from the API key, unique per user,
-            #      works on hosted server without any extra setup (same concept as VS Code's
-            #      StateManager.getDeploymentId() but key-based instead of file-based)
-            deployment_id = _get_deployment_id()  # covers (a), (b), and key-derived path
+            deployment_id = _get_deployment_id()
 
             # Deployment ID — derived from API key (same UUID the npm daemon uses)
             if not deployment_id:
@@ -831,13 +878,28 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     ))]
                 deployment_id = _derive_deployment_id(secret_key)
 
+            # In local stdio mode, avoid colliding with extension/key-derived deployments
+            # that may be pinned to a stale workspace. Only remap when deployment_id was
+            # auto-derived (not explicitly overridden by header/env).
+            if (
+                NEO_TRANSPORT == "stdio"
+                and secret_key
+                and not explicit_deployment_id
+                and deployment_id == _derive_deployment_id(secret_key)
+            ):
+                deployment_id = _derive_local_daemon_deployment_id(secret_key)
+
             description = arguments["description"]
             auto_mode = arguments.get("auto_mode", False)
             wait = arguments.get("wait_for_completion", False)
             workspace = arguments.get("workspace") or _server_cwd
 
-            # Always try to ensure a local executor first (extension or npm daemon).
-            await _ensure_local_daemon(secret_key, deployment_id, workspace)
+            # Auto-start daemon only in stdio mode (local process on user's machine).
+            # In HTTP mode, never try to start daemons from the server process.
+            if NEO_TRANSPORT != "http":
+                ready = await _ensure_local_daemon(secret_key, deployment_id, workspace)
+                if not ready:
+                    return [TextContent(type="text", text=handle_error(400))]
 
             prefix = f"Working directory: {workspace}\n\nCreate all files inside this directory.\n\n"
             message = f"{prefix}{description}"
@@ -864,8 +926,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             if resp.status_code == 400:
                 # 400 = no healthy daemon for this deployment.
-                # Retry path must handle deployment-ID mismatch, not only daemon absence.
-                started = await _ensure_local_daemon(secret_key, deployment_id, workspace)
+                # Retry-once auto-start is only allowed in local stdio mode.
+                started = False
+                if NEO_TRANSPORT != "http":
+                    started = await _ensure_local_daemon(secret_key, deployment_id, workspace)
                 if started:
                     # Retry the submit once
                     try:
@@ -875,27 +939,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         )
                     except Exception:
                         pass  # fall through to error handling below
-
-                # If deployment_id came from discovery (not an explicit override), and
-                # backend still reports no healthy deployment, retry once with key-derived
-                # ID to recover from stale/incorrect discovered IDs.
-                if (
-                    resp.status_code == 400
-                    and not explicit_deployment_id
-                    and derived_deployment_id
-                    and deployment_id != derived_deployment_id
-                ):
-                    deployment_id = derived_deployment_id
-                    submit_body["deployment_id"] = deployment_id
-                    started = await _ensure_local_daemon(secret_key, deployment_id, workspace)
-                    if started:
-                        try:
-                            resp = await client.post(
-                                "/v2/thread/init-chat-direct",
-                                headers=_headers(), json=submit_body, timeout=30.0,
-                            )
-                        except Exception:
-                            pass
 
                 if resp.status_code == 400:
                     return [TextContent(type="text", text=handle_error(400))]
@@ -1198,7 +1241,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 pass
 
             if not workspace:
-                workspace = _server_cwd
+                return [TextContent(type="text", text=(
+                    "No local workspace mapping found for this thread.\n"
+                    "Refusing server-side filesystem fallback.\n"
+                    "Resubmit with an explicit workspace and ensure the daemon is running on the user machine."
+                ))]
 
             if not os.path.isdir(workspace):
                 return [TextContent(type="text", text=f"Workspace not found: {workspace}")]
@@ -1618,6 +1665,31 @@ def _npm_daemon_running(deployment_id: str = "") -> bool:
         _safe_unlink(dep_pid_path)
         return False
     return dep_pid == npm_pid
+
+
+def _python_daemon_running(deployment_id: str = "") -> bool:
+    """Return True when the Python daemon process is alive."""
+    py_pid_path = os.path.expanduser("~/.neo/daemon/python_daemon.pid")
+    py_pid = _read_pid_file(py_pid_path)
+    if py_pid is None:
+        return False
+    if not _pid_alive(py_pid):
+        _safe_unlink(py_pid_path)
+        return False
+    if not _pid_matches_any_cmdline(py_pid, ("neo_mcp.daemon", "neo-mcp daemon", "daemon.py")):
+        return False
+
+    if not deployment_id:
+        return True
+
+    dep_pid_path = os.path.expanduser(f"~/.neo/daemon/daemon_{deployment_id[:8]}.pid")
+    dep_pid = _read_pid_file(dep_pid_path)
+    if dep_pid is None:
+        return True  # allow global python daemon PID fallback
+    if not _pid_alive(dep_pid):
+        _safe_unlink(dep_pid_path)
+        return False
+    return dep_pid == py_pid
 
 
 def _read_pid_file(path: str) -> int | None:

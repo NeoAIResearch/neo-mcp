@@ -438,24 +438,20 @@ class TestGetDeploymentId(unittest.TestCase):
 
     def test_env_override_takes_priority(self):
         srv.NEO_DEPLOYMENT_ID = "env-override-id"
-        with patch("neo_mcp.server._discover_sandbox_id", return_value="discovered"):
-            result = srv._get_deployment_id()
+        result = srv._get_deployment_id()
         self.assertEqual(result, "env-override-id")
 
-    def test_key_derived_takes_priority_over_discovery(self):
+    def test_key_derived_when_env_not_set(self):
         srv.NEO_DEPLOYMENT_ID = ""
         srv.NEO_SECRET_KEY = "sk-v1-priority-test"
-        with patch("neo_mcp.server._discover_sandbox_id", return_value="discovered-id"):
-            result = srv._get_deployment_id()
+        result = srv._get_deployment_id()
         self.assertRegex(result, r"^[a-f0-9\-]{36}$")
-        self.assertNotEqual(result, "discovered-id")
 
-    def test_falls_back_to_discovery_when_no_key(self):
+    def test_returns_empty_when_no_header_env_or_key(self):
         srv.NEO_DEPLOYMENT_ID = ""
         srv.NEO_SECRET_KEY = ""
-        with patch("neo_mcp.server._discover_sandbox_id", return_value="discovered-id"):
-            result = srv._get_deployment_id()
-        self.assertEqual(result, "discovered-id")
+        result = srv._get_deployment_id()
+        self.assertEqual(result, "")
 
     def test_returns_empty_when_nothing_found_and_no_key(self):
         """When no header, env var, files, AND no API key: return empty."""
@@ -464,8 +460,7 @@ class TestGetDeploymentId(unittest.TestCase):
         try:
             srv.NEO_SECRET_KEY = ""
             srv._ctx_secret_key.set("")
-            with patch("neo_mcp.server._discover_sandbox_id", return_value=""):
-                result = srv._get_deployment_id()
+            result = srv._get_deployment_id()
             self.assertEqual(result, "")
         finally:
             srv.NEO_SECRET_KEY = orig_key
@@ -477,16 +472,14 @@ class TestGetDeploymentId(unittest.TestCase):
         try:
             srv.NEO_SECRET_KEY = "sk-v1-testkey"
             srv._ctx_secret_key.set("")
-            with patch("neo_mcp.server._discover_sandbox_id", return_value=""):
-                result = srv._get_deployment_id()
-                self.assertRegex(result, r"^[a-f0-9\-]{36}$")
-                # Same key → same UUID on every call (deterministic)
-                result2 = srv._get_deployment_id()
-                self.assertEqual(result, result2)
+            result = srv._get_deployment_id()
+            self.assertRegex(result, r"^[a-f0-9\-]{36}$")
+            # Same key → same UUID on every call (deterministic)
+            result2 = srv._get_deployment_id()
+            self.assertEqual(result, result2)
             # Different key → different UUID
             srv.NEO_SECRET_KEY = "sk-v1-otherkey"
-            with patch("neo_mcp.server._discover_sandbox_id", return_value=""):
-                result3 = srv._get_deployment_id()
+            result3 = srv._get_deployment_id()
             self.assertNotEqual(result, result3)
         finally:
             srv.NEO_SECRET_KEY = orig_key
@@ -748,8 +741,8 @@ class TestNeoSubmitTask(unittest.TestCase):
         self.assertIn("DAEMON_NOT_RUNNING", txt)
         self.assertIn("neo-mcp-daemon", txt)
 
-    def test_submit_http_mode_still_attempts_local_daemon_autostart(self):
-        """HTTP transport should still attempt automatic daemon readiness."""
+    def test_submit_http_mode_does_not_autostart_daemon(self):
+        """HTTP transport must not attempt daemon auto-start from server process."""
         resp_ok = make_response(200, {"thread_id": "tid-http-auto"})
         srv.NEO_TRANSPORT = "http"
         mock_ensure = AsyncMock(return_value=True)
@@ -763,23 +756,20 @@ class TestNeoSubmitTask(unittest.TestCase):
             result = call_tool("neo_submit_task", {"description": "train a model"})
 
         self.assertIn("tid-http-auto", text_of(result))
-        mock_ensure.assert_awaited()
+        mock_ensure.assert_not_awaited()
 
-    def test_submit_400_fallbacks_to_key_derived_deployment_id(self):
-        """If discovered deployment_id is stale, retry once with key-derived ID."""
-        stale_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-        key_id = "11111111-2222-5333-8444-555555555555"
+    def test_submit_400_retries_once_same_deployment_id(self):
+        """Daemon-only mode retries once after ensure_local_daemon."""
+        dep_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         captured_ids: list[str] = []
 
         async def mock_post(url, **kwargs):
             body = kwargs.get("json", {})
             captured_ids.append(body.get("deployment_id"))
-            # 1st call: initial submit with stale id -> 400
-            # 2nd call: retry after ensure with stale id -> 400
-            # 3rd call: fallback with key-derived id -> 200
-            if len(captured_ids) < 3:
+            # 1st call -> 400, 2nd call (retry) -> 200
+            if len(captured_ids) == 1:
                 return make_response(400, {"detail": "No healthy deployments"})
-            return make_response(200, {"thread_id": "tid-fallback"})
+            return make_response(200, {"thread_id": "tid-retry"})
 
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(side_effect=mock_post)
@@ -789,8 +779,7 @@ class TestNeoSubmitTask(unittest.TestCase):
 
         dep_token = srv._ctx_deployment_id.set("")
         try:
-            with patch("neo_mcp.server._get_deployment_id", return_value=stale_id), \
-             patch("neo_mcp.server._derive_deployment_id", return_value=key_id), \
+            with patch("neo_mcp.server._get_deployment_id", return_value=dep_id), \
              patch("neo_mcp.server._ensure_local_daemon", new_callable=AsyncMock, return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
              patch("asyncio.create_task"):
@@ -798,9 +787,8 @@ class TestNeoSubmitTask(unittest.TestCase):
         finally:
             srv._ctx_deployment_id.reset(dep_token)
 
-        self.assertIn("tid-fallback", text_of(result))
-        self.assertEqual(captured_ids[:2], [stale_id, stale_id])
-        self.assertEqual(captured_ids[2], key_id)
+        self.assertIn("tid-retry", text_of(result))
+        self.assertEqual(captured_ids, [dep_id, dep_id])
 
     def test_submit_401_returns_invalid_key_error(self):
         resp_401 = make_response(401, {"detail": "Unauthorized"})
@@ -915,35 +903,15 @@ class TestNeoSubmitTask(unittest.TestCase):
         self.assertIn("COMPLETED", txt)
         self.assertIn("Model trained!", txt)
 
-    # -- VS Code extension / daemon auto-start routing tests ----------------
+    # -- daemon-only auto-start routing tests --------------------------------
 
-    def test_vscode_extension_running_skips_daemon_autostart(self):
-        """When _register_with_daemon succeeds (VS Code extension on 31337), npm daemon must NOT start."""
-        resp_ok = make_response(200, {"thread_id": "tid-ext-skip"})
-        ext_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-        mock_daemon = AsyncMock()
-
-        with patch("neo_mcp.server._get_deployment_id", return_value=ext_id), \
-             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=True), \
-             patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
-             patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
-             patch("asyncio.create_task"):
-            ctx, _ = make_async_client({"DEFAULT": resp_ok})
-            MockClient.return_value = ctx
-            result = call_tool("neo_submit_task", {"description": "train model"})
-
-        mock_daemon.assert_not_called()
-        self.assertIn("tid-ext-skip", text_of(result))
-
-    def test_no_extension_no_npm_daemon_autostart_triggered(self):
-        """When no VS Code extension and npm daemon not running, auto-start must be called."""
-        resp_ok = make_response(200, {"thread_id": "tid-no-ext"})
+    def test_no_npm_daemon_autostart_triggered(self):
+        """When npm daemon is not running, auto-start must be called."""
+        resp_ok = make_response(200, {"thread_id": "tid-no-daemon"})
         mock_daemon = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
@@ -953,17 +921,37 @@ class TestNeoSubmitTask(unittest.TestCase):
             result = call_tool("neo_submit_task", {"description": "train model"})
 
         mock_daemon.assert_called_once()
-        self.assertIn("tid-no-ext", text_of(result))
+        self.assertIn("tid-no-daemon", text_of(result))
+
+    def test_python_daemon_fallback_when_npm_start_fails(self):
+        """If npm daemon cannot start, Python daemon fallback is attempted."""
+        resp_ok = make_response(200, {"thread_id": "tid-py-fallback"})
+        mock_npm_start = AsyncMock(return_value=False)
+        mock_py_start = AsyncMock(return_value=True)
+
+        with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
+             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
+             patch("neo_mcp.server._auto_start_python_daemon", mock_py_start), \
+             patch("asyncio.sleep", new_callable=AsyncMock), \
+             patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
+             patch("asyncio.create_task"):
+            ctx, _ = make_async_client({"DEFAULT": resp_ok})
+            MockClient.return_value = ctx
+            result = call_tool("neo_submit_task", {"description": "train model"})
+
+        mock_npm_start.assert_called_once()
+        mock_py_start.assert_called_once()
+        self.assertIn("tid-py-fallback", text_of(result))
 
     def test_npm_daemon_already_running_no_restart(self):
         """If daemon already running for deployment, skip auto-start."""
         resp_ok = make_response(200, {"thread_id": "tid-already-running"})
         mock_daemon = AsyncMock()
-        mock_register = AsyncMock(return_value=False)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
              patch("neo_mcp.server._npm_daemon_running", return_value=True), \
-             patch("neo_mcp.server._register_with_daemon", mock_register), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
@@ -972,35 +960,11 @@ class TestNeoSubmitTask(unittest.TestCase):
             call_tool("neo_submit_task", {"description": "train model"})
 
         mock_daemon.assert_not_called()
-        mock_register.assert_called_once()
-
-    def test_stale_daemon_log_does_not_block_autostart(self):
-        """Stale sandboxId in daemon.log must NOT prevent daemon auto-start.
-        This was the core bug: _vscode_daemon_deployment_id() returned a stale Python
-        daemon entry, blocking auto-start even when the daemon was dead."""
-        resp_ok = make_response(200, {"thread_id": "tid-stale"})
-        stale_id = "deadbeef-0000-0000-0000-000000000000"
-        mock_daemon = AsyncMock(return_value=True)
-
-        with patch("neo_mcp.server._get_deployment_id", return_value=stale_id), \
-             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
-             patch("asyncio.sleep", new_callable=AsyncMock), \
-             patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
-             patch("asyncio.create_task"):
-            ctx, _ = make_async_client({"DEFAULT": resp_ok})
-            MockClient.return_value = ctx
-            call_tool("neo_submit_task", {"description": "train model"})
-
-        # Daemon MUST be started even though daemon.log had a stale entry
-        mock_daemon.assert_called_once()
-
-    def test_extension_id_sent_in_submit_body(self):
-        """Extension deployment_id must be forwarded to init-chat-direct."""
+    def test_deployment_id_sent_in_submit_body(self):
+        """Resolved deployment_id must be forwarded to init-chat-direct."""
         captured = {}
         resp_ok = make_response(200, {"thread_id": "tid-body"})
-        ext_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+        dep_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 
         async def mock_post(url, **kwargs):
             captured.update(kwargs.get("json", {}))
@@ -1012,18 +976,18 @@ class TestNeoSubmitTask(unittest.TestCase):
         ctx.__aenter__ = AsyncMock(return_value=mock_client)
         ctx.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("neo_mcp.server._get_deployment_id", return_value=ext_id), \
+        with patch("neo_mcp.server._get_deployment_id", return_value=dep_id), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=True), \
+             patch("neo_mcp.server._auto_start_npm_daemon", new_callable=AsyncMock, return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
              patch("asyncio.create_task"):
             call_tool("neo_submit_task", {"description": "task"})
 
-        self.assertEqual(captured.get("deployment_id"), ext_id)
+        self.assertEqual(captured.get("deployment_id"), dep_id)
         self.assertEqual(captured.get("deployment_type"), "vscode")
 
-    def test_key_derived_id_used_when_no_extension_no_existing_id(self):
-        """When no extension and no discovered ID, key-derived UUID is submitted."""
+    def test_local_daemon_id_used_in_stdio_when_no_existing_id(self):
+        """In stdio mode, submit remaps key-derived ID to local-daemon ID."""
         captured = {}
         resp_ok = make_response(200, {"thread_id": "tid-key-derived"})
         key_uuid = "cccccccc-dddd-eeee-ffff-aaaaaaaaaaaa"
@@ -1045,7 +1009,8 @@ class TestNeoSubmitTask(unittest.TestCase):
              patch("asyncio.create_task"):
             call_tool("neo_submit_task", {"description": "task"})
 
-        self.assertEqual(captured.get("deployment_id"), key_uuid)
+        expected = srv._derive_local_daemon_deployment_id(srv.NEO_SECRET_KEY)
+        self.assertEqual(captured.get("deployment_id"), expected)
 
 
 # ---------------------------------------------------------------------------
@@ -1408,21 +1373,16 @@ class TestNeoGetFiles(unittest.TestCase):
         self.assertIn("# model code", txt)
         self.assertIn("README.md", txt)
 
-    def test_falls_back_to_server_cwd_when_no_workspace_map(self):
-        # No workspaces file — should fall back to _server_cwd
-        workspace = tempfile.mkdtemp()
-        with open(os.path.join(workspace, "output.txt"), "w") as f:
-            f.write("result data\n")
-        srv._server_cwd = workspace
-
+    def test_no_workspace_map_returns_error(self):
+        # No workspaces file — must fail fast (no server-side cwd fallback)
         with patch("neo_mcp.server.httpx.AsyncClient") as MockClient:
             ctx, _ = make_async_client({})
             MockClient.return_value = ctx
             result = call_tool("neo_get_files", {"thread_id": "tid-f4"})
 
         txt = text_of(result)
-        self.assertIn("output.txt", txt)
-        self.assertIn("result data", txt)
+        self.assertIn("No local workspace mapping found", txt)
+        self.assertIn("Refusing server-side filesystem fallback", txt)
 
 
 # ---------------------------------------------------------------------------
