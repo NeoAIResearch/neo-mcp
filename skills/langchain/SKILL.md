@@ -280,5 +280,5 @@ chain = prompt | llm | StrOutputParser()
 ## Notes
 
 - `thread_id` is optional — the server auto-recovers the last active thread.
-- Task execution requires a daemon on the user's machine: install the **Neo VS Code/Cursor extension** (zero setup), or let an agent with terminal access start it automatically on first task (`neo-mcp daemon &` — uses `NEO_SECRET_KEY` directly).
+- Task execution requires a daemon on the user's machine: install the **Neo VS Code/Cursor extension** (zero setup), or let an agent with terminal access start it automatically on first task (`~/.neo/agent --daemon` first, then npm/pip fallback — uses `NEO_SECRET_KEY` directly).
 - Get your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.

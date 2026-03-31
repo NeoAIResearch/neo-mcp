@@ -221,15 +221,17 @@ Tasks execute on your machine via a daemon process that polls the Neo backend fo
 
 **Stdio (local pip install):** The daemon starts automatically and silently when you submit your first task. No manual steps needed.
 
-**Hosted server (HTTP transport):** The hosted server can't start a daemon on your machine. Instead, when no daemon is found, `neo_submit_task` returns a message telling your agent to run:
+**Hosted server (HTTP transport):** The hosted server can't start a daemon on your machine. Instead, when no daemon is found, `neo_submit_task` returns a message telling your agent to run (in this order):
 ```bash
-npx neo-mcp-daemon &
+~/.neo/agent --daemon
+npx --yes neo-mcp-daemon &
+neo-mcp daemon
 ```
 Agents with terminal access (Claude Code, Cursor, Windsurf, Codex CLI) will ask your permission and start it automatically. Web clients (ChatGPT, Claude.ai) will show you the command to run.
 
 **To keep the daemon running across reboots**, add to `~/.zshrc` or `~/.bashrc`:
 ```bash
-pgrep -f "neo-mcp-daemon" > /dev/null || NEO_SECRET_KEY=sk-v1-YOUR_KEY npx neo-mcp-daemon &
+pgrep -f "/.neo/agent --daemon" > /dev/null || NEO_SECRET_KEY=sk-v1-YOUR_KEY ~/.neo/agent --daemon &
 ```
 
 The daemon authenticates with `NEO_SECRET_KEY` directly — no login step needed.
@@ -290,6 +292,6 @@ neo-mcp setup --secret-key sk-v1-... --editor claude --scope project
 | `Trial or quota ended` (403) | Out of credits | Top up at the Neo dashboard |
 | `neo-mcp` command not found | Install incomplete or PATH issue | Re-run `pip install neo-mcp`; verify with `which neo-mcp` |
 | Tools don't appear after restart | Config path wrong or JSON syntax error | Validate the JSON and check the file location for your editor |
-| `DAEMON_NOT_RUNNING` on task submit | No daemon active | Agent will offer to run `npx neo-mcp-daemon &` — click yes. Or install the Neo VS Code/Cursor extension. |
+| `DAEMON_NOT_RUNNING` on task submit | No daemon active | Agent will offer Go daemon start first (`~/.neo/agent --daemon`), then npm/pip fallback — click yes. |
 | Task submitted but no files written locally | Daemon not running | Agent will offer to start it — click yes |
 | Status stuck on RUNNING | Step waiting for daemon | Call `neo_task_plan` to see which step is blocked |
