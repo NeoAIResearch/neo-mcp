@@ -474,37 +474,34 @@ class TestGetDeploymentId(unittest.TestCase):
     def test_returns_empty_when_no_header_env_or_key(self):
         srv.NEO_DEPLOYMENT_ID = ""
         srv.NEO_SECRET_KEY = ""
-        with patch("neo_mcp.server._read_go_daemon_local_id", return_value=""):
-            result = srv._get_deployment_id()
+        result = srv._get_deployment_id()
         self.assertEqual(result, "")
 
     def test_returns_empty_when_nothing_found_and_no_key(self):
-        """When no header, env var, files, AND no API key: return empty."""
+        """When no header, env var, AND no API key: return empty."""
         srv.NEO_DEPLOYMENT_ID = ""
         orig_key = srv.NEO_SECRET_KEY
         try:
             srv.NEO_SECRET_KEY = ""
             srv._ctx_secret_key.set("")
-            with patch("neo_mcp.server._read_go_daemon_local_id", return_value=""):
-                result = srv._get_deployment_id()
+            result = srv._get_deployment_id()
             self.assertEqual(result, "")
         finally:
             srv.NEO_SECRET_KEY = orig_key
 
     def test_falls_back_to_key_derived_uuid(self):
-        """When no header/env/files but API key is set, derive UUID from key."""
+        """When no header/env but API key is set, derive UUID from key."""
         srv.NEO_DEPLOYMENT_ID = ""
         orig_key = srv.NEO_SECRET_KEY
         try:
             srv.NEO_SECRET_KEY = "sk-v1-testkey"
             srv._ctx_secret_key.set("")
-            with patch("neo_mcp.server._read_go_daemon_local_id", return_value=""):
-                result = srv._get_deployment_id()
-                self.assertRegex(result, r"^[a-f0-9\-]{36}$")
-                result2 = srv._get_deployment_id()
-                self.assertEqual(result, result2)
-                srv.NEO_SECRET_KEY = "sk-v1-otherkey"
-                result3 = srv._get_deployment_id()
+            result = srv._get_deployment_id()
+            self.assertRegex(result, r"^[a-f0-9\-]{36}$")
+            result2 = srv._get_deployment_id()
+            self.assertEqual(result, result2)
+            srv.NEO_SECRET_KEY = "sk-v1-otherkey"
+            result3 = srv._get_deployment_id()
             self.assertNotEqual(result, result3)
         finally:
             srv.NEO_SECRET_KEY = orig_key

@@ -236,36 +236,17 @@ def _discover_sandbox_id() -> str:
     return ""
 
 
-def _read_go_daemon_local_id() -> str:
-    """Read the Go daemon's unique local deployment ID from disk.
-
-    The Go daemon writes this file on first start so that task submissions
-    are routed exclusively to it, bypassing any VS Code extension or other
-    daemon polling the key-derived deployment ID.
-    """
-    path = os.path.expanduser("~/.neo/daemon/go_daemon_local_id")
-    try:
-        uid = open(path).read().strip()
-        if uid and re.match(r'^[a-f0-9\-]{36}$', uid):
-            return uid
-    except OSError:
-        pass
-    return ""
-
-
 def _get_deployment_id() -> str:
     """Return deployment ID.
 
     Priority:
     1. Per-request X-Neo-Deployment-Id header (HTTP mode — set by context var)
     2. NEO_DEPLOYMENT_ID env var
-    3. Go daemon local ID — machine-local UUID that avoids VS Code extension competition
-    4. Derived from API key — fallback when Go daemon is not running
+    3. Derived from API key — Go daemon and hosted server both use the same
+       SHA-256 derivation, so no coordination file is needed.
     """
     if dep := _ctx_deployment_id.get() or NEO_DEPLOYMENT_ID:
         return dep
-    if go_id := _read_go_daemon_local_id():
-        return go_id
     sk = _ctx_secret_key.get() or NEO_SECRET_KEY
     if sk:
         return _derive_deployment_id(sk)
