@@ -443,6 +443,7 @@ app = Server(
         "DAEMON STARTUP — if neo_submit_task returns DAEMON_NOT_RUNNING:\n"
         "  In stdio mode this server auto-starts daemon locally (npx then python fallback).\n"
         "  In HTTP mode, run startup commands on the USER MACHINE and retry submit:\n"
+        "  Always ask the user for permission before running startup commands.\n"
         "    1) npx --yes neo-mcp-daemon &\n"
         "    2) neo-mcp daemon\n\n"
         "WORKSPACE — always pass the correct directory:\n"
@@ -465,6 +466,8 @@ def handle_error(status_code: int) -> str:
         400: (
             "DAEMON_NOT_RUNNING\n"
             "Automatic daemon startup was attempted but no healthy local daemon is available.\n"
+            "USER_ACTION_REQUIRED=true\n"
+            "ASK_USER_PERMISSION_TO_RUN_LOCAL_STARTUP=true\n"
             "LOCAL_STARTUP_COMMANDS (run on user machine):\n"
             "1. npx --yes neo-mcp-daemon &\n"
             "2. neo-mcp daemon\n"
