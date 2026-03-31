@@ -16,7 +16,10 @@ claude mcp add --scope user neo \
   --header "Authorization: Bearer sk-v1-YOUR_KEY"
 ```
 
-Open a **new Claude Code session**, then submit an AI/ML task. On first run, your agent may ask permission to start the local daemon (`~/.neo/agent --daemon`, then npm/pip fallback if needed). That's it. No login flow required.
+Open a **new Claude Code session** and submit any AI/ML task. On first run the agent will ask:
+> *"I need to start your local Neo daemon. May I run this command?"*
+
+Click **Allow** once — the Go daemon installs and starts automatically. All subsequent tasks run with no interruption. No terminal, no manual setup required.
 
 ---
 
