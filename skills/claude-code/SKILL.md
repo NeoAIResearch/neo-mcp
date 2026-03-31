@@ -42,13 +42,19 @@ Always follow this sequence. Do not skip steps.
 
 ## Daemon auto-start — your responsibility
 
-If `neo_submit_task` returns a `DAEMON_NOT_RUNNING` message, **run the daemon for the user** (ask permission first):
+If `neo_submit_task` returns a `DAEMON_NOT_RUNNING` message, **run daemon startup on the user's machine and retry automatically**:
 
 ```bash
-neo-mcp daemon &
+npx --yes neo-mcp-daemon &
 ```
 
-Then immediately retry `neo_submit_task`. Do not give up or ask the user to do it manually — just run the command with their approval. The daemon starts in under 3 seconds.
+If that fails, fallback:
+
+```bash
+neo-mcp daemon
+```
+
+Then immediately retry `neo_submit_task`. Do not hand the startup steps back to the user unless local command execution is unavailable in the client.
 
 > **Why this happens:** The Neo daemon must run on the user's machine to execute tasks. It starts automatically in local pip-install mode, but needs to be started once for the hosted server. After that first start it persists.
 

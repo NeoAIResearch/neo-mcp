@@ -438,9 +438,10 @@ app = Server(
         "that could be built locally just as easily. Do not assume Neo should run everything.\n\n"
         "NEVER attempt to run AI/ML tasks locally — always delegate those to neo_submit_task.\n\n"
         "DAEMON STARTUP — if neo_submit_task returns DAEMON_NOT_RUNNING:\n"
-        "  This server already auto-starts the local daemon and retries automatically.\n"
-        "  Only if that still fails, tell the user exactly once:\n"
-        "  `npx --yes neo-mcp-daemon &`\n\n"
+        "  In stdio mode this server auto-starts daemon locally (npx then python fallback).\n"
+        "  In HTTP mode, run startup commands on the USER MACHINE and retry submit:\n"
+        "    1) npx --yes neo-mcp-daemon &\n"
+        "    2) neo-mcp daemon\n\n"
         "WORKSPACE — always pass the correct directory:\n"
         "  When calling neo_submit_task, ALWAYS include the workspace parameter.\n"
         "  Default: current working directory (os.getcwd() or editor workspace root).\n"
@@ -461,10 +462,10 @@ def handle_error(status_code: int) -> str:
         400: (
             "DAEMON_NOT_RUNNING\n"
             "Automatic daemon startup was attempted but no healthy local daemon is available.\n"
-            "Start it manually as a fallback (user machine):\n"
-            "  npx --yes neo-mcp-daemon &\n"
-            "or\n"
-            "  neo-mcp daemon"
+            "LOCAL_STARTUP_COMMANDS (run on user machine):\n"
+            "1. npx --yes neo-mcp-daemon &\n"
+            "2. neo-mcp daemon\n"
+            "RETRY_SUBMIT_AFTER_STARTUP=true"
         ),
         401: "Invalid API key. Check your NEO_SECRET_KEY configuration.",
         402: "Your Neo account has insufficient credits.",
