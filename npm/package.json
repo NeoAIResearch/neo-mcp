@@ -1,6 +1,6 @@
 {
   "name": "neo-mcp-daemon",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Neo local execution daemon — runs AI/ML tasks locally, no Python required",
   "main": "dist/index.js",
   "bin": {
@@ -10,6 +10,7 @@
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
+    "postinstall": "node scripts/postinstall.js",
     "prepublishOnly": "npm run build && npm test"
   },
   "engines": {
@@ -18,6 +19,8 @@
   "files": [
     "dist",
     "bin",
+    "binaries",
+    "scripts/postinstall.js",
     "README.md"
   ],
   "keywords": [

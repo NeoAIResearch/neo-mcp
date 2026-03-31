@@ -474,7 +474,8 @@ class TestGetDeploymentId(unittest.TestCase):
     def test_returns_empty_when_no_header_env_or_key(self):
         srv.NEO_DEPLOYMENT_ID = ""
         srv.NEO_SECRET_KEY = ""
-        result = srv._get_deployment_id()
+        with patch("neo_mcp.server._read_go_daemon_local_id", return_value=""):
+            result = srv._get_deployment_id()
         self.assertEqual(result, "")
 
     def test_returns_empty_when_nothing_found_and_no_key(self):
@@ -484,7 +485,8 @@ class TestGetDeploymentId(unittest.TestCase):
         try:
             srv.NEO_SECRET_KEY = ""
             srv._ctx_secret_key.set("")
-            result = srv._get_deployment_id()
+            with patch("neo_mcp.server._read_go_daemon_local_id", return_value=""):
+                result = srv._get_deployment_id()
             self.assertEqual(result, "")
         finally:
             srv.NEO_SECRET_KEY = orig_key
@@ -496,14 +498,13 @@ class TestGetDeploymentId(unittest.TestCase):
         try:
             srv.NEO_SECRET_KEY = "sk-v1-testkey"
             srv._ctx_secret_key.set("")
-            result = srv._get_deployment_id()
-            self.assertRegex(result, r"^[a-f0-9\-]{36}$")
-            # Same key → same UUID on every call (deterministic)
-            result2 = srv._get_deployment_id()
-            self.assertEqual(result, result2)
-            # Different key → different UUID
-            srv.NEO_SECRET_KEY = "sk-v1-otherkey"
-            result3 = srv._get_deployment_id()
+            with patch("neo_mcp.server._read_go_daemon_local_id", return_value=""):
+                result = srv._get_deployment_id()
+                self.assertRegex(result, r"^[a-f0-9\-]{36}$")
+                result2 = srv._get_deployment_id()
+                self.assertEqual(result, result2)
+                srv.NEO_SECRET_KEY = "sk-v1-otherkey"
+                result3 = srv._get_deployment_id()
             self.assertNotEqual(result, result3)
         finally:
             srv.NEO_SECRET_KEY = orig_key
@@ -977,6 +978,8 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_py_start = AsyncMock()
 
         with patch("neo_mcp.server._register_with_daemon", mock_register), \
+             patch("neo_mcp.server._go_daemon_running", return_value=False), \
+             patch("neo_mcp.server._resolve_go_daemon_bin", return_value=""), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
@@ -995,6 +998,8 @@ class TestNeoSubmitTask(unittest.TestCase):
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
              patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
+             patch("neo_mcp.server._go_daemon_running", return_value=False), \
+             patch("neo_mcp.server._resolve_go_daemon_bin", return_value=""), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
@@ -1015,6 +1020,8 @@ class TestNeoSubmitTask(unittest.TestCase):
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
              patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
+             patch("neo_mcp.server._go_daemon_running", return_value=False), \
+             patch("neo_mcp.server._resolve_go_daemon_bin", return_value=""), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
@@ -1050,6 +1057,8 @@ class TestNeoSubmitTask(unittest.TestCase):
     def test_running_npm_daemon_without_registration_attempts_restart(self):
         """If npm daemon is alive but un-registerable, restart recovery is attempted."""
         with patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
+             patch("neo_mcp.server._go_daemon_running", return_value=False), \
+             patch("neo_mcp.server._resolve_go_daemon_bin", return_value=""), \
              patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server._restart_npm_daemon", new_callable=AsyncMock, return_value=True) as mock_restart, \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
@@ -1063,6 +1072,8 @@ class TestNeoSubmitTask(unittest.TestCase):
     def test_npm_restart_failure_falls_back_to_python(self):
         """If npm recovery fails, ensure_local_daemon should still try Python fallback."""
         with patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
+             patch("neo_mcp.server._go_daemon_running", return_value=False), \
+             patch("neo_mcp.server._resolve_go_daemon_bin", return_value=""), \
              patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server._restart_npm_daemon", new_callable=AsyncMock, return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", new_callable=AsyncMock, return_value=False), \

@@ -12,9 +12,19 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"neo-agent/config"
+	"neo-agent/workspace"
 )
+
+var wsMgr *workspace.Manager
+
+// Init wires the workspace manager used for per-thread path resolution.
+// Call once from main before any requests are dispatched.
+func Init(m *workspace.Manager) {
+	wsMgr = m
+}
 
 type Command struct {
 	Action            string         `json:"action"`
@@ -107,7 +117,7 @@ func hWriteCode(cmd Command) map[string]any {
 		return fail(cmd.RequestID, "filename is required")
 	}
 
-	full, e := resolvePath(filename)
+	full, e := resolvePath(filename, cmd.ThreadID)
 	if e != nil {
 		return fail(cmd.RequestID, e.Error())
 	}
@@ -119,7 +129,15 @@ func hWriteCode(cmd Command) map[string]any {
 		return fail(cmd.RequestID, err.Error())
 	}
 
-	return ok(cmd.RequestID, map[string]any{"file_path": full, "message": "File written"})
+	return ok(cmd.RequestID, map[string]any{
+		"file_path": full,
+		"message":   "File written",
+		"compile_check": map[string]any{
+			"performed": false,
+			"success":   true,
+			"error":     nil,
+		},
+	})
 }
 
 func hGetFile(cmd Command) map[string]any {
@@ -127,7 +145,7 @@ func hGetFile(cmd Command) map[string]any {
 	if fp == "" {
 		return fail(cmd.RequestID, "file_path is required")
 	}
-	full, e := resolvePath(fp)
+	full, e := resolvePath(fp, cmd.ThreadID)
 	if e != nil {
 		return fail(cmd.RequestID, e.Error())
 	}
@@ -143,7 +161,7 @@ func hDeleteFile(cmd Command) map[string]any {
 	if p == "" {
 		return fail(cmd.RequestID, "path is required")
 	}
-	full, e := resolvePath(p)
+	full, e := resolvePath(p, cmd.ThreadID)
 	if e != nil {
 		return fail(cmd.RequestID, e.Error())
 	}
@@ -158,10 +176,9 @@ func hRunSubprocess(cmd Command) map[string]any {
 	if strings.TrimSpace(command) == "" {
 		return fail(cmd.RequestID, "command is required")
 	}
-
 	detach := fieldBool(cmd, "detach", true)
 	workdir := fieldString(cmd, "workdir", "")
-	cwd, e := resolveDir(workdir)
+	cwd, e := resolveDir(workdir, cmd.ThreadID)
 	if e != nil {
 		return fail(cmd.RequestID, e.Error())
 	}
@@ -285,7 +302,7 @@ func hListFiles(cmd Command) map[string]any {
 	maxDepth := fieldInt(cmd, "max_depth", 10)
 	includeHidden := fieldBool(cmd, "include_hidden", false)
 
-	start, e := resolveDir(dir)
+	start, e := resolveDir(dir, cmd.ThreadID)
 	if e != nil {
 		return fail(cmd.RequestID, e.Error())
 	}
@@ -365,7 +382,20 @@ func fieldInt(cmd Command, key string, fallback int) int {
 	return fallback
 }
 
-func resolvePath(p string) (string, error) {
+// workspaceRoot returns the effective workspace root for a given thread.
+// If threadID is non-empty and the workspace manager has a mapping, that path
+// is used; otherwise it falls back to the NEO_WORKSPACE env / config default.
+func workspaceRoot(threadID string) string {
+	if threadID != "" && wsMgr != nil {
+		wsMgr.ReloadIfStale(30 * time.Second)
+		if ws := wsMgr.Get(threadID); ws != "" {
+			return ws
+		}
+	}
+	return config.GetWorkspaceRoot()
+}
+
+func resolvePath(p string, threadID string) (string, error) {
 	p = strings.TrimSpace(p)
 	if p == "" {
 		return "", fmt.Errorf("empty path")
@@ -379,7 +409,7 @@ func resolvePath(p string) (string, error) {
 		p = filepath.Join(home, strings.TrimPrefix(p, "~/"))
 	}
 
-	root := config.GetWorkspaceRoot()
+	root := workspaceRoot(threadID)
 	clean := filepath.Clean(p)
 	if !filepath.IsAbs(clean) {
 		clean = filepath.Join(root, clean)
@@ -397,16 +427,45 @@ func resolvePath(p string) (string, error) {
 		return "", e
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("path outside allowed workspace: %s", rootAbs)
+		// /tmp (and similar temp dirs) is allowed as-is — the backend writes temp
+		// scripts there and immediately runs them from the same path.
+		if strings.HasPrefix(abs, "/tmp/") || abs == "/tmp" {
+			return abs, nil
+		}
+
+		// Path is outside workspace — remap by finding workspace base directory
+		// name in the path. This handles the case where the Neo backend runs in
+		// a container with a different root (e.g. /app/project/foo) while the
+		// user's workspace is /root/foo: we strip the foreign prefix and keep
+		// only the path components that come after the workspace directory name.
+		wsBase := filepath.Base(rootAbs)
+		parts := strings.Split(filepath.ToSlash(abs), "/")
+		remapped := false
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i] == wsBase {
+				relParts := parts[i+1:]
+				if len(relParts) == 0 {
+					abs = rootAbs
+				} else {
+					abs = filepath.Join(append([]string{rootAbs}, relParts...)...)
+				}
+				remapped = true
+				break
+			}
+		}
+		if !remapped {
+			// Last resort: use only the base filename inside the workspace.
+			abs = filepath.Join(rootAbs, filepath.Base(p))
+		}
 	}
 	return abs, nil
 }
 
-func resolveDir(p string) (string, error) {
+func resolveDir(p string, threadID string) (string, error) {
 	if strings.TrimSpace(p) == "" {
-		return config.GetWorkspaceRoot(), nil
+		return workspaceRoot(threadID), nil
 	}
-	abs, e := resolvePath(p)
+	abs, e := resolvePath(p, threadID)
 	if e != nil {
 		return "", e
 	}

@@ -1,2 +1,106 @@
 #!/usr/bin/env node
+/**
+ * neo-mcp-daemon entrypoint
+ *
+ * Startup order:
+ * 1. Install platform Go binary to ~/.neo/agent (idempotent)
+ * 2. If ~/.neo/agent exists and is executable → exec it as `--daemon`
+ *    (replaces this Node.js process entirely — no memory overhead)
+ * 3. Otherwise → fall back to the Node.js daemon in dist/index.js
+ */
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+const BINARY_MAP = {
+  'darwin-arm64':  'neo-agent-mac',
+  'darwin-x64':    'neo-agent-mac-intel',
+  'linux-x64':     'neo-agent-linux',
+  'linux-arm64':   'neo-agent-linux-arm',
+  'win32-x64':     'neo-agent.exe',
+};
+
+function resolveDestPath() {
+  const neoDir = path.join(os.homedir(), '.neo');
+  return process.platform === 'win32'
+    ? path.join(neoDir, 'agent.exe')
+    : path.join(neoDir, 'agent');
+}
+
+function ensureGoBinary() {
+  const key = `${process.platform}-${process.arch}`;
+  const binaryName = BINARY_MAP[key];
+  if (!binaryName) return;
+
+  const srcPath = path.join(__dirname, '..', 'binaries', binaryName);
+  if (!fs.existsSync(srcPath)) return;
+
+  const destPath = resolveDestPath();
+  const neoDir = path.dirname(destPath);
+
+  try {
+    // Only overwrite if the source is newer (or dest missing).
+    const destExists = fs.existsSync(destPath);
+    if (destExists) {
+      const srcMtime = fs.statSync(srcPath).mtimeMs;
+      const dstMtime = fs.statSync(destPath).mtimeMs;
+      if (dstMtime >= srcMtime) return; // already up-to-date
+    }
+    fs.mkdirSync(neoDir, { recursive: true });
+    fs.copyFileSync(srcPath, destPath);
+    if (process.platform !== 'win32') {
+      fs.chmodSync(destPath, 0o755);
+    }
+  } catch (_) {
+    // Best-effort — fall through to Node.js daemon on failure.
+  }
+}
+
+function tryExecGoBinary() {
+  const goBin = resolveDestPath();
+  if (!fs.existsSync(goBin)) return false;
+
+  try {
+    fs.accessSync(goBin, fs.constants.X_OK);
+  } catch (_) {
+    return false;
+  }
+
+  // exec() replaces this process — no return on success.
+  // Pass through all original arguments so --deployment-id etc. work.
+  const args = process.argv.slice(2);
+  const result = spawnSync(goBin, ['--daemon', ...args], {
+    stdio: 'inherit',
+    env: process.env,
+    detached: false,
+  });
+
+  if (result.error) {
+    // Binary failed to start — fall through to Node.js daemon.
+    return false;
+  }
+
+  process.exit(result.status ?? 0);
+}
+
+// Warn if no key — daemon will start but will be unable to poll.
+if (!process.env.NEO_SECRET_KEY && !process.env.NEO_TOKEN) {
+  console.error(
+    '[neo-mcp-daemon] Warning: NEO_SECRET_KEY is not set.\n' +
+    '  The daemon needs your API key to receive tasks from Neo.\n' +
+    '  Set it before starting: NEO_SECRET_KEY=sk-v1-... npx neo-mcp-daemon'
+  );
+}
+
+// Step 1: install/update Go binary
+ensureGoBinary();
+
+// Step 2: try to run Go binary (replaces process on success)
+tryExecGoBinary();
+
+// Step 3: fall back to Node.js daemon
 require('../dist/index.js');
