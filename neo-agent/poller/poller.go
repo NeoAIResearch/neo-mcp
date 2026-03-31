@@ -12,7 +12,16 @@ import (
 
 	"neo-agent/config"
 	"neo-agent/executor"
+	"neo-agent/workspace"
 )
+
+var wsMgr *workspace.Manager
+
+// SetWorkspaceManager injects the shared workspace manager so pollOnce can
+// trigger a staleness check at the start of each poll cycle.
+func SetWorkspaceManager(m *workspace.Manager) {
+	wsMgr = m
+}
 
 type backendCommand map[string]any
 
@@ -47,6 +56,12 @@ func Start() {
 }
 
 func pollOnce(token, serverURL, deploymentID string) {
+	// Eagerly refresh the workspace map so newly-submitted tasks get the
+	// right workspace within one poll cycle (5 s default interval).
+	if wsMgr != nil {
+		wsMgr.ReloadIfStale(5 * time.Second)
+	}
+
 	url := fmt.Sprintf("%s/v2/poll/%s?max_messages=10&wait_time=5", strings.TrimRight(serverURL, "/"), deploymentID)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {

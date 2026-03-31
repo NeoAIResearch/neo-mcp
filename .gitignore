@@ -6,12 +6,25 @@ dist/
 build/
 .env
 .claude/
-vscode_extension/
 .tmp/
 test_demo/
 test_project/
 neo_artifacts/
 node_modules/
 *.pid
-image.png
+
+# Local build artifacts
+neo-agent/neo-agent
+neo-agent/releases/
+
+# Test artifacts
+test_run/
+filelister_*.py
+neo_test_*.py
+go_daemon_proof.txt
+workspace_check.txt
+
+# vscode_extension is tracked separately
+vscode_extension/
+
 python/=42

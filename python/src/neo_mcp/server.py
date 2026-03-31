@@ -236,16 +236,36 @@ def _discover_sandbox_id() -> str:
     return ""
 
 
+def _read_go_daemon_local_id() -> str:
+    """Read the Go daemon's unique local deployment ID from disk.
+
+    The Go daemon writes this file on first start so that task submissions
+    are routed exclusively to it, bypassing any VS Code extension or other
+    daemon polling the key-derived deployment ID.
+    """
+    path = os.path.expanduser("~/.neo/daemon/go_daemon_local_id")
+    try:
+        uid = open(path).read().strip()
+        if uid and re.match(r'^[a-f0-9\-]{36}$', uid):
+            return uid
+    except OSError:
+        pass
+    return ""
+
+
 def _get_deployment_id() -> str:
     """Return deployment ID.
 
     Priority:
     1. Per-request X-Neo-Deployment-Id header (HTTP mode — set by context var)
     2. NEO_DEPLOYMENT_ID env var
-    3. Derived from API key — primary path for daemon routing
+    3. Go daemon local ID — machine-local UUID that avoids VS Code extension competition
+    4. Derived from API key — fallback when Go daemon is not running
     """
     if dep := _ctx_deployment_id.get() or NEO_DEPLOYMENT_ID:
         return dep
+    if go_id := _read_go_daemon_local_id():
+        return go_id
     sk = _ctx_secret_key.get() or NEO_SECRET_KEY
     if sk:
         return _derive_deployment_id(sk)
@@ -391,12 +411,38 @@ def _go_daemon_running(deployment_id: str = "") -> bool:
     return True
 
 
+def _kill_zombie_go_daemons(deployment_id: str = "") -> None:
+    """Kill all stale go_daemon*.pid processes (belt-and-suspenders alongside Go singleton)."""
+    import glob
+    import signal as _signal
+
+    daemon_dir = os.path.expanduser("~/.neo/daemon")
+    for pid_path in glob.glob(os.path.join(daemon_dir, "go_daemon*.pid")):
+        pid = _read_pid_file(pid_path)
+        if pid is None:
+            _safe_unlink(pid_path)
+            continue
+        if not _pid_alive(pid):
+            _safe_unlink(pid_path)
+            continue
+        if not _pid_matches_any_cmdline(pid, ("--daemon",)):
+            _safe_unlink(pid_path)
+            continue
+        try:
+            os.kill(pid, _signal.SIGTERM)
+        except OSError:
+            pass
+        _safe_unlink(pid_path)
+
+
 async def _auto_start_go_daemon(secret_key: str, deployment_id: str = "", workspace: str = "") -> bool:
     import subprocess
 
     go_bin = _resolve_go_daemon_bin()
     if not go_bin:
         return False
+
+    _kill_zombie_go_daemons(deployment_id)
 
     if _go_daemon_running(deployment_id):
         return True
@@ -587,20 +633,19 @@ async def _ensure_local_daemon(secret_key: str, deployment_id: str, workspace: s
     """Ensure there's a healthy local executor for this deployment ID.
 
     Startup order:
-    1) go daemon process (if already running)
-    2) auto-start go daemon binary (preferred, no npm/pip runtime dependency)
-    3) register with an already-running localhost daemon (token + localhost check)
-    4) if npm daemon is running but not registerable, restart npm once
-    5) auto-start npm daemon
-    6) python daemon process (if already running)
-    7) auto-start python daemon (fallback)
+    1) Go daemon already running → done (preferred path)
+    2) Go binary present → start it and return (no npm/Python started)
+    3) Go binary absent → fall back to localhost registration, then npm, then Python
     """
+    # --- Go binary path (preferred) ---
     if _go_daemon_running(deployment_id):
         return True
 
-    if await _auto_start_go_daemon(secret_key, deployment_id, workspace):
-        return True
+    if _resolve_go_daemon_bin():
+        # Go binary exists — it is the only daemon we want to run.
+        return await _auto_start_go_daemon(secret_key, deployment_id, workspace)
 
+    # --- Fallback: no Go binary available ---
     if await _register_with_daemon(deployment_id, secret_key, workspace):
         return True
 
@@ -613,12 +658,10 @@ async def _ensure_local_daemon(secret_key: str, deployment_id: str, workspace: s
         if await _restart_npm_daemon(secret_key, deployment_id, workspace):
             if await _register_with_daemon(deployment_id, secret_key, workspace):
                 return True
-            # Fresh daemon started with explicit workspace/deployment; continue.
             return True
         # npm recovery failed; continue to python fallback below.
 
     if await _auto_start_npm_daemon(secret_key, deployment_id, workspace):
-        # Fresh daemon should be registerable; retry once to bind requested workspace.
         if await _register_with_daemon(deployment_id, secret_key, workspace):
             return True
         return True
@@ -675,9 +718,10 @@ def handle_error(status_code: int, transport: str = "") -> str:
             "No healthy daemon is available for the selected deployment_id.\n"
             "USER_ACTION_REQUIRED=true\n"
             "ASK_USER_PERMISSION_TO_RUN_LOCAL_STARTUP=true\n"
-            "LOCAL_STARTUP_COMMANDS (run on user machine):\n"
-            "1. ~/.neo/agent --daemon\n"
-            "2. npx --yes neo-mcp-daemon &\n"
+            "NOTE: NEO_SECRET_KEY must be set in the terminal where you run the daemon.\n"
+            "LOCAL_STARTUP_COMMANDS (run on user machine, with NEO_SECRET_KEY set):\n"
+            "1. NEO_SECRET_KEY=$NEO_SECRET_KEY ~/.neo/agent --daemon &\n"
+            "2. NEO_SECRET_KEY=$NEO_SECRET_KEY npx --yes neo-mcp-daemon &\n"
             "3. neo-mcp daemon\n"
             "RETRY_SUBMIT_AFTER_STARTUP=true"
         ),
@@ -695,12 +739,13 @@ def handle_error(status_code: int, transport: str = "") -> str:
         return (
             "DAEMON_NOT_RUNNING\n"
             "Hosted MCP is a forwarding bridge and cannot start daemons on the server.\n"
-            "Start a local daemon on the user machine, then retry submit.\n"
+            "Start a local daemon on the user machine, then retry neo_submit_task.\n"
             "USER_ACTION_REQUIRED=true\n"
             "ASK_USER_PERMISSION_TO_RUN_LOCAL_STARTUP=true\n"
-            "LOCAL_STARTUP_COMMANDS (run on user machine):\n"
-            "1. ~/.neo/agent --daemon\n"
-            "2. npx --yes neo-mcp-daemon &\n"
+            "NOTE: NEO_SECRET_KEY must be set in the terminal where you run the daemon.\n"
+            "LOCAL_STARTUP_COMMANDS (run on user machine, with NEO_SECRET_KEY set):\n"
+            "1. NEO_SECRET_KEY=$NEO_SECRET_KEY ~/.neo/agent --daemon &\n"
+            "2. NEO_SECRET_KEY=$NEO_SECRET_KEY npx --yes neo-mcp-daemon &\n"
             "3. neo-mcp daemon\n"
             "RETRY_SUBMIT_AFTER_STARTUP=true"
         )
@@ -1142,6 +1187,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             wait = arguments.get("wait_for_completion", False)
             workspace = arguments.get("workspace") or _server_cwd
 
+            # Ensure the workspace directory exists before starting the daemon.
+            if workspace and not os.path.isdir(workspace):
+                try:
+                    os.makedirs(workspace, exist_ok=True)
+                except OSError:
+                    pass  # daemon will handle it or surface an error per-file
+
             # Auto-start daemon only in stdio mode (local process on user's machine).
             # In HTTP mode, never try to start daemons from the server process.
             if NEO_TRANSPORT != "http":
@@ -1226,7 +1278,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             if not wait:
                 return [TextContent(type="text", text=(
-                    f"Task submitted. thread_id: {thread_id}\n\n"
+                    f"Task submitted. thread_id: {thread_id}\n"
+                    f"Workspace: {workspace}\n\n"
                     "Polling is running in the background.\n"
                     "• neo_task_plan   — see live step-by-step progress\n"
                     "• neo_task_status — check overall status\n"
@@ -1322,6 +1375,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "COMPLETED": "call neo_get_messages to read output",
                 "TERMINATED": "task ended",
             }
+            ws_lookup = _load_thread_workspace_lookup()
             for tid, source in found.items():
                 # Use in-memory state first to avoid extra API calls
                 state = _active_polls.get(tid)
@@ -1340,6 +1394,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 icon = status_icons.get(status, "•")
                 hint = hints.get(status, "")
                 line = f"{icon} {tid}  [{status}]  (source: {source})"
+                ws = ws_lookup.get(tid, "")
+                if ws:
+                    line += f"\n   workspace: {ws}"
                 if hint:
                     line += f"\n   → {hint}"
                 lines.append(line)
@@ -1691,9 +1748,10 @@ def _build_http_app():
         tok_http = _ctx_http_request.set(True)
         tok_api = _ctx_api_key.set(headers.get("x-access-key", ""))
         tok_secret = _ctx_secret_key.set(secret_key)
-        tok_dep = _ctx_deployment_id.set(
-            deployment_id_header or (_derive_deployment_id(secret_key) if secret_key else "")
-        )
+        # Only set deployment_id context from header — do NOT eagerly derive from key here.
+        # _get_deployment_id() will discover the Go daemon's local ID (or fall back to
+        # key-derived) at call time, so setting a key-derived value here would mask it.
+        tok_dep = _ctx_deployment_id.set(deployment_id_header)
 
         try:
             session_id = headers.get("mcp-session-id", "")
@@ -1707,9 +1765,9 @@ def _build_http_app():
                 transport = await _start_session(session_id, secret_key, deployment_id_header)
                 _sessions[session_id] = transport
                 _session_keys[session_id] = secret_key
-                resolved_dep_id = deployment_id_header or (_derive_deployment_id(secret_key) if secret_key else "")
-                if resolved_dep_id:
-                    _session_deployment_ids[session_id] = resolved_dep_id
+                # Only persist header-provided deployment ID; don't derive here.
+                if deployment_id_header:
+                    _session_deployment_ids[session_id] = deployment_id_header
 
             await transport.handle_request(scope, receive, send)
         finally:

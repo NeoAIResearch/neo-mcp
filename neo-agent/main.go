@@ -7,15 +7,30 @@ import (
 	"fmt"
 	"os"
 
+	"neo-agent/config"
+	"neo-agent/executor"
 	"neo-agent/mcp"
 	"neo-agent/poller"
+	"neo-agent/singleton"
+	"neo-agent/workspace"
 )
 
 func main() {
 	daemonOnly := flag.Bool("daemon", false, "run as background daemon poller only")
 	flag.Parse()
 
+	mgr := workspace.New()
+	executor.Init(mgr)
+	poller.SetWorkspaceManager(mgr)
+
 	if *daemonOnly {
+		// Resolve deployment ID: respect NEO_DEPLOYMENT_ID env var if already
+		// set (Python stdio server passes it explicitly), otherwise derive from
+		// NEO_SECRET_KEY so HTTP-mode users get the same ID as the MCP server.
+		deploymentID := config.GetDeploymentID()
+
+		cleanup := singleton.AcquireOrExit(deploymentID)
+		defer cleanup()
 		poller.Start()
 		return
 	}

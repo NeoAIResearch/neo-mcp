@@ -107,8 +107,11 @@ func GetDeploymentID() string {
 	}
 
 	sum := sha256.Sum256([]byte(token))
-	// UUID-ish stable ID from SHA-256 first 16 bytes.
+	// Stable UUID from SHA-256 first 16 bytes, aligned with Python:
+	// uuid.UUID(bytes=digest[:16], version=5)
 	b := sum[:16]
+	b[6] = (b[6] & 0x0f) | 0x50
+	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%s-%s-%s-%s-%s",
 		hex.EncodeToString(b[0:4]),
 		hex.EncodeToString(b[4:6]),
