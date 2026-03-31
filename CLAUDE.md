@@ -84,15 +84,16 @@ docker build -t neo-mcp-test ./python
 docker run -i --rm -e NEO_SECRET_KEY=your-secret \
   -v ~/.neo:/root/.neo:ro neo-mcp-test
 
-# Register with Claude Code (pip install — npm daemon auto-starts on first task)
-claude mcp add --scope user neo \
-  -e NEO_SECRET_KEY=your-secret \
-  -- neo-mcp
-
-# Register with Claude Code (hosted HTTP server — recommended, works for all editors)
+# Register with Claude Code (PRIMARY — hosted HTTP server, works for all editors)
+# On first task, agent asks permission to start the local daemon (one click).
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
   --header "Authorization: Bearer your-secret"
+
+# Register with Claude Code (local pip install — daemon auto-starts silently in stdio mode)
+claude mcp add --scope user neo \
+  -e NEO_SECRET_KEY=your-secret \
+  -- neo-mcp
 
 # Register with Claude Code (Docker, after publish)
 claude mcp add --scope user neo \
@@ -113,19 +114,25 @@ claude mcp logs neo
 - `_headers()` raises `ValueError` with a clear message if `NEO_SECRET_KEY` is missing; the error is returned as a tool response (no crash).
 - In HTTP mode, the per-request key from the `Authorization` header is stored in a context var (`_ctx_secret_key`) and takes priority over the module-level env var.
 
-### Daemon — npm is primary
+### Daemon — Go binary is primary
 
-**The primary daemon is `npx neo-mcp-daemon`** (Node.js npm package). The Python daemon (`daemon.py`) is a fallback for environments where Node/npx is not available.
+**The primary daemon is the Go binary at `~/.neo/agent`**, installed automatically by `npx neo-mcp-daemon` (via `postinstall.js` + bin entrypoint). The Node.js npm daemon and Python daemon (`daemon.py`) are fallbacks for platforms without a pre-built Go binary.
 
-The daemon is what actually executes tasks on the user's machine — it polls the Neo backend for commands (`write_code`, `run_subprocess`, `get_file`, `list_files`, etc.) and executes them locally.
+The daemon executes tasks on the user's machine — polls the Neo backend for commands (`write_code`, `run_subprocess`, `get_file`, `list_files`, etc.) and runs them locally.
 
+`_ensure_local_daemon()` startup priority:
+1. Go binary already running → done
+2. `~/.neo/agent` exists → `_auto_start_go_daemon()` (preferred)
+3. `npx neo-mcp-daemon` available → `_auto_start_npm_daemon()` (which itself installs + execs Go binary)
+4. Python daemon → last resort
+
+Deployment UUID: derived from `NEO_SECRET_KEY` via SHA-256 — both the hosted server and all daemon types use the same formula, so no coordination needed.
+
+- **Go daemon** writes PID to `~/.neo/daemon/go_daemon.pid`
 - **npm daemon** writes PID to `~/.neo/daemon/npm_daemon.pid`
-- **Python daemon** writes PID to `~/.neo/daemon/python_daemon.pid` and `~/.neo/daemon/daemon_<id[:8]>.pid`
-- Both write `{"sandboxId": "..."}` entries to `~/.neo/daemon/daemon.log` for discovery
-- Both write the deployment UUID to `~/.neo/daemon/standalone_deployment_id`
-- Both write thread→workspace mappings to `~/.neo/daemon/thread-workspaces.json`
-
-`_daemon_running()` checks all of the above PID files. `_npm_daemon_running()` is kept as an alias.
+- **Python daemon** writes PID to `~/.neo/daemon/python_daemon.pid`
+- All write `{"sandboxId": "..."}` entries to `~/.neo/daemon/daemon.log`
+- All write thread→workspace mappings to `~/.neo/daemon/thread-workspaces.json`
 
 ### Task submission — always vscode mode
 
@@ -158,11 +165,11 @@ The hosted server (`mcpserver.heyneo.com`) is a **stateless bridge** — it tran
 - The npm daemon (`npx neo-mcp-daemon`) — started automatically by the agent on first task submission
 
 **Agent-driven daemon start (HTTP mode):**
-When no daemon is found, `neo_submit_task` returns a `DAEMON_NOT_RUNNING` message with the exact command:
+When no daemon is found, `neo_submit_task` returns a `DAEMON_NOT_RUNNING` message with the exact startup command — `NEO_SECRET_KEY` pre-filled:
 ```
-npx neo-mcp-daemon &
+NEO_SECRET_KEY=sk-v1-... ~/.neo/agent --daemon >/tmp/neo-daemon.log 2>&1 &
 ```
-Agents with terminal access (Claude Code, Cursor, Windsurf, Codex CLI) will ask user permission and run it. The user just clicks yes — no manual terminal work required.
+Agents with terminal access (Claude Code, Cursor, Windsurf, Codex CLI) ask user permission and run it. The user clicks **Allow** once — the Go binary installs via `npx` if not present, starts, and tasks flow automatically. No manual terminal work required.
 
 **VS Code extension users** don't need any of this — the extension manages the daemon automatically.
 
