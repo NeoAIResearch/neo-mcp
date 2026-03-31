@@ -405,11 +405,14 @@ async def _ensure_local_daemon(secret_key: str, deployment_id: str, workspace: s
     """Ensure there's a healthy local executor for this deployment ID.
 
     Startup order:
-    1) npm daemon process (if already running)
-    2) auto-start npm daemon
-    3) python daemon process (if already running)
-    4) auto-start python daemon (fallback)
+    1) register with an already-running local daemon (token + localhost check)
+    2) npm daemon process (if already running)
+    3) auto-start npm daemon
+    4) python daemon process (if already running)
+    5) auto-start python daemon (fallback)
     """
+    if await _register_with_daemon(deployment_id, secret_key, workspace):
+        return True
     if _npm_daemon_running(deployment_id):
         return True
     if await _auto_start_npm_daemon(secret_key, deployment_id, workspace):

@@ -905,12 +905,31 @@ class TestNeoSubmitTask(unittest.TestCase):
 
     # -- daemon-only auto-start routing tests --------------------------------
 
+    def test_registerable_local_daemon_skips_autostart(self):
+        """Reachable daemon registration should satisfy readiness without restarts."""
+        mock_register = AsyncMock(return_value=True)
+        mock_npm_start = AsyncMock()
+        mock_py_start = AsyncMock()
+
+        with patch("neo_mcp.server._register_with_daemon", mock_register), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
+             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
+             patch("neo_mcp.server._auto_start_python_daemon", mock_py_start):
+            ready = self._run(srv._ensure_local_daemon("sk-v1-test", "dep-xyz", "/tmp/ws"))
+
+        self.assertTrue(ready)
+        mock_register.assert_called_once_with("dep-xyz", "sk-v1-test", "/tmp/ws")
+        mock_npm_start.assert_not_called()
+        mock_py_start.assert_not_called()
+
     def test_no_npm_daemon_autostart_triggered(self):
         """When npm daemon is not running, auto-start must be called."""
         resp_ok = make_response(200, {"thread_id": "tid-no-daemon"})
         mock_daemon = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
+             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
@@ -930,6 +949,7 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_py_start = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
+             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
