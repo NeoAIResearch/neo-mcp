@@ -18,23 +18,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-
-      - name: Build Linux Go release artifact
-        run: |
-          cd neo-agent
-          mkdir -p releases
-          GOOS=linux GOARCH=amd64 go build -o releases/neo-agent-linux .
-
-      - name: Upload Go agent artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: neo-agent-linux
-          path: neo-agent/releases/neo-agent-linux
-
       # 1️⃣ Decide environment + region from branch
       - name: Set environment and region
         id: set-env
