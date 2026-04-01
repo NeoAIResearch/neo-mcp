@@ -93,11 +93,13 @@ The MCP server runs at `https://mcpserver.heyneo.com/mcp` — nothing to install
 #### stdio mode — local pip install, auto-starts daemon silently
 
 ```bash
-pip install neo-mcp 
+pipx install neo-mcp
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-YOUR_KEY \
   -- neo-mcp  
 ```
+
+> `pipx` is recommended over `pip` — it installs CLI tools in isolated environments and works on all platforms including Ubuntu/Debian. Install it with `apt install pipx` or `pip install pipx`.
 
 
 The MCP server runs as a local subprocess. In this mode the server auto-starts the daemon silently on first task submission — no manual daemon management needed. Recommended when you want a fully self-contained local setup.

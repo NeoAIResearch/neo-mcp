@@ -100,8 +100,8 @@ When invoked as `/neo <task>`, immediately call `neo_submit_task` with the provi
 To register Neo with Claude Code — one command:
 
 ```bash
-# Local pip install (recommended — daemon auto-starts silently)
-pip install neo-mcp
+# Local install (recommended — daemon auto-starts silently)
+pipx install neo-mcp   # use pipx to avoid system Python conflicts
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-your-key \
   -- neo-mcp
