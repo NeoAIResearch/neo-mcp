@@ -328,6 +328,46 @@ async def _register_with_daemon(deployment_id: str, secret_key: str, workspace: 
     return True
 
 
+async def _submit_via_daemon(
+    message: str, deployment_id: str, workspace: str, secret_key: str
+) -> "str | None":
+    """Submit task through the local daemon's /init-chat endpoint.
+
+    The daemon stores the per-thread workspace mapping so write_code commands
+    are routed to the correct directory. Returns thread_id or None on failure.
+    """
+    token_path = _ipc_token_path()
+    try:
+        with open(token_path) as f:
+            token = f.read().strip()
+        if not token:
+            return None
+    except OSError:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as dc:
+            resp = await dc.post(
+                f"http://127.0.0.1:{_DAEMON_PORT}/init-chat",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "message": message,
+                    "deploymentId": deployment_id,
+                    "workspaceFolder": workspace,
+                },
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            return (
+                data.get("thread_id")
+                or data.get("threadId")
+                or data.get("id")
+            )
+    except Exception:
+        return None
+
+
 def _derive_deployment_id(secret_key: str) -> str:
     """Derive a stable, deterministic deployment UUID from the API key.
 
@@ -1160,65 +1200,79 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if deployment_id:
                 submit_body["deployment_id"] = deployment_id
 
-            try:
-                resp = await client.post(
-                    "/v2/thread/init-chat-direct",
-                    headers=_headers(),
-                    json=submit_body,
-                )
-            except httpx.HTTPError as exc:
-                return [TextContent(type="text", text=(
-                    f"Network error reaching Neo backend: {exc}\n"
-                    f"deployment_type: vscode, deployment_id: {deployment_id or '(none)'}"
-                ))]
+            # stdio mode: route through daemon's /init-chat so it records the
+            # per-thread workspace mapping. This is the same path the VS Code
+            # extension uses — the daemon stores threadWorkspaces.set(thread_id,
+            # workspaceFolder) so write_code commands land in the right directory.
+            thread_id = None
+            if NEO_TRANSPORT != "http":
+                thread_id = await _submit_via_daemon(message, deployment_id, workspace, secret_key)
 
-            if resp.status_code == 400:
-                # 400 = no healthy daemon for this deployment.
-                # Retry-once auto-start is only allowed in local stdio mode.
-                started = False
-                if NEO_TRANSPORT != "http":
-                    started = await _ensure_local_daemon(secret_key, deployment_id, workspace)
-                if started:
-                    # Retry the submit once
-                    try:
-                        resp = await client.post(
-                            "/v2/thread/init-chat-direct",
-                            headers=_headers(), json=submit_body, timeout=30.0,
-                        )
-                    except Exception:
-                        pass  # fall through to error handling below
+            if not thread_id:
+                # Fallback: call backend directly (HTTP mode or daemon /init-chat unavailable)
+                resp = None
+                try:
+                    resp = await client.post(
+                        "/v2/thread/init-chat-direct",
+                        headers=_headers(),
+                        json=submit_body,
+                    )
+                except httpx.HTTPError as exc:
+                    return [TextContent(type="text", text=(
+                        f"Network error reaching Neo backend: {exc}\n"
+                        f"deployment_type: vscode, deployment_id: {deployment_id or '(none)'}"
+                    ))]
 
                 if resp.status_code == 400:
-                    return [TextContent(type="text", text=_daemon_not_running_message(secret_key, NEO_TRANSPORT))]
+                    # 400 = no healthy daemon for this deployment.
+                    # Retry-once auto-start is only allowed in local stdio mode.
+                    started = False
+                    if NEO_TRANSPORT != "http":
+                        started = await _ensure_local_daemon(secret_key, deployment_id, workspace)
+                    if started:
+                        # Retry via daemon first, then direct
+                        thread_id = await _submit_via_daemon(message, deployment_id, workspace, secret_key)
+                        if not thread_id:
+                            try:
+                                resp = await client.post(
+                                    "/v2/thread/init-chat-direct",
+                                    headers=_headers(), json=submit_body, timeout=30.0,
+                                )
+                            except Exception:
+                                pass  # fall through to error handling below
 
-            if resp.status_code != 200:
-                try:
-                    detail = resp.json().get("detail") or resp.json().get("error") or resp.text
-                except Exception:
-                    detail = resp.text
-                return [TextContent(type="text", text=(
-                    f"{handle_error(resp.status_code, NEO_TRANSPORT)}\n"
-                    f"HTTP {resp.status_code} — {detail}\n"
-                    f"deployment_type: vscode, deployment_id: {deployment_id or '(none)'}"
-                ))]
+                    if not thread_id and resp.status_code == 400:
+                        return [TextContent(type="text", text=_daemon_not_running_message(secret_key, NEO_TRANSPORT))]
 
-            try:
-                data = resp.json()
-            except Exception:
-                return [TextContent(type="text", text=(
-                    f"Backend returned 200 but response was not valid JSON.\n"
-                    f"Body: {resp.text[:500]}"
-                ))]
-            thread_id = (
-                data.get("thread_id")
-                or data.get("threadId")
-                or data.get("id")
-            )
-            if not thread_id:
-                return [TextContent(type="text", text=(
-                    f"Backend returned 200 but no thread_id found in response.\n"
-                    f"Response: {data}"
-                ))]
+                if not thread_id:
+                    if resp.status_code != 200:
+                        try:
+                            detail = resp.json().get("detail") or resp.json().get("error") or resp.text
+                        except Exception:
+                            detail = resp.text
+                        return [TextContent(type="text", text=(
+                            f"{handle_error(resp.status_code, NEO_TRANSPORT)}\n"
+                            f"HTTP {resp.status_code} — {detail}\n"
+                            f"deployment_type: vscode, deployment_id: {deployment_id or '(none)'}"
+                        ))]
+
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        return [TextContent(type="text", text=(
+                            f"Backend returned 200 but response was not valid JSON.\n"
+                            f"Body: {resp.text[:500]}"
+                        ))]
+                    thread_id = (
+                        data.get("thread_id")
+                        or data.get("threadId")
+                        or data.get("id")
+                    )
+                    if not thread_id:
+                        return [TextContent(type="text", text=(
+                            f"Backend returned 200 but no thread_id found in response.\n"
+                            f"Response: {data}"
+                        ))]
 
             if NEO_TRANSPORT != "http":
                 _save_thread_id(thread_id)

@@ -1141,6 +1141,104 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_ensure.assert_awaited_once_with(srv.NEO_SECRET_KEY, key_uuid, os.getcwd())
         self.assertEqual(captured.get("deployment_id"), key_uuid)
 
+    def test_submit_routes_through_daemon_init_chat_in_stdio_mode(self):
+        """In stdio mode, submission goes through daemon /init-chat (not direct backend)."""
+        with patch("neo_mcp.server._get_deployment_id", return_value="dep-abc"), \
+             patch("neo_mcp.server._ensure_local_daemon", new_callable=AsyncMock, return_value=True), \
+             patch("neo_mcp.server._submit_via_daemon", new_callable=AsyncMock, return_value="tid-via-daemon") as mock_via, \
+             patch("asyncio.create_task"):
+            result = call_tool("neo_submit_task", {"description": "train model", "workspace": "/tmp/myws"})
+
+        mock_via.assert_awaited_once()
+        # workspace and message should be passed correctly
+        call_args = mock_via.call_args
+        self.assertEqual(call_args.args[2], "/tmp/myws")  # workspace positional arg
+        self.assertIn("train model", call_args.args[0])   # message contains description
+        self.assertIn("tid-via-daemon", text_of(result))
+
+    def test_submit_falls_back_to_direct_when_daemon_init_chat_fails(self):
+        """If _submit_via_daemon returns None, fall back to direct backend call."""
+        resp_ok = make_response(200, {"thread_id": "tid-fallback"})
+
+        with patch("neo_mcp.server._get_deployment_id", return_value="dep-abc"), \
+             patch("neo_mcp.server._ensure_local_daemon", new_callable=AsyncMock, return_value=True), \
+             patch("neo_mcp.server._submit_via_daemon", new_callable=AsyncMock, return_value=None), \
+             patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
+             patch("asyncio.create_task"):
+            ctx, _ = make_async_client({"DEFAULT": resp_ok})
+            MockClient.return_value = ctx
+            result = call_tool("neo_submit_task", {"description": "task"})
+
+        self.assertIn("tid-fallback", text_of(result))
+
+    def test_submit_via_daemon_returns_none_without_token_file(self):
+        """_submit_via_daemon returns None when daemon.token file doesn't exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_ipc = srv._ipc_token_path
+            srv._ipc_token_path = lambda: os.path.join(tmpdir, "no-token")
+            try:
+                result = self._run(srv._submit_via_daemon("msg", "dep", "/ws", "sk-v1-test"))
+            finally:
+                srv._ipc_token_path = orig_ipc
+        self.assertIsNone(result)
+
+    def test_submit_via_daemon_returns_none_on_non_200(self):
+        """_submit_via_daemon returns None when daemon returns non-200."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_file = os.path.join(tmpdir, "daemon.token")
+            with open(token_file, "w") as f:
+                f.write("test-token")
+            orig_ipc = srv._ipc_token_path
+            srv._ipc_token_path = lambda: token_file
+
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=make_response(500, {}))
+            ctx = MagicMock()
+            ctx.__aenter__ = AsyncMock(return_value=mock_client)
+            ctx.__aexit__ = AsyncMock(return_value=False)
+            try:
+                with patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx):
+                    result = self._run(srv._submit_via_daemon("msg", "dep", "/ws", "sk-v1-test"))
+            finally:
+                srv._ipc_token_path = orig_ipc
+        self.assertIsNone(result)
+
+    def test_submit_via_daemon_returns_thread_id_on_success(self):
+        """_submit_via_daemon returns thread_id from daemon /init-chat response."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_file = os.path.join(tmpdir, "daemon.token")
+            with open(token_file, "w") as f:
+                f.write("secret-token")
+            orig_ipc = srv._ipc_token_path
+            srv._ipc_token_path = lambda: token_file
+
+            captured = {}
+
+            async def mock_post(url, **kwargs):
+                captured["url"] = url
+                captured["body"] = kwargs.get("json", {})
+                captured["auth"] = kwargs.get("headers", {}).get("Authorization", "")
+                return make_response(200, {"thread_id": "tid-daemon-123"})
+
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(side_effect=mock_post)
+            ctx = MagicMock()
+            ctx.__aenter__ = AsyncMock(return_value=mock_client)
+            ctx.__aexit__ = AsyncMock(return_value=False)
+            try:
+                with patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx):
+                    result = self._run(srv._submit_via_daemon(
+                        "train model", "dep-xyz", "/home/user/project", "sk-v1-test"
+                    ))
+            finally:
+                srv._ipc_token_path = orig_ipc
+
+        self.assertEqual(result, "tid-daemon-123")
+        self.assertIn("/init-chat", captured["url"])
+        self.assertEqual(captured["body"]["workspaceFolder"], "/home/user/project")
+        self.assertEqual(captured["body"]["deploymentId"], "dep-xyz")
+        self.assertEqual(captured["auth"], "Bearer secret-token")
+
 
 # ---------------------------------------------------------------------------
 # 9. Tool: neo_task_status
