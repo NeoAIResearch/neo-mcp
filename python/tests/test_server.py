@@ -770,10 +770,10 @@ class TestNeoSubmitTask(unittest.TestCase):
         """HTTP transport must not attempt daemon auto-start from server process."""
         resp_ok = make_response(200, {"thread_id": "tid-http-auto"})
         srv.NEO_TRANSPORT = "http"
-        mock_ensure = AsyncMock(return_value=True)
+        mock_start = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-http"), \
-             patch("neo_mcp.server._ensure_local_daemon", mock_ensure), \
+             patch("neo_mcp.server._start_daemon", mock_start), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
             ctx, _ = make_async_client({"DEFAULT": resp_ok})
@@ -781,7 +781,7 @@ class TestNeoSubmitTask(unittest.TestCase):
             result = call_tool("neo_submit_task", {"description": "train a model"})
 
         self.assertIn("tid-http-auto", text_of(result))
-        mock_ensure.assert_not_awaited()
+        mock_start.assert_not_awaited()
 
     def test_submit_400_retries_once_same_deployment_id(self):
         """Daemon-only mode retries once after ensure_local_daemon."""
@@ -805,7 +805,7 @@ class TestNeoSubmitTask(unittest.TestCase):
         dep_token = srv._ctx_deployment_id.set("")
         try:
             with patch("neo_mcp.server._get_deployment_id", return_value=dep_id), \
-             patch("neo_mcp.server._ensure_local_daemon", new_callable=AsyncMock, return_value=True), \
+             patch("neo_mcp.server._start_daemon", new_callable=AsyncMock, return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
              patch("asyncio.create_task"):
                 result = call_tool("neo_submit_task", {"description": "task"})
@@ -819,7 +819,6 @@ class TestNeoSubmitTask(unittest.TestCase):
         resp_401 = make_response(401, {"detail": "Unauthorized"})
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-123"), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=True), \
              patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
@@ -886,7 +885,6 @@ class TestNeoSubmitTask(unittest.TestCase):
         import httpx as _httpx
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-123"), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=True), \
              patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
@@ -945,7 +943,7 @@ class TestNeoSubmitTask(unittest.TestCase):
         ctx.__aexit__ = AsyncMock(return_value=False)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-123"), \
-             patch("neo_mcp.server._ensure_local_daemon", new_callable=AsyncMock, return_value=True), \
+             patch("neo_mcp.server._start_daemon", new_callable=AsyncMock, return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
              patch("asyncio.create_task"):
             call_tool("neo_submit_task", {"description": "task"})
@@ -954,33 +952,12 @@ class TestNeoSubmitTask(unittest.TestCase):
 
     # -- daemon-only auto-start routing tests --------------------------------
 
-    def test_registerable_local_daemon_skips_autostart(self):
-        """Reachable daemon registration should satisfy readiness without restarts."""
-        mock_register = AsyncMock(return_value=True)
-        mock_npm_start = AsyncMock()
-        mock_py_start = AsyncMock()
-
-        with patch("neo_mcp.server._register_with_daemon", mock_register), \
-             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
-             patch("neo_mcp.server._python_daemon_running", return_value=False), \
-             patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
-             patch("neo_mcp.server._auto_start_python_daemon", mock_py_start):
-            ready = self._run(srv._ensure_local_daemon("sk-v1-test", "dep-xyz", "/tmp/ws"))
-
-        self.assertTrue(ready)
-        mock_register.assert_called_once_with("dep-xyz", "sk-v1-test", "/tmp/ws")
-        mock_npm_start.assert_not_called()
-        mock_py_start.assert_not_called()
-
     def test_no_npm_daemon_autostart_triggered(self):
-        """When pip daemon fails, npm auto-start must be called as fallback."""
+        """When no daemon running, npm auto-start is called."""
         resp_ok = make_response(200, {"thread_id": "tid-no-daemon"})
         mock_npm_start = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._python_daemon_running", return_value=False), \
-             patch("neo_mcp.server._auto_start_python_daemon", new_callable=AsyncMock, return_value=False), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
@@ -994,13 +971,12 @@ class TestNeoSubmitTask(unittest.TestCase):
         self.assertIn("tid-no-daemon", text_of(result))
 
     def test_npm_daemon_starts_first_before_python(self):
-        """npm/Go daemon is tried first; Python daemon is not called if npm succeeds."""
+        """npm daemon is tried first; Python daemon is not called if npm succeeds."""
         resp_ok = make_response(200, {"thread_id": "tid-npm-primary"})
         mock_npm_start = AsyncMock(return_value=True)
         mock_py_start = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
@@ -1022,7 +998,6 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_daemon = AsyncMock()
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=True), \
              patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
@@ -1033,30 +1008,21 @@ class TestNeoSubmitTask(unittest.TestCase):
 
         mock_daemon.assert_not_called()
 
-    def test_running_npm_daemon_without_registration_attempts_restart(self):
-        """If pip fails and npm daemon is alive but un-registerable, restart recovery is attempted."""
-        with patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._python_daemon_running", return_value=False), \
-             patch("neo_mcp.server._auto_start_python_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
-             patch("neo_mcp.server._restart_npm_daemon", new_callable=AsyncMock, return_value=True) as mock_restart:
-            ready = self._run(srv._ensure_local_daemon("sk-v1-test", "dep-xyz", "/tmp/ws"))
-
+    def test_start_daemon_npm_running_returns_true(self):
+        """_start_daemon returns True immediately if npm daemon already running."""
+        with patch("neo_mcp.server._npm_daemon_running", return_value=True):
+            ready = self._run(srv._start_daemon("sk-v1-test", "dep-xyz", "/tmp/ws"))
         self.assertTrue(ready)
-        mock_restart.assert_called_once_with("sk-v1-test", "dep-xyz", "/tmp/ws")
 
-    def test_npm_restart_failure_falls_back_to_python(self):
-        """If npm recovery fails, ensure_local_daemon should still try Python fallback."""
-        with patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
-             patch("neo_mcp.server._restart_npm_daemon", new_callable=AsyncMock, return_value=False), \
+    def test_start_daemon_python_fallback(self):
+        """_start_daemon falls back to Python daemon if npm not available."""
+        with patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", new_callable=AsyncMock, return_value=False), \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
-             patch("neo_mcp.server._auto_start_python_daemon", new_callable=AsyncMock, return_value=True) as mock_py_start:
-            ready = self._run(srv._ensure_local_daemon("sk-v1-test", "dep-xyz", "/tmp/ws"))
-
+             patch("neo_mcp.server._auto_start_python_daemon", new_callable=AsyncMock, return_value=True) as mock_py:
+            ready = self._run(srv._start_daemon("sk-v1-test", "dep-xyz", "/tmp/ws"))
         self.assertTrue(ready)
-        mock_py_start.assert_called_once_with("sk-v1-test", "dep-xyz", "/tmp/ws")
+        mock_py.assert_called_once_with("sk-v1-test", "dep-xyz", "/tmp/ws")
     def test_deployment_id_sent_in_submit_body(self):
         """Resolved deployment_id must be forwarded to init-chat-direct."""
         captured = {}
@@ -1098,14 +1064,12 @@ class TestNeoSubmitTask(unittest.TestCase):
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=mock_client)
         ctx.__aexit__ = AsyncMock(return_value=False)
-        mock_ensure = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value=""), \
              patch("neo_mcp.server._derive_deployment_id", return_value=key_uuid), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._ensure_local_daemon", mock_ensure), \
+             patch("neo_mcp.server._auto_start_npm_daemon", new_callable=AsyncMock, return_value=True), \
              patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
              patch("asyncio.create_task"):
             call_tool("neo_submit_task", {"description": "task"})
@@ -1127,117 +1091,15 @@ class TestNeoSubmitTask(unittest.TestCase):
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=mock_client)
         ctx.__aexit__ = AsyncMock(return_value=False)
-        mock_ensure = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value=key_uuid), \
              patch("neo_mcp.server._derive_deployment_id", return_value=key_uuid), \
              patch("neo_mcp.server._npm_daemon_running", side_effect=lambda dep="": dep == key_uuid), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._ensure_local_daemon", mock_ensure), \
              patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx), \
              patch("asyncio.create_task"):
             call_tool("neo_submit_task", {"description": "task"})
 
-        mock_ensure.assert_awaited_once_with(srv.NEO_SECRET_KEY, key_uuid, os.getcwd())
         self.assertEqual(captured.get("deployment_id"), key_uuid)
-
-    def test_submit_routes_through_daemon_init_chat_in_stdio_mode(self):
-        """In stdio mode, submission goes through daemon /init-chat (not direct backend)."""
-        with patch("neo_mcp.server._get_deployment_id", return_value="dep-abc"), \
-             patch("neo_mcp.server._ensure_local_daemon", new_callable=AsyncMock, return_value=True), \
-             patch("neo_mcp.server._submit_via_daemon", new_callable=AsyncMock, return_value="tid-via-daemon") as mock_via, \
-             patch("asyncio.create_task"):
-            result = call_tool("neo_submit_task", {"description": "train model", "workspace": "/tmp/myws"})
-
-        mock_via.assert_awaited_once()
-        # workspace and message should be passed correctly
-        call_args = mock_via.call_args
-        self.assertEqual(call_args.args[2], "/tmp/myws")  # workspace positional arg
-        self.assertIn("train model", call_args.args[0])   # message contains description
-        self.assertIn("tid-via-daemon", text_of(result))
-
-    def test_submit_falls_back_to_direct_when_daemon_init_chat_fails(self):
-        """If _submit_via_daemon returns None, fall back to direct backend call."""
-        resp_ok = make_response(200, {"thread_id": "tid-fallback"})
-
-        with patch("neo_mcp.server._get_deployment_id", return_value="dep-abc"), \
-             patch("neo_mcp.server._ensure_local_daemon", new_callable=AsyncMock, return_value=True), \
-             patch("neo_mcp.server._submit_via_daemon", new_callable=AsyncMock, return_value=None), \
-             patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
-             patch("asyncio.create_task"):
-            ctx, _ = make_async_client({"DEFAULT": resp_ok})
-            MockClient.return_value = ctx
-            result = call_tool("neo_submit_task", {"description": "task"})
-
-        self.assertIn("tid-fallback", text_of(result))
-
-    def test_submit_via_daemon_returns_none_without_token_file(self):
-        """_submit_via_daemon returns None when daemon.token file doesn't exist."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            orig_ipc = srv._ipc_token_path
-            srv._ipc_token_path = lambda: os.path.join(tmpdir, "no-token")
-            try:
-                result = self._run(srv._submit_via_daemon("msg", "dep", "/ws", "sk-v1-test"))
-            finally:
-                srv._ipc_token_path = orig_ipc
-        self.assertIsNone(result)
-
-    def test_submit_via_daemon_returns_none_on_non_200(self):
-        """_submit_via_daemon returns None when daemon returns non-200."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            token_file = os.path.join(tmpdir, "daemon.token")
-            with open(token_file, "w") as f:
-                f.write("test-token")
-            orig_ipc = srv._ipc_token_path
-            srv._ipc_token_path = lambda: token_file
-
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(return_value=make_response(500, {}))
-            ctx = MagicMock()
-            ctx.__aenter__ = AsyncMock(return_value=mock_client)
-            ctx.__aexit__ = AsyncMock(return_value=False)
-            try:
-                with patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx):
-                    result = self._run(srv._submit_via_daemon("msg", "dep", "/ws", "sk-v1-test"))
-            finally:
-                srv._ipc_token_path = orig_ipc
-        self.assertIsNone(result)
-
-    def test_submit_via_daemon_returns_thread_id_on_success(self):
-        """_submit_via_daemon returns thread_id from daemon /init-chat response."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            token_file = os.path.join(tmpdir, "daemon.token")
-            with open(token_file, "w") as f:
-                f.write("secret-token")
-            orig_ipc = srv._ipc_token_path
-            srv._ipc_token_path = lambda: token_file
-
-            captured = {}
-
-            async def mock_post(url, **kwargs):
-                captured["url"] = url
-                captured["body"] = kwargs.get("json", {})
-                captured["auth"] = kwargs.get("headers", {}).get("Authorization", "")
-                return make_response(200, {"thread_id": "tid-daemon-123"})
-
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(side_effect=mock_post)
-            ctx = MagicMock()
-            ctx.__aenter__ = AsyncMock(return_value=mock_client)
-            ctx.__aexit__ = AsyncMock(return_value=False)
-            try:
-                with patch("neo_mcp.server.httpx.AsyncClient", return_value=ctx):
-                    result = self._run(srv._submit_via_daemon(
-                        "train model", "dep-xyz", "/home/user/project", "sk-v1-test"
-                    ))
-            finally:
-                srv._ipc_token_path = orig_ipc
-
-        self.assertEqual(result, "tid-daemon-123")
-        self.assertIn("/init-chat", captured["url"])
-        self.assertEqual(captured["body"]["workspaceFolder"], "/home/user/project")
-        self.assertEqual(captured["body"]["deploymentId"], "dep-xyz")
-        self.assertEqual(captured["auth"], "Bearer secret-token")
 
 
 # ---------------------------------------------------------------------------

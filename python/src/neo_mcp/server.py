@@ -34,9 +34,6 @@ _THREAD_WORKSPACES_TTL_SECONDS = int(os.environ.get("NEO_THREAD_WORKSPACES_TTL_S
 _DAEMON_DIR = os.path.expanduser("~/.neo/daemon")
 _NPM_STARTUP_LOG = os.path.expanduser("~/.neo/daemon/npm_daemon_start.log")
 _PYTHON_STARTUP_LOG = os.path.expanduser("~/.neo/daemon/python_daemon_start.log")
-_DAEMON_PORT = 31337
-# Tracks deployment_ids we are actively heartbeating so we don't start duplicate tasks.
-_active_heartbeats: set[str] = set()
 
 # In-memory poll state: { thread_id: { "status": str, "messages": list|None, "capped": bool } }
 # Populated and updated by background asyncio tasks; read by neo_task_status / neo_get_messages.
@@ -183,8 +180,7 @@ def _vscode_daemon_deployment_id() -> str:
     Only the Python daemon writes these entries (with "source": "python-daemon").
 
     This function is kept as a utility for discovering any previously-run Python
-    daemon's deployment ID. It must NOT be used as a proxy for "is VS Code extension
-    running?" — use _register_with_daemon() for that (checks localhost:31337).
+    daemon's deployment ID.
     """
     for log_name in ("daemon.log", "daemon.log.1"):
         log_path = os.path.expanduser(f"~/.neo/daemon/{log_name}")
@@ -250,122 +246,6 @@ def _get_deployment_id() -> str:
     if sk:
         return _derive_deployment_id(sk)
     return ""
-
-
-def _ipc_token_path() -> str:
-    """Return IPC token path, preferring dedicated token with legacy fallback."""
-    preferred = os.path.expanduser("~/.neo/daemon/ipc_token")
-    legacy = os.path.expanduser("~/.neo/daemon/daemon.token")
-    if os.path.exists(preferred):
-        return preferred
-    return legacy
-
-
-async def _heartbeat_loop(deployment_id: str) -> None:
-    """Send a heartbeat to the daemon every 60 s to keep the deployment alive.
-
-    The daemon evicts deployments with no heartbeat for > 5 minutes.
-    Mirrors start-daemon.sh step 11 (background heartbeat sender).
-    """
-    token_path = _ipc_token_path()
-    while True:
-        await asyncio.sleep(60)
-        try:
-            with open(token_path) as f:
-                token = f.read().strip()
-        except OSError:
-            break  # Daemon gone — stop heartbeating
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as dc:
-                await dc.post(
-                    f"http://127.0.0.1:{_DAEMON_PORT}/heartbeat",
-                    headers={"Authorization": f"Bearer {token}"},
-                    json={"deploymentId": deployment_id},
-                )
-        except Exception:
-            pass  # Non-fatal; retry next interval
-
-
-async def _register_with_daemon(deployment_id: str, secret_key: str, workspace: str = "") -> bool:
-    """Register deployment_id with the local daemon and start a heartbeat task.
-
-    Mirrors start-daemon.sh steps 8–11:
-      - reads ipc_token for IPC auth
-      - POST /register with deploymentId + workspaceFolder + authToken
-      - launches _heartbeat_loop background task if not already running
-
-    Returns True if registration succeeded, False if daemon is not running/reachable.
-    """
-    token_path = _ipc_token_path()
-    try:
-        with open(token_path) as f:
-            token = f.read().strip()
-        if not token:
-            return False
-    except OSError:
-        return False
-
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as dc:
-            resp = await dc.post(
-                f"http://127.0.0.1:{_DAEMON_PORT}/register",
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "deploymentId": deployment_id,
-                    "workspaceFolder": workspace or _server_cwd,
-                    "authToken": secret_key,
-                },
-            )
-            if resp.status_code != 200:
-                return False
-    except Exception:
-        return False
-
-    if deployment_id not in _active_heartbeats:
-        _active_heartbeats.add(deployment_id)
-        asyncio.create_task(_heartbeat_loop(deployment_id))
-
-    return True
-
-
-async def _submit_via_daemon(
-    message: str, deployment_id: str, workspace: str, secret_key: str
-) -> "str | None":
-    """Submit task through the local daemon's /init-chat endpoint.
-
-    The daemon stores the per-thread workspace mapping so write_code commands
-    are routed to the correct directory. Returns thread_id or None on failure.
-    """
-    token_path = _ipc_token_path()
-    try:
-        with open(token_path) as f:
-            token = f.read().strip()
-        if not token:
-            return None
-    except OSError:
-        return None
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as dc:
-            resp = await dc.post(
-                f"http://127.0.0.1:{_DAEMON_PORT}/init-chat",
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "message": message,
-                    "deploymentId": deployment_id,
-                    "workspaceFolder": workspace,
-                },
-            )
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-            return (
-                data.get("thread_id")
-                or data.get("threadId")
-                or data.get("id")
-            )
-    except Exception:
-        return None
 
 
 def _derive_deployment_id(secret_key: str) -> str:
@@ -493,7 +373,7 @@ async def _auto_start_npm_daemon(secret_key: str, deployment_id: str = "", works
             except Exception:
                 pass
 
-        # First run may need package download + Go binary install; allow generous time.
+        # First run may need package download; allow generous time.
         for _ in range(120):
             await asyncio.sleep(0.5)
             if _npm_daemon_running(deployment_id):
@@ -503,55 +383,6 @@ async def _auto_start_npm_daemon(secret_key: str, deployment_id: str = "", works
         await asyncio.sleep(1.0)
 
     return False
-
-
-def _stop_npm_daemon() -> None:
-    """Best-effort stop of the npm daemon process.
-
-    Safe restart helper for stale or unresponsive local daemon states.
-    """
-    npm_pid_path = os.path.expanduser("~/.neo/daemon/npm_daemon.pid")
-    npm_pid = _read_pid_file(npm_pid_path)
-    if npm_pid is None:
-        _cleanup_npm_pid_files()
-        return
-
-    if not _pid_alive(npm_pid):
-        _safe_unlink(npm_pid_path)
-        _cleanup_npm_pid_files()
-        return
-
-    # Guard against PID reuse.
-    if not _pid_matches_any_cmdline(npm_pid, ("neo-mcp-daemon", "/dist/index.js", "PollerDaemon")):
-        return
-
-    try:
-        os.kill(npm_pid, signal.SIGTERM)
-    except OSError:
-        pass
-
-    for _ in range(20):
-        if not _pid_alive(npm_pid):
-            break
-        time.sleep(0.1)
-
-    if _pid_alive(npm_pid):
-        try:
-            os.kill(npm_pid, signal.SIGKILL)
-        except OSError:
-            pass
-
-    _cleanup_npm_pid_files(npm_pid)
-
-
-async def _restart_npm_daemon(secret_key: str, deployment_id: str = "", workspace: str = "") -> bool:
-    """Restart npm daemon and wait until it's alive for the target deployment."""
-    _stop_npm_daemon()
-    if _port_open("127.0.0.1", _DAEMON_PORT):
-        return False
-    # Small delay so port 31337 and PID files settle before spawn.
-    await asyncio.sleep(0.2)
-    return await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
 
 
 async def _auto_start_python_daemon(secret_key: str, deployment_id: str = "", workspace: str = "") -> bool:
@@ -598,46 +429,15 @@ async def _auto_start_python_daemon(secret_key: str, deployment_id: str = "", wo
     return False
 
 
-async def _ensure_local_daemon(secret_key: str, deployment_id: str, workspace: str) -> bool:
-    """Ensure there's a healthy local executor for this deployment ID.
-
-    Startup order:
-    1) VS Code extension daemon or npm/Go daemon already running on port 31337 → register
-    2) npm daemon (Go binary primary) already running → retry registration
-    3) Auto-start npm daemon via npx (installs Go binary, most reliable)
-    4) Python daemon already running → use it
-    5) Auto-start Python daemon (last resort — pure Python, no Node.js needed)
-    """
-    # --- Try any already-running daemon on port 31337 (VS Code ext / npm / Go) ---
-    if await _register_with_daemon(deployment_id, secret_key, workspace):
-        return True
-
-    # --- npm/Go daemon (primary — Go binary for local execution) ---
+async def _start_daemon(secret_key: str, deployment_id: str, workspace: str) -> bool:
+    """Start a local daemon if none is running. npm (Node.js) first, Python fallback."""
     if _npm_daemon_running(deployment_id):
-        # One extra retry for transient localhost/token races.
-        if await _register_with_daemon(deployment_id, secret_key, workspace):
-            return True
-        if await _restart_npm_daemon(secret_key, deployment_id, workspace):
-            if await _register_with_daemon(deployment_id, secret_key, workspace):
-                return True
-            return True
-
-    if await _auto_start_npm_daemon(secret_key, deployment_id, workspace):
-        # Give the npm daemon a moment to write its token file before registering.
-        await asyncio.sleep(1)
-        if await _register_with_daemon(deployment_id, secret_key, workspace):
-            return True
-        # Registration failed — daemon is alive but IPC not ready yet; still usable
-        # via the direct-backend fallback + thread-workspaces.json disk re-read path.
         return True
-
-    # --- Python daemon (fallback — no Node.js/npx required) ---
+    if await _auto_start_npm_daemon(secret_key, deployment_id, workspace):
+        return True
     if _python_daemon_running(deployment_id):
         return True
-    if await _auto_start_python_daemon(secret_key, deployment_id, workspace):
-        return True
-
-    return False
+    return await _auto_start_python_daemon(secret_key, deployment_id, workspace)
 
 
 # Capture working directory at server startup — this is where the user launched the MCP client from
@@ -1185,7 +985,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # Auto-start daemon only in stdio mode (local process on user's machine).
             # In HTTP mode, never try to start daemons from the server process.
             if NEO_TRANSPORT != "http":
-                ready = await _ensure_local_daemon(secret_key, deployment_id, workspace)
+                ready = await _start_daemon(secret_key, deployment_id, workspace)
                 if not ready:
                     return [TextContent(type="text", text=_daemon_not_running_message(secret_key, NEO_TRANSPORT))]
 
@@ -1200,79 +1000,62 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if deployment_id:
                 submit_body["deployment_id"] = deployment_id
 
-            # stdio mode: route through daemon's /init-chat so it records the
-            # per-thread workspace mapping. This is the same path the VS Code
-            # extension uses — the daemon stores threadWorkspaces.set(thread_id,
-            # workspaceFolder) so write_code commands land in the right directory.
-            thread_id = None
-            if NEO_TRANSPORT != "http":
-                thread_id = await _submit_via_daemon(message, deployment_id, workspace, secret_key)
+            # Submit task to backend directly.
+            resp = None
+            try:
+                resp = await client.post(
+                    "/v2/thread/init-chat-direct",
+                    headers=_headers(),
+                    json=submit_body,
+                )
+            except httpx.HTTPError as exc:
+                return [TextContent(type="text", text=(
+                    f"Network error reaching Neo backend: {exc}\n"
+                    f"deployment_type: vscode, deployment_id: {deployment_id or '(none)'}"
+                ))]
 
-            if not thread_id:
-                # Fallback: call backend directly (HTTP mode or daemon /init-chat unavailable)
-                resp = None
-                try:
-                    resp = await client.post(
-                        "/v2/thread/init-chat-direct",
-                        headers=_headers(),
-                        json=submit_body,
-                    )
-                except httpx.HTTPError as exc:
-                    return [TextContent(type="text", text=(
-                        f"Network error reaching Neo backend: {exc}\n"
-                        f"deployment_type: vscode, deployment_id: {deployment_id or '(none)'}"
-                    ))]
-
-                if resp.status_code == 400:
-                    # 400 = no healthy daemon for this deployment.
-                    # Retry-once auto-start is only allowed in local stdio mode.
-                    started = False
-                    if NEO_TRANSPORT != "http":
-                        started = await _ensure_local_daemon(secret_key, deployment_id, workspace)
-                    if started:
-                        # Retry via daemon first, then direct
-                        thread_id = await _submit_via_daemon(message, deployment_id, workspace, secret_key)
-                        if not thread_id:
-                            try:
-                                resp = await client.post(
-                                    "/v2/thread/init-chat-direct",
-                                    headers=_headers(), json=submit_body, timeout=30.0,
-                                )
-                            except Exception:
-                                pass  # fall through to error handling below
-
-                    if not thread_id and resp.status_code == 400:
-                        return [TextContent(type="text", text=_daemon_not_running_message(secret_key, NEO_TRANSPORT))]
-
-                if not thread_id:
-                    if resp.status_code != 200:
-                        try:
-                            detail = resp.json().get("detail") or resp.json().get("error") or resp.text
-                        except Exception:
-                            detail = resp.text
-                        return [TextContent(type="text", text=(
-                            f"{handle_error(resp.status_code, NEO_TRANSPORT)}\n"
-                            f"HTTP {resp.status_code} — {detail}\n"
-                            f"deployment_type: vscode, deployment_id: {deployment_id or '(none)'}"
-                        ))]
-
+            if resp.status_code == 400:
+                # 400 = no healthy daemon for this deployment. Try starting one and retry once.
+                if NEO_TRANSPORT != "http":
+                    await _start_daemon(secret_key, deployment_id, workspace)
                     try:
-                        data = resp.json()
+                        resp = await client.post(
+                            "/v2/thread/init-chat-direct",
+                            headers=_headers(), json=submit_body, timeout=30.0,
+                        )
                     except Exception:
-                        return [TextContent(type="text", text=(
-                            f"Backend returned 200 but response was not valid JSON.\n"
-                            f"Body: {resp.text[:500]}"
-                        ))]
-                    thread_id = (
-                        data.get("thread_id")
-                        or data.get("threadId")
-                        or data.get("id")
-                    )
-                    if not thread_id:
-                        return [TextContent(type="text", text=(
-                            f"Backend returned 200 but no thread_id found in response.\n"
-                            f"Response: {data}"
-                        ))]
+                        pass
+                if resp.status_code == 400:
+                    return [TextContent(type="text", text=_daemon_not_running_message(secret_key, NEO_TRANSPORT))]
+
+            if resp.status_code != 200:
+                try:
+                    detail = resp.json().get("detail") or resp.json().get("error") or resp.text
+                except Exception:
+                    detail = resp.text
+                return [TextContent(type="text", text=(
+                    f"{handle_error(resp.status_code, NEO_TRANSPORT)}\n"
+                    f"HTTP {resp.status_code} — {detail}\n"
+                    f"deployment_type: vscode, deployment_id: {deployment_id or '(none)'}"
+                ))]
+
+            try:
+                data = resp.json()
+            except Exception:
+                return [TextContent(type="text", text=(
+                    f"Backend returned 200 but response was not valid JSON.\n"
+                    f"Body: {resp.text[:500]}"
+                ))]
+            thread_id = (
+                data.get("thread_id")
+                or data.get("threadId")
+                or data.get("id")
+            )
+            if not thread_id:
+                return [TextContent(type="text", text=(
+                    f"Backend returned 200 but no thread_id found in response.\n"
+                    f"Response: {data}"
+                ))]
 
             if NEO_TRANSPORT != "http":
                 _save_thread_id(thread_id)
@@ -1917,14 +1700,12 @@ def _daemon_running(deployment_id: str = "") -> bool:
     If deployment_id is provided, checks that deployment-specific PID file first.
     """
     pid_files = [
-        os.path.expanduser("~/.neo/daemon/go_daemon.pid"),
         os.path.expanduser("~/.neo/daemon/npm_daemon.pid"),
         os.path.expanduser("~/.neo/daemon/python_daemon.pid"),
     ]
     if deployment_id:
         dep_pid = os.path.expanduser(f"~/.neo/daemon/daemon_{deployment_id[:8]}.pid")
-        go_dep_pid = os.path.expanduser(f"~/.neo/daemon/go_daemon_{deployment_id[:8]}.pid")
-        pid_files = [go_dep_pid, dep_pid]
+        pid_files = [dep_pid]
     # Also check per-deployment PID files written by the Python daemon
     daemon_dir = os.path.expanduser("~/.neo/daemon")
     if not deployment_id:
