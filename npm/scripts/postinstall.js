@@ -1,3 +1,3 @@
 #!/usr/bin/env node
-// Go binary install removed — npm daemon runs as Node.js process only.
-console.log('[neo-mcp-daemon] Ready.');
+'use strict';
+// Nothing to do — neo-mcp-daemon runs as a pure Node.js process.
