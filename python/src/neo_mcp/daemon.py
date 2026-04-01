@@ -546,7 +546,18 @@ async def run_daemon(workspace: Optional[str] = None, deployment_id: Optional[st
                 backoff = 1.0
                 for cmd in commands:
                     tid = cmd.get("thread_id")
-                    effective_ws = thread_workspaces.get(tid, ws) if tid else ws
+                    if tid:
+                        effective_ws = thread_workspaces.get(tid)
+                        if effective_ws is None:
+                            # server.py writes thread→workspace to disk immediately after
+                            # getting thread_id from the backend. Re-read here so we pick
+                            # up the correct workspace for this task even if the daemon
+                            # was started with a different default workspace.
+                            fresh = _load_thread_workspaces()
+                            thread_workspaces.update(fresh)
+                            effective_ws = thread_workspaces.get(tid, ws)
+                    else:
+                        effective_ws = ws
                     resp = await _dispatch(cmd, effective_ws)
 
                     if tid:
