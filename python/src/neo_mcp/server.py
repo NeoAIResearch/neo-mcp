@@ -56,17 +56,53 @@ def _remove_lock() -> None:
     except OSError:
         pass
 
-def _poller_already_running() -> bool:
-    if not LOCK_FILE.exists():
-        return False
+def _pid_is_alive(pid: int) -> bool:
     try:
-        data = json.loads(LOCK_FILE.read_text())
-        pid = data.get("pid")
-        if pid and pid != os.getpid():
-            os.kill(int(pid), 0)  # raises OSError if not alive
-            return True
-    except (OSError, ValueError, TypeError):
-        pass
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _poller_already_running(deployment_id: str = "") -> bool:
+    """Return True if any daemon with the same deployment ID is already polling.
+
+    Checks (in order):
+    1. Our own lock file (neo-mcp.lock)
+    2. Go agent PID file: daemon_{deployment_id}.pid  (written by ~/.neo/agent)
+    3. Go agent generic PID file: go_daemon.pid
+    4. npm daemon generic PID file: npm_daemon.pid / python_daemon.pid
+    """
+    # 1. Our own lock file
+    if LOCK_FILE.exists():
+        try:
+            data = json.loads(LOCK_FILE.read_text())
+            pid = data.get("pid")
+            if pid and int(pid) != os.getpid() and _pid_is_alive(int(pid)):
+                return True
+        except (OSError, ValueError, TypeError):
+            pass
+
+    # 2–4. Any other daemon writing a PID file under ~/.neo/daemon/
+    candidates = []
+    if deployment_id:
+        candidates.append(DAEMON_DIR / f"daemon_{deployment_id.replace('-', '')[:8]}.pid")
+        candidates.append(DAEMON_DIR / f"daemon_{deployment_id}.pid")
+    candidates += [
+        DAEMON_DIR / "go_daemon.pid",
+        DAEMON_DIR / "npm_daemon.pid",
+        DAEMON_DIR / "python_daemon.pid",
+    ]
+    for pid_file in candidates:
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text().strip())
+                if pid != os.getpid() and _pid_is_alive(pid):
+                    logger.info("Existing daemon detected via %s (pid=%d) — skipping poller start", pid_file.name, pid)
+                    return True
+            except (OSError, ValueError):
+                pass
+
     return False
 
 
@@ -312,13 +348,14 @@ async def run(secret_key: str, workspace: str) -> None:
 
     pid = os.getpid()
     poller_task: Optional[asyncio.Task] = None
+    deployment_id = derive_deployment_id(secret_key)
 
-    # Lock file — single poller instance
-    if _poller_already_running():
+    # Lock file — single poller instance; also yield to Go/npm/extension daemons
+    if _poller_already_running(deployment_id):
         logger.warning(
-            "Another neo-mcp poller is already running (lock=%s). "
-            "MCP server will start without a local daemon.",
-            LOCK_FILE,
+            "Another daemon is already running for deployment %s. "
+            "MCP server will start without a local poller.",
+            deployment_id,
         )
     else:
         _write_lock(pid)
@@ -328,7 +365,7 @@ async def run(secret_key: str, workspace: str) -> None:
         logger.info(
             "Poller started (pid=%d deployment=%s)",
             pid,
-            derive_deployment_id(secret_key),
+            deployment_id,
         )
 
     def _shutdown(signum: int, frame: Any) -> None:
