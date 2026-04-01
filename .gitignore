@@ -26,6 +26,3 @@ workspace_check.txt
 
 # vscode_extension is tracked separately
 vscode_extension/
-
-python/=42
-
