@@ -1,6 +1,6 @@
 # Neo — OpenAI Agents SDK Integration
 
-Use Neo's MCP server as a toolset inside the OpenAI Agents SDK. Neo runs AI/ML workloads remotely so your agent doesn't need to execute training or data-processing jobs inline.
+Use Neo's MCP server as a toolset inside the OpenAI Agents SDK. Neo executes AI/ML workloads locally on the user's machine — files are written directly to their workspace, never to a remote server.
 
 **MCP server:** `https://mcpserver.heyneo.com/mcp`
 **Auth:** `Authorization: Bearer sk-v1-YOUR_KEY`
@@ -9,7 +9,7 @@ Use Neo's MCP server as a toolset inside the OpenAI Agents SDK. Neo runs AI/ML w
 
 ## Option A: MCP Server tool (recommended)
 
-The OpenAI Agents SDK has native MCP support via `MCPServerHTTP`. This loads all 10 Neo tools automatically.
+The OpenAI Agents SDK has native MCP support via `MCPServerHTTP`. This loads all 7 Neo tools automatically.
 
 ```python
 import asyncio
@@ -24,19 +24,20 @@ neo_mcp = MCPServerHTTP(
 agent = Agent(
     name="Neo ML Agent",
     model="gpt-4o",
-    instructions="""You are an AI assistant with access to Neo, a remote AI/ML execution backend.
+    instructions="""You are an AI assistant with access to Neo, a local AI/ML execution backend.
+Files are written directly to the user's machine — never to a remote server.
 
 Use Neo for any AI/ML work: training models, building RAG pipelines, data preprocessing,
 building autonomous agents, or LLM integrations.
 
 Workflow:
 1. Call neo_submit_task — returns thread_id immediately
-2. Call neo_task_plan repeatedly until COMPLETED or WAITING_FOR_FEEDBACK
-3. If WAITING_FOR_FEEDBACK, call neo_send_feedback to reply
+2. Call neo_task_status until COMPLETED or WAITING_FOR_FEEDBACK
+3. If WAITING_FOR_FEEDBACK, call neo_send_feedback to reply, then check status again
 4. Call neo_get_messages for full output once COMPLETED
-5. Call neo_get_files to retrieve generated code, models, or scripts
 
 Never run ML workloads locally — always delegate to neo_submit_task.
+Always pass workspace as the project root (git root), never a subdirectory.
 """,
     mcp_servers=[neo_mcp],
 )
@@ -62,7 +63,7 @@ export NEO_SECRET_KEY=sk-v1-...
 
 ## Option B: Function tools (inline definitions)
 
-Define the Neo tools as Python functions for full control, without the MCP client.
+Define the 7 Neo tools as Python functions for full control, without the MCP client.
 
 ```python
 import os
@@ -90,143 +91,110 @@ def _call_neo(tool_name: str, arguments: dict) -> str:
 
 
 @function_tool
-def neo_submit_task(
-    description: str,
-    wait_for_completion: bool = False,
-    auto_mode: bool = False,
-) -> str:
-    """Submit an AI/ML task to Neo's remote backend.
+def neo_submit_task(message: str, workspace: str) -> str:
+    """Submit an AI/ML task to Neo for local execution.
 
-    Returns thread_id immediately. Use wait_for_completion=True only for tasks
-    under ~3 minutes. For longer tasks, poll with neo_task_plan.
+    Returns {thread_id, status, workspace} immediately.
+    Use for: training models, RAG pipelines, AI agents, data preprocessing.
+    NOT for general coding. Files are written directly to the user's local machine.
 
     Args:
-        description: Full description of the task to run.
-        wait_for_completion: Block until done and return output directly.
-        auto_mode: Run fully autonomously without pausing for questions.
+        message: Full task description with goal, file paths, and constraints.
+        workspace: Absolute path to the project root (git root). Never a subdirectory.
     """
-    return _call_neo("neo_submit_task", {
-        "description": description,
-        "wait_for_completion": wait_for_completion,
-        "auto_mode": auto_mode,
-    })
+    return _call_neo("neo_submit_task", {"message": message, "workspace": workspace})
 
 
 @function_tool
-def neo_task_plan(thread_id: str = "") -> str:
-    """Show Neo's current execution plan with per-step status.
+def neo_task_status(thread_id: str) -> str:
+    """Get the current status of a Neo task.
 
-    Much cheaper than neo_get_messages. Use this while the task is RUNNING
-    to see which steps are done and which are in progress.
+    Returns one of: RUNNING (call again), COMPLETED (call neo_get_messages),
+    WAITING_FOR_FEEDBACK (call neo_send_feedback), PAUSED, TERMINATED, FAILED.
+    Call once per turn — do NOT poll in a tight loop.
 
     Args:
-        thread_id: Thread ID from neo_submit_task. Omit for last active thread.
+        thread_id: Thread ID from neo_submit_task.
     """
-    args = {}
-    if thread_id:
-        args["thread_id"] = thread_id
-    return _call_neo("neo_task_plan", args)
+    return _call_neo("neo_task_status", {"thread_id": thread_id})
 
 
 @function_tool
-def neo_task_status(thread_id: str = "") -> str:
-    """Check the current status of a Neo task.
+def neo_get_messages(thread_id: str, limit: int = 50) -> str:
+    """Retrieve full output from a completed Neo task.
 
-    Returns one of: RUNNING, COMPLETED, WAITING_FOR_FEEDBACK, PAUSED, TERMINATED.
+    Only call when neo_task_status returns COMPLETED.
+    Capped at ~20,000 tokens.
 
     Args:
-        thread_id: Thread ID from neo_submit_task. Omit for last active thread.
+        thread_id: Thread ID from neo_submit_task.
+        limit: Max messages to return (default 50, max 200).
     """
-    args = {}
-    if thread_id:
-        args["thread_id"] = thread_id
-    return _call_neo("neo_task_status", args)
+    return _call_neo("neo_get_messages", {"thread_id": thread_id, "limit": limit})
 
 
 @function_tool
-def neo_get_messages(thread_id: str = "") -> str:
-    """Get the full conversation output once a task is COMPLETED.
-
-    Capped at ~20 000 tokens. Call after neo_task_status returns COMPLETED.
-
-    Args:
-        thread_id: Thread ID from neo_submit_task. Omit for last active thread.
-    """
-    args = {}
-    if thread_id:
-        args["thread_id"] = thread_id
-    return _call_neo("neo_get_messages", args)
-
-
-@function_tool
-def neo_get_files(thread_id: str = "") -> str:
-    """Download files generated by a completed task.
-
-    Returns code, models, scripts inline. Call after COMPLETED.
-
-    Args:
-        thread_id: Thread ID. Omit for last active thread.
-    """
-    args = {}
-    if thread_id:
-        args["thread_id"] = thread_id
-    return _call_neo("neo_get_files", args)
-
-
-@function_tool
-def neo_send_feedback(message: str, thread_id: str = "") -> str:
+def neo_send_feedback(thread_id: str, message: str) -> str:
     """Reply to Neo when it is WAITING_FOR_FEEDBACK.
 
+    Only call when neo_task_status returns WAITING_FOR_FEEDBACK.
+    After sending, call neo_task_status to confirm the task resumed.
+
     Args:
-        message: Your reply to Neo's question.
-        thread_id: Thread ID. Omit for last active thread.
+        thread_id: Thread ID of the waiting task.
+        message: Your reply to Neo's question or additional instructions.
     """
-    args = {"message": message}
-    if thread_id:
-        args["thread_id"] = thread_id
-    return _call_neo("neo_send_feedback", args)
+    return _call_neo("neo_send_feedback", {"thread_id": thread_id, "message": message})
 
 
 @function_tool
-def neo_list_tasks() -> str:
-    """List running or recent Neo tasks associated with your API key.
+def neo_pause_task(thread_id: str) -> str:
+    """Pause a running Neo task mid-execution. Resumable via neo_resume_task.
 
-    Use when the user has closed a window or lost track of a task. Discovers
-    tasks from in-memory state, the local thread ID file, and the Neo API.
-    Reconnects background pollers automatically for any active tasks found.
+    Args:
+        thread_id: Thread ID of the running task.
     """
-    return _call_neo("neo_list_tasks", {})
+    return _call_neo("neo_pause_task", {"thread_id": thread_id})
 
 
 @function_tool
-def neo_stop_task(thread_id: str = "", delete_remote_artifacts: bool = False) -> str:
-    """Stop and clean up a running or paused task.
+def neo_resume_task(thread_id: str) -> str:
+    """Resume a paused Neo task from where it stopped.
 
     Args:
-        thread_id: Thread ID. Omit for last active thread.
-        delete_remote_artifacts: Also delete files stored on Neo's servers.
+        thread_id: Thread ID of the paused task.
     """
-    args = {"delete_remote_artifacts": delete_remote_artifacts}
-    if thread_id:
-        args["thread_id"] = thread_id
-    return _call_neo("neo_stop_task", args)
+    return _call_neo("neo_resume_task", {"thread_id": thread_id})
+
+
+@function_tool
+def neo_stop_task(thread_id: str) -> str:
+    """Permanently stop and clean up a Neo task. IRREVERSIBLE.
+
+    Only call when the user explicitly asks to cancel.
+    To pause temporarily (resumable), use neo_pause_task instead.
+
+    Args:
+        thread_id: Thread ID of the task to stop.
+    """
+    return _call_neo("neo_stop_task", {"thread_id": thread_id})
 
 
 # Build agent with inline tools
 agent = Agent(
     name="Neo ML Agent",
     model="gpt-4o",
-    instructions="""You have access to Neo, a remote AI/ML execution backend.
-Use neo_submit_task for any ML/AI work. Poll with neo_task_plan until COMPLETED,
-then call neo_get_messages for the final output.""",
+    instructions="""You have access to Neo, a local AI/ML execution backend.
+Use neo_submit_task for any ML/AI work. Files are written directly to the user's machine.
+Poll with neo_task_status until COMPLETED, then call neo_get_messages for the final output.
+Always pass workspace as the project root (git root), never a subdirectory.""",
     tools=[
         neo_submit_task,
-        neo_list_tasks,
-        neo_task_plan,
         neo_task_status,
         neo_get_messages,
-        neo_get_files,
         neo_send_feedback,
+        neo_pause_task,
+        neo_resume_task,
         neo_stop_task,
     ],
 )
@@ -278,8 +246,8 @@ orchestrator = Agent(
 
 ## Notes
 
-- `thread_id` is optional — the server auto-recovers the last active thread.
-- Task execution requires a daemon on the user's machine. Options (simplest first):
+- Task execution requires a daemon running on the user's machine. Options:
   1. **Neo VS Code/Cursor extension** — handles everything automatically, zero setup
-  2. **Agent auto-start** — agents with terminal access run `neo-mcp daemon` first (pip), then `npx --yes neo-mcp-daemon` as fallback if pip is unavailable
+  2. **Agent auto-start** — agents with terminal access run `npx --yes neo-mcp-daemon /workspace &` automatically; user clicks Allow once
+- Files land in the `workspace` passed to `neo_submit_task` — infer from current project directory.
 - Get your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.

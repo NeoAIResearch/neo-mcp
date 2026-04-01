@@ -103,16 +103,27 @@ class ActionHandlers:
             return {"request_id": request_id, "status": "error", "error": "Missing filename or code"}
 
         workspace = self._workspace_for(thread_id)
+        ws_resolved = Path(workspace).resolve()
 
         if os.path.isabs(filename):
-            # Allow any absolute path — Neo uses /app/project/ as its default workspace.
-            # Only relative paths get the traversal check.
-            file_path = Path(filename).resolve()
+            candidate = Path(filename).resolve()
+            if self._is_allowed_path(candidate, ws_resolved):
+                file_path = candidate
+            else:
+                # Backend sent its own container path (e.g. /app/project/src/main.py).
+                # Remap to the user's local workspace preserving relative structure.
+                file_path = self._remap_to_workspace(candidate, ws_resolved, workdir)
+                logger.info("Remapped absolute path %s → %s", filename, file_path)
         else:
-            base = Path(workspace) / workdir if workdir else Path(workspace)
+            if workdir and os.path.isabs(workdir):
+                # Backend supplied an absolute workdir (e.g. /app/project/test_2/demo).
+                # Remap it to the local workspace to preserve subdirectory structure.
+                # e.g. /app/project/test_2/demo → <workspace>/test_2/demo
+                base = self._remap_to_workspace(Path(workdir).resolve(), ws_resolved)
+            else:
+                base = ws_resolved / workdir if workdir else ws_resolved
             candidate = (base / filename).resolve()
-            ws_resolved = Path(workspace).resolve()
-            if not str(candidate).startswith(str(ws_resolved) + os.sep) and candidate != ws_resolved:
+            if not self._is_allowed_path(candidate, ws_resolved):
                 logger.warning("Path traversal blocked: %s", filename)
                 return {"request_id": request_id, "status": "error", "error": "Path traversal detected"}
             file_path = candidate
@@ -281,6 +292,42 @@ class ActionHandlers:
         if thread_id and thread_id in self._thread_workspaces:
             return self._thread_workspaces[thread_id]
         return self._default_workspace
+
+    def _remap_to_workspace(self, path: Path, workspace: Path, workdir_hint: Optional[str] = None) -> Path:
+        """Remap a backend container path (e.g. /app/project/src/main.py) to the local workspace.
+
+        Also deduplicates when workspace is itself a subdirectory matching the first
+        segment of the relative path — prevents double-nesting like test_2/test_2/file.py.
+        """
+        relative: Optional[Path] = None
+
+        if workdir_hint and os.path.isabs(workdir_hint):
+            try:
+                relative = path.relative_to(Path(workdir_hint).resolve())
+            except ValueError:
+                pass
+
+        if relative is None:
+            for root in [Path("/app/project"), Path("/app"), Path("/workspace"), Path("/project")]:
+                try:
+                    relative = path.relative_to(root)
+                    break
+                except ValueError:
+                    continue
+
+        if relative is None:
+            return workspace / path.name
+
+        # Deduplicate: if workspace ends with the first part of relative,
+        # the user's workspace IS that directory — don't nest it again.
+        # e.g. workspace=/project/test_2, relative=test_2/file.py → file.py
+        parts = relative.parts
+        if parts and workspace.parts and workspace.parts[-1] == parts[0]:
+            relative = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+
+        if str(relative) == ".":
+            return workspace
+        return workspace / relative
 
     def _is_allowed_path(self, resolved: Path, workspace: Path) -> bool:
         ws = workspace.resolve()

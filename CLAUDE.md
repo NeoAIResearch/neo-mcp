@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 10 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — via stdio or HTTP transport. The hosted server runs at `https://mcpserver.heyneo.com/mcp`.
+A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 7 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — via stdio or HTTP transport. The hosted server runs at `https://mcpserver.heyneo.com/mcp`.
 
 ## Project structure
 
@@ -14,13 +14,13 @@ Each concern lives in its own top-level folder.
 neo-mcp/
 ├── python/                         # pip-installable MCP server (neo-mcp package)
 │   ├── src/neo_mcp/
-│   │   ├── server.py               # MCP server — all 10 tools, single file
+│   │   ├── server.py               # MCP server — all 7 tools, single file
 │   │   ├── oauth.py                # OAuth 2.0 PKCE authorization server (HTTP mode)
 │   │   ├── setup.py                # setup wizard (neo-mcp setup)
 │   │   ├── daemon.py               # Python daemon (fallback — primary is npm daemon)
 │   │   └── login.py                # browser OAuth flow (neo-mcp login)
 │   ├── tests/
-│   │   ├── test_server.py          # 129-test unit suite (no key needed)
+│   │   ├── test_server.py          # unit test suite (no key needed)
 │   │   └── test_connection.py      # connectivity smoke test (needs key)
 │   ├── scripts/start-daemon.sh     # standalone daemon launcher (bash)
 │   ├── pyproject.toml              # package metadata + entry points
@@ -28,11 +28,21 @@ neo-mcp/
 │   ├── Dockerfile                  # HTTP-mode container (used by CI → ECR)
 │   └── DEPLOYMENT.md               # Docker deployment guide
 │
+├── npm/                            # npm daemon package (neo-mcp-daemon)
+│   ├── src/
+│   │   ├── daemon.ts               # polling loop + command dispatch
+│   │   ├── executor.ts             # write_code, run_subprocess, etc. + path remapping
+│   │   └── mcp-server.ts           # MCP server with all 7 tool definitions
+│   ├── bin/neo-mcp-daemon          # CLI entry point
+│   ├── package.json                # npm package metadata (neo-mcp-daemon)
+│   └── tsconfig.json
+│
 ├── vscode_extension/               # VS Code/Cursor extension (TypeScript, own release cycle)
 │
 ├── skills/                         # Agent framework integrations
 │   ├── README.md                   # index
 │   ├── claude-code/SKILL.md        # Claude Code /neo slash command
+│   ├── neo-setup/SKILL.md          # /neo-setup onboarding guide
 │   ├── vercel/SKILL.md             # Vercel AI SDK
 │   ├── openai-agents/SKILL.md      # OpenAI Agents SDK
 │   └── langchain/SKILL.md          # LangChain / LangGraph
@@ -43,7 +53,6 @@ neo-mcp/
 │   ├── CONNECTORS.md               # Claude.ai + ChatGPT web connector setup
 │   └── WEB_CONNECTOR.md            # Web connector implementation notes
 │
-├── NPM_DAEMON_PLAN.md              # Plan for npm daemon package (neo-mcp-daemon)
 ├── .github/workflows/
 │   └── publish-mcp.yml             # CI: builds python/Dockerfile → ECR on push to main
 ├── README.md                       # Top-level overview + quick start
@@ -121,8 +130,9 @@ claude mcp logs neo
 The daemon executes tasks on the user's machine — polls the Neo backend for commands (`write_code`, `run_subprocess`, `get_file`, `list_files`, etc.) and runs them locally.
 
 Startup priority (in `server.py`):
-1. npm daemon already running (`npm_daemon.pid` alive) → skip Python poller
-2. Python poller starts as a background asyncio task alongside the MCP server
+1. `NEO_NO_DAEMON=true` is set → skip all daemon startup (bridge/hosted mode)
+2. npm daemon already running (`npm_daemon.pid` alive) → skip Python poller
+3. Python poller starts as a background asyncio task alongside the MCP server
 
 Deployment UUID: derived from `NEO_SECRET_KEY` via SHA-256 — both the hosted server and all daemon types use the same formula, so no coordination needed.
 
@@ -130,6 +140,18 @@ Deployment UUID: derived from `NEO_SECRET_KEY` via SHA-256 — both the hosted s
 - **Python poller** writes lock to `~/.neo/daemon/neo-mcp.lock`
 - All write `{"sandboxId": "..."}` entries to `~/.neo/daemon/daemon.log`
 - All write thread→workspace mappings to `~/.neo/daemon/thread-workspaces.json`
+
+### Path remapping — how local files land in the right place
+
+The Neo backend runs tasks inside a container where paths are prefixed with `/app/project/`. The daemon remaps these to the user's local workspace.
+
+`remapToWorkspace` / `_remap_to_workspace` strips known container prefixes (`/app/project`, `/app`, `/workspace`, `/project`) and resolves the relative remainder against the local workspace path.
+
+**Deduplication:** if the workspace directory name matches the first segment of the remapped relative path, that segment is stripped. Example: workspace `/home/user/test_2`, Neo sends `/app/project/test_2/model.py` → remaps to `/home/user/test_2/model.py` (not `/home/user/test_2/test_2/model.py`).
+
+**Adaptive polling:** the daemon uses `wait_time=1` for long-poll requests when a command was received within the last 60 s (active execution), and `wait_time=5` when idle. This reduces worst-case per-file latency from ~5 s to ~1 s during active task execution.
+
+**Workspace must be the git/project ROOT** — never a subdirectory. Passing a subdirectory causes files to land in a duplicate nested folder.
 
 ### Task submission — always vscode mode
 
@@ -155,7 +177,7 @@ Deployment UUID: derived from `NEO_SECRET_KEY` via SHA-256 — both the hosted s
 
 ### Hosted server vs local install — architecture split
 
-The hosted server (`mcpserver.heyneo.com`) is a **stateless bridge** — it translates MCP calls to Neo API requests but never runs daemons.
+The hosted server (`mcpserver.heyneo.com`) is a **stateless bridge** — it translates MCP calls to Neo API requests but never runs daemons. It sets `NEO_NO_DAEMON=true` to skip daemon startup entirely.
 
 **Execution always happens on the user's machine**, via:
 - The Neo VS Code/Cursor extension (zero setup — handles everything automatically), OR
@@ -182,32 +204,18 @@ After submission, `init-chat-direct` returns a `thread_id`. **All status and mes
 
 `_poll_task_bg(thread_id)` runs as a background asyncio task, polling status every 3–60 s (adaptive ramp), fetching all messages on COMPLETED. Results land in `_active_polls[thread_id]` so `neo_task_status` and `neo_get_messages` return instantly from cache.
 
-### neo_get_files — local workspace, no S3
-
-`neo_get_files` reads files **directly from the local workspace** that the daemon wrote to. There is no S3, no export job, no presigned URLs.
-
-Flow:
-1. Look up the workspace path for the thread from `~/.neo/daemon/thread-workspaces.json` (`_THREAD_WORKSPACES_FILE`)
-2. Fall back to `_server_cwd` if no mapping found
-3. Walk the workspace directory (skipping `venv`, `node_modules`, `.git`, `__pycache__`, etc.)
-4. Return file contents inline, capped at 80 000 chars
-
-This works because the daemon writes files locally via `write_code` commands, and `thread-workspaces.json` records which workspace was used for each thread.
-
-**Do not add S3 / export-artifacts / presigned URL logic back** — it was a leftover from a cloud execution model that no longer applies.
-
 ### Daemon registration and heartbeat
 When the VS Code/Cursor extension daemon is running:
 - `_register_with_daemon(deployment_id, secret_key)` reads `~/.neo/daemon/daemon.token` and POSTs to `http://127.0.0.1:31337/register`
 - `_heartbeat_loop(deployment_id)` sends a keepalive every 60 s to prevent the daemon from evicting the registration
 
 ### Other design points
-- `NEO_READ_ONLY=true` strips all write tools at `list_tools()` time — only `neo_task_status`, `neo_task_plan`, `neo_get_messages`, and `neo_get_files` remain.
+- `NEO_NO_DAEMON=true` skips all daemon startup — set automatically in Docker/bridge deployments.
+- `NEO_READ_ONLY=true` strips all write tools at `list_tools()` time — only `neo_task_status`, `neo_get_messages` remain visible.
 - `NEO_WORKSPACE_DIR` overrides `os.getcwd()` for `_server_cwd` — useful in Docker.
 - `handle_error(status_code)` is the single error-mapping function; every tool calls it on non-200 responses.
 - `neo_get_messages` paginates via `before=<timestamp>` cursor and hard-caps at 80 000 chars (~20 000 tokens).
 - Thread ID is persisted to `~/.neo/active_thread_id` (`_THREAD_ID_FILE`) so follow-up tool calls can recover it without the caller re-supplying it.
-- Thread→workspace mapping is persisted to `~/.neo/daemon/thread-workspaces.json` (`_THREAD_WORKSPACES_FILE`) — written by the daemon, read by `neo_get_files`.
 - Transport: `stdio_server` from `mcp.server.stdio` for stdio mode; Starlette + uvicorn for HTTP mode (`NEO_TRANSPORT=http`).
 
 ## Tool → route mapping
@@ -215,11 +223,8 @@ When the VS Code/Cursor extension daemon is running:
 | Tool | Method | Path |
 |---|---|---|
 | `neo_submit_task` | POST | `/v2/thread/init-chat-direct` |
-| `neo_list_tasks` | GET (optional) | `/v2/thread/list` + in-memory + `~/.neo/active_thread_id` |
 | `neo_task_status` | GET | `/v2/thread/status/{thread_id}` |
-| `neo_task_plan` | GET | `/v2/thread/status/{thread_id}` (reads `current_plan` field) |
 | `neo_get_messages` | GET | `/v2/thread/thread-messages` |
-| `neo_get_files` | local | reads from `~/.neo/daemon/thread-workspaces.json` → local workspace |
 | `neo_send_feedback` | POST | `/v2/thread/feedback/{thread_id}` |
 | `neo_pause_task` | POST | `/v2/thread/control/{thread_id}` (signal: PAUSE) |
 | `neo_resume_task` | POST | `/v2/thread/control/{thread_id}` (signal: RESUME) |
@@ -231,10 +236,12 @@ Auth on every request: `Authorization: Bearer $NEO_SECRET_KEY`
 
 - Without the npm daemon running, tasks submit and track correctly via thread_id polling — but local file execution depends on the daemon being active.
 - Do NOT send a fabricated `NEO_DEPLOYMENT_ID` unless it matches a real running sandbox — it causes a 30 s ReadTimeout.
-- `neo_get_files` reads from the local workspace. If called from the hosted MCP server (`mcpserver.heyneo.com`) without local filesystem access, it will fall back to `_server_cwd` which may not be the user's workspace.
+- Workspace must always be the project/git root. Subdirectories cause duplicate nested folder creation (e.g. `test_2/test_2/`) due to path remapping logic.
 
 ## Docker / CI
 
 `Dockerfile` is in `python/`. The GitHub Actions workflow at `.github/workflows/publish-mcp.yml` builds and pushes to the internal ECR registry on every push to `main`. The public Docker image (`ghcr.io/heyneo/neo-mcp-server`) is maintained separately.
+
+Docker security: container runs as non-root user (uid 1000), workspace is restricted to `/tmp/neo-workspace`, `NEO_NO_DAEMON=true` disables the local poller since the bridge server never has a daemon.
 
 PyPI releases trigger automatically on `v*` version tags.

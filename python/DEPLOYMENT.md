@@ -38,6 +38,8 @@ The `-v ~/.neo:/root/.neo:ro` mount lets the container read VS Code/Cursor exten
 
 The server itself needs **no key at all**. Deploy it once; each user configures their own client with their own key.
 
+The image is hardened for server deployment: it runs as a non-root user (`neo`, uid 1000), the Python daemon is disabled via `NEO_NO_DAEMON=true` (the hosted bridge never executes tasks locally — that always happens on the user's machine), and the workspace is constrained to `/tmp/neo-workspace` inside the container so no files can be written outside a throw-away temp directory.
+
 ### 1. Start the server (no key required)
 
 ```bash
@@ -59,6 +61,9 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    read_only: true          # optional: make the container filesystem read-only
+    tmpfs:
+      - /tmp                 # /tmp must be writable for the health server and temp workspace
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -144,7 +149,8 @@ docker build -t neo-mcp .
 | `NEO_SECRET_KEY` | **stdio mode only** | Your `sk-v1-...` secret key. In HTTP mode the key comes from each client's `Authorization: Bearer` header — this env var is not used. |
 | `NEO_HTTP_PORT` | No | Port to listen on in HTTP mode (default `8000`) |
 | `NEO_HTTP_HOST` | No | Host to bind in HTTP mode (default `0.0.0.0`, pre-set in image) |
-| `NEO_WORKSPACE_DIR` | No | Override the working directory reported to Neo |
+| `NEO_WORKSPACE_DIR` | No | Override the working directory. Defaults to `/tmp/neo-workspace` in the image (constrains any writes to a throw-away temp dir). |
+| `NEO_NO_DAEMON` | No | `true` = skip the background Python poller. Pre-set in the image — the hosted bridge never executes tasks locally. |
 | `NEO_DEPLOYMENT_ID` | No | Pin a specific VS Code extension sandbox ID |
 | `NEO_READ_ONLY` | No | `true` = expose only status/plan/message tools |
 | `NEO_PUBLIC_URL` | No | Base URL for OAuth discovery payloads (default `https://mcp.heyneo.so`) |
@@ -169,5 +175,5 @@ The image is published automatically to GitHub Container Registry on every push 
 | `NEO_SECRET_KEY not set` error | You are running in stdio mode without the key. Pass `-e NEO_SECRET_KEY=sk-v1-...` to `docker run`, or use `claude mcp add -e NEO_SECRET_KEY=...` to register it once. |
 | Port 8000 already in use | Use `-p 8001:8000` to map to a different host port |
 | `Invalid API key` (401) | The key in your client config is wrong. Double-check the value in your MCP client settings. |
-| Tasks submit but no files appear locally | The VS Code/Cursor extension must be running on the host; mount `~/.neo` with `-v ~/.neo:/root/.neo:ro` |
+| Tasks submit but no files appear locally | The Neo daemon must be running on the user's machine — the hosted bridge only routes calls, it never writes files itself. Start the daemon via `npx --yes neo-mcp-daemon /workspace &` or `neo-mcp daemon`. |
 | Output truncated | Cap is ~20 000 tokens — call `neo_task_plan` for a concise summary |

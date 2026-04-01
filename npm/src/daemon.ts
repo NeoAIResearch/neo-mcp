@@ -66,6 +66,12 @@ export function loadThreadWorkspaces(): Record<string, string> {
   }
 }
 
+export function registerThreadWorkspace(threadId: string, workspace: string): void {
+  const existing = loadThreadWorkspaces();
+  existing[threadId] = workspace;
+  saveThreadWorkspaces(existing);
+}
+
 export function saveThreadWorkspaces(workspaces: Record<string, string>): void {
   const now = Date.now();
   const minTs = now - THREAD_WORKSPACES_TTL_MS;
@@ -111,12 +117,12 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
-export async function pollBackend(depId: string, token: string): Promise<Command[]> {
+export async function pollBackend(depId: string, token: string, waitTime = 5): Promise<Command[]> {
   try {
     const res = await fetchWithTimeout(
-      `${NEO_API_URL}/v2/poll/${depId}?max_messages=10&wait_time=5`,
+      `${NEO_API_URL}/v2/poll/${depId}?max_messages=10&wait_time=${waitTime}`,
       { headers: { 'Authorization': `Bearer ${token}` } },
-      15_000,
+      Math.max(waitTime * 2, 10) * 1_000, // timeout = 2× wait_time, minimum 10s
     );
     if (res.status === 401) {
       console.error(`Auth rejected for deployment ${depId} (401).`);
@@ -130,15 +136,28 @@ export async function pollBackend(depId: string, token: string): Promise<Command
   }
 }
 
+// Retry sendResponse up to 3 times — silent failure was the root cause of stalled file creation.
+// The backend only generates the next write_code command after receiving the previous response.
+// If sendResponse silently failed, the backend would stall waiting for a confirmation that never arrived.
 export async function sendResponse(depId: string, token: string, response: Record<string, unknown>): Promise<void> {
-  try {
-    await fetchWithTimeout(`${NEO_API_URL}/v2/poll/response`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...response, sandbox_id: response['sandbox_id'] ?? depId }),
-    }, 30_000);
-  } catch {
-    // best-effort
+  const body = JSON.stringify({ ...response, sandbox_id: response['sandbox_id'] ?? depId });
+  let delayMs = 500;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await fetchWithTimeout(`${NEO_API_URL}/v2/poll/response`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body,
+      }, 30_000);
+      return; // success
+    } catch (err) {
+      if (attempt < 3) {
+        await sleep(delayMs);
+        delayMs *= 2; // 500ms → 1000ms
+      } else {
+        console.error(`[sendResponse] Failed after 3 attempts for request_id=${response['request_id'] ?? '?'}:`, err);
+      }
+    }
   }
 }
 
@@ -174,16 +193,28 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
   process.on('SIGINT',  () => { stop(); process.exit(0); });
   opts.signal?.addEventListener('abort', stop, { once: true });
 
+  let lastCommandTime = 0; // Date.now() ms, 0 = never
+
   while (running) {
-    const commands = await pollBackend(depId, token);
+    // During active execution use wait_time=1 so the poll returns quickly after the
+    // backend queues the next command. wait_time=5 is fine when idle (reduces poll traffic).
+    const recentlyActive = (Date.now() - lastCommandTime) < 60_000;
+    const waitTime = recentlyActive ? 1 : 5;
+    const commands = await pollBackend(depId, token, waitTime);
 
     if (commands.length === 0) {
-      await sleep(backoffMs);
-      backoffMs = Math.min(Math.floor(backoffMs * 1.5), 3_000);
+      if (recentlyActive) {
+        // Small yield so the event loop can process signals/timers before next poll.
+        await sleep(100);
+      } else {
+        await sleep(backoffMs);
+        backoffMs = Math.min(Math.floor(backoffMs * 1.5), 3_000);
+      }
       continue;
     }
 
     backoffMs = 1_000;
+    lastCommandTime = Date.now();
     for (const cmd of commands) {
       const tid = cmd.thread_id as string | undefined;
 

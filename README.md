@@ -82,8 +82,8 @@ Once the daemon is running, add the Neo MCP server to your editor. There are two
 
 ```bash
 claude mcp add --scope user neo \
-  --transport http https://mcpserver.heyneo.com/mcp \  , 
-  --header "Authorization: Bearer sk-v1-YOUR_KEY" 
+  --transport http https://mcpserver.heyneo.com/mcp \
+  --header "Authorization: Bearer sk-v1-YOUR_KEY"
 ```
 
 The MCP server runs at `https://mcpserver.heyneo.com/mcp` — nothing to install or maintain locally. Your daemon (started in Step 1) handles all local execution. This is the recommended mode for Cursor, Windsurf, VS Code, Zed, Claude.ai, and ChatGPT.
@@ -93,14 +93,13 @@ The MCP server runs at `https://mcpserver.heyneo.com/mcp` — nothing to install
 #### stdio mode — local pip install, auto-starts daemon silently
 
 ```bash
-pipx install neo-mcp
+pipx install neo-mcp   # use pipx to avoid system Python conflicts
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-YOUR_KEY \
-  -- neo-mcp  
+  -- neo-mcp
 ```
 
-> `pipx` is recommended over `pip` — it installs CLI tools in isolated environments and works on all platforms including Ubuntu/Debian. Install it with `apt install pipx` or `pip install pipx`.
-
+> `pipx` is recommended over `pip` — it installs CLI tools in isolated environments and works on all platforms. Install it with `apt install pipx` or `pip install pipx`.
 
 The MCP server runs as a local subprocess. In this mode the server auto-starts the daemon silently on first task submission — no manual daemon management needed. Recommended when you want a fully self-contained local setup.
 
@@ -388,6 +387,7 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for the full guide including Docker, scop
 | `NEO_DEPLOYMENT_ID` | No | Pin a specific VS Code/Cursor extension sandbox ID (auto-discovered by default) |
 | `NEO_READ_ONLY` | No | `true` = expose only status/plan/message tools (no submit, stop, pause) |
 | `NEO_WORKSPACE_DIR` | No | Override working directory (useful in Docker) |
+| `NEO_NO_DAEMON` | No | `true` = disable the background Python poller — set automatically in Docker bridge deployments |
 | `NEO_TRANSPORT` | No | `stdio` (default) or `http` |
 | `NEO_PUBLIC_URL` | No | Override public base URL for OAuth discovery (default: `https://mcpserver.heyneo.com`) |
 
@@ -402,7 +402,7 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for the full guide including Docker, scop
 | `No healthy deployments available` (400) | No daemon running — see "Starting the daemon manually" above |
 | Agent shows DAEMON_NOT_RUNNING but doesn't run a command | Run the daemon manually: `NEO_SECRET_KEY=sk-v1-... npx --yes neo-mcp-daemon /your/workspace &` |
 | `~/.neo/agent` not found (Exit 127) | Go binary not installed — use `npx --yes neo-mcp-daemon` instead (installs it automatically) |
-| `Task submitted but no files written locally` | Daemon not running — start it and resubmit |
+| `Task submitted but no files written locally` | Daemon not running — start it and resubmit. Files land in the `workspace` passed to `neo_submit_task` (defaults to current project directory). |
 | Task submission hangs or times out | Daemon stopped — restart with `npx --yes neo-mcp-daemon /workspace &` |
 | `neo-mcp` not found | Re-run `pip install neo-mcp` and verify `which neo-mcp` |
 | Neo tools don't appear after `claude mcp add` | Open a **new Claude Code session** — tools load at session start |

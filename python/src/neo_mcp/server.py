@@ -148,99 +148,235 @@ def build_server(
             types.Tool(
                 name="neo_submit_task",
                 description=(
-                    "Submit a task to the Neo ML backend. Returns a thread_id "
-                    "immediately. Use neo_task_status to poll for completion."
+                    "Submit an AI/ML task to Neo for local execution. "
+                    "Use for: training/fine-tuning models, building AI agents, RAG pipelines, "
+                    "LLM integrations, ML data processing. "
+                    "NOT for general coding — write that code directly. "
+                    "\n\n"
+                    "Execution is entirely local: the daemon runs on the user's machine and "
+                    "writes files directly to workspace. Files are never stored remotely. "
+                    "Neo's output may reference /app/project/src/model.py — the daemon "
+                    "automatically remaps this to <workspace>/src/model.py on the local disk. "
+                    "\n\n"
+                    "Returns {thread_id, status, workspace} immediately. "
+                    "Next: neo_task_status to poll, neo_get_messages when COMPLETED."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "message": {
                             "type": "string",
-                            "description": "Full task description for Neo to execute",
+                            "description": (
+                                "Full task description. Be specific: state the goal, "
+                                "relevant file paths, and constraints. "
+                                "Example: 'Train a sentiment classifier on data/reviews.csv, "
+                                "save to models/sentiment.pkl, target F1 > 0.85'"
+                            ),
                         },
                         "workspace": {
                             "type": "string",
-                            "description": "Workspace directory path (defaults to server cwd)",
+                            "description": (
+                                "Absolute path to the PROJECT ROOT — the git repository root "
+                                "or top-level project folder. "
+                                "ALWAYS infer automatically, never ask the user. "
+                                "NEVER pass a subdirectory: if the user is inside "
+                                "/home/user/project/src, pass /home/user/project. "
+                                "Run `git rev-parse --show-toplevel` to find the git root, "
+                                "or fall back to os.getcwd(). "
+                                "Passing a subdirectory creates duplicate nested folders."
+                            ),
                         },
                     },
-                    "required": ["message"],
+                    "required": ["message", "workspace"],
                 },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=False,
+                    openWorldHint=True,
+                ),
             ),
             types.Tool(
                 name="neo_task_status",
-                description="Get the current status of a Neo task by thread_id.",
+                description=(
+                    "Get the current status of a Neo task. Returns one of: "
+                    "RUNNING (still executing — call again; use neo_task_plan for step details), "
+                    "COMPLETED (done — call neo_get_messages for output), "
+                    "WAITING_FOR_FEEDBACK (Neo has a question — call neo_send_feedback), "
+                    "PAUSED (frozen — call neo_resume_task to continue), "
+                    "TERMINATED or FAILED (ended — call neo_get_messages to read what happened). "
+                    "\n\n"
+                    "Reads from an in-memory cache backed by an adaptive background poller "
+                    "(3s–60s). Fast and safe to call once per turn. "
+                    "Do NOT poll in a tight loop."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "thread_id": {
                             "type": "string",
-                            "description": "Thread ID from neo_submit_task",
+                            "description": "Thread ID from neo_submit_task. Example: 'thread_abc123'",
                         },
                     },
                     "required": ["thread_id"],
                 },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=True,
+                ),
             ),
             types.Tool(
                 name="neo_get_messages",
-                description="Retrieve messages (output) from a Neo task thread.",
+                description=(
+                    "Retrieve the full conversation output from a completed Neo task. "
+                    "Only call when neo_task_status returns COMPLETED — "
+                    "for live progress while RUNNING use neo_task_plan instead "
+                    "(cheaper, shows per-step status without fetching all messages). "
+                    "\n\n"
+                    "Output is capped at ~80,000 characters (~20,000 tokens). "
+                    "If the response is truncated, paginate backwards using the `before` "
+                    "cursor set to the ISO timestamp of the oldest message on the previous page."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "thread_id": {"type": "string", "description": "Thread ID"},
+                        "thread_id": {
+                            "type": "string",
+                            "description": "Thread ID from neo_submit_task.",
+                        },
                         "before": {
                             "type": "string",
-                            "description": "Pagination cursor (older messages)",
+                            "description": (
+                                "Pagination cursor — ISO 8601 timestamp of the oldest message "
+                                "from the previous page. Omit to get the most recent messages first."
+                            ),
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Max messages to return",
+                            "description": "Max messages to return per page. Default 50, max 200.",
                             "default": 50,
+                            "minimum": 1,
+                            "maximum": 200,
                         },
                     },
                     "required": ["thread_id"],
                 },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=True,
+                ),
             ),
             types.Tool(
                 name="neo_send_feedback",
-                description="Send a follow-up message to a running or waiting Neo task.",
+                description=(
+                    "Reply to Neo when it is waiting for user input. "
+                    "Only call when neo_task_status returns WAITING_FOR_FEEDBACK — "
+                    "Neo has paused and needs a decision or clarification before continuing. "
+                    "After sending, call neo_task_status again to confirm the task resumed. "
+                    "\n\n"
+                    "Do NOT use to submit a new task — use neo_submit_task for that."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "thread_id": {"type": "string"},
+                        "thread_id": {
+                            "type": "string",
+                            "description": "Thread ID of the task that is WAITING_FOR_FEEDBACK.",
+                        },
                         "message": {
                             "type": "string",
-                            "description": "Feedback or instruction to send",
+                            "description": (
+                                "Your reply to Neo's question or additional instructions. "
+                                "Example: 'Use PyTorch, target accuracy 90%, save to models/'"
+                            ),
                         },
                     },
                     "required": ["thread_id", "message"],
                 },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=False,
+                    openWorldHint=True,
+                ),
             ),
             types.Tool(
                 name="neo_pause_task",
-                description="Pause a running Neo task.",
+                description=(
+                    "Pause a running Neo task mid-execution. "
+                    "The task freezes at its current step and can be resumed later with "
+                    "neo_resume_task. Safe to call on an already-paused task (no-op). "
+                    "To cancel permanently, use neo_stop_task instead."
+                ),
                 inputSchema={
                     "type": "object",
-                    "properties": {"thread_id": {"type": "string"}},
+                    "properties": {
+                        "thread_id": {
+                            "type": "string",
+                            "description": "Thread ID of the running task to pause.",
+                        },
+                    },
                     "required": ["thread_id"],
                 },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=True,
+                ),
             ),
             types.Tool(
                 name="neo_resume_task",
-                description="Resume a paused Neo task.",
+                description=(
+                    "Resume a paused Neo task from where it stopped. "
+                    "Has no effect if the task is already running. "
+                    "Only works after neo_pause_task — to start a new task use neo_submit_task."
+                ),
                 inputSchema={
                     "type": "object",
-                    "properties": {"thread_id": {"type": "string"}},
+                    "properties": {
+                        "thread_id": {
+                            "type": "string",
+                            "description": "Thread ID of the paused task to resume.",
+                        },
+                    },
                     "required": ["thread_id"],
                 },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=True,
+                ),
             ),
             types.Tool(
                 name="neo_stop_task",
-                description="Stop and clean up a Neo task. This is irreversible.",
+                description=(
+                    "Permanently stop and clean up a Neo task. "
+                    "IRREVERSIBLE — execution context is deleted and the task cannot be resumed. "
+                    "Only call when the user explicitly asks to cancel. "
+                    "To pause temporarily (resumable), use neo_pause_task instead."
+                ),
                 inputSchema={
                     "type": "object",
-                    "properties": {"thread_id": {"type": "string"}},
+                    "properties": {
+                        "thread_id": {
+                            "type": "string",
+                            "description": "Thread ID of the task to permanently stop.",
+                        },
+                    },
                     "required": ["thread_id"],
                 },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=True,
+                    idempotentHint=False,
+                    openWorldHint=True,
+                ),
             ),
         ]
 
@@ -299,6 +435,10 @@ async def _submit_task(
     thread_id = data.get("thread_id")
     if thread_id:
         poller.set_thread_status(thread_id, "RUNNING")
+        # Register workspace NOW — before any poll commands arrive.
+        # ActionHandlers._workspace_for(thread_id) reads this shared dict,
+        # so write_code / run_subprocess will use the correct local path.
+        poller.register_thread_workspace(thread_id, ws)
     return {"thread_id": thread_id, "status": "submitted", "workspace": ws}
 
 
@@ -351,7 +491,10 @@ async def run(secret_key: str, workspace: str) -> None:
     deployment_id = derive_deployment_id(secret_key)
 
     # Lock file — single poller instance; also yield to Go/npm/extension daemons
-    if _poller_already_running(deployment_id):
+    _no_daemon = os.environ.get("NEO_NO_DAEMON", "").lower() in ("1", "true", "yes")
+    if _no_daemon:
+        logger.info("NEO_NO_DAEMON is set — skipping local poller (bridge/hosted mode)")
+    elif _poller_already_running(deployment_id):
         logger.warning(
             "Another daemon is already running for deployment %s. "
             "MCP server will start without a local poller.",
