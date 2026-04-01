@@ -629,8 +629,14 @@ async def _ensure_local_daemon(secret_key: str, deployment_id: str, workspace: s
             return True
 
     if await _auto_start_npm_daemon(secret_key, deployment_id, workspace):
+        # Give the npm daemon a moment to write its token file before registering.
+        # Without this, _register_with_daemon can silently fail (no token yet)
+        # and _submit_via_daemon returns None, losing per-thread workspace routing.
+        await asyncio.sleep(1)
         if await _register_with_daemon(deployment_id, secret_key, workspace):
             return True
+        # Registration failed — daemon is alive but IPC not ready yet; still usable
+        # via the direct-backend fallback + thread-workspaces.json disk re-read path.
         return True
 
     return False
