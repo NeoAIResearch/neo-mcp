@@ -8,68 +8,113 @@ Run AI/ML tasks on Neo's remote backend from any AI editor — Claude Code, Curs
 
 ## Quick start
 
-### Option A: pip install — stdio mode (RECOMMENDED — fully automatic, no manual daemon setup)
+### Step 1 — Install the daemon (required for file execution)
 
-The MCP server runs locally on your machine. Daemon startup is 100% automatic — no agent cooperation needed, no terminal commands, nothing.
+The Neo daemon is a small background process that runs on your machine. It receives commands from Neo's backend and executes them locally — writing files, running scripts, installing packages. **Without it, tasks submit and track correctly but no files are ever written to your machine.**
 
-```bash
-# On most systems:
-pip install neo-mcp
-
-# On Debian/Ubuntu servers (externally-managed Python):
-pip install neo-mcp --break-system-packages
-# or:
-pip install neo-mcp --user
-```
-
-```bash
-claude mcp add --scope user neo \
-  -e NEO_SECRET_KEY=sk-v1-YOUR_KEY \
-  -- neo-mcp
-```
-
-Open a **new Claude Code session**. On first task submission the server silently auto-starts the daemon:
-
-1. `~/.neo/agent --daemon` (Go binary — preferred, fastest)
-2. `npx --yes neo-mcp-daemon` (npm — auto-downloads and starts Go binary)
-3. `neo-mcp daemon` (Python fallback)
-
-You never have to touch the daemon yourself.
-
-> **Prerequisite:** Node.js must be installed for the npm path (most servers have it).
-> If not: `curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs`
+Pick whichever install method matches your environment:
 
 ---
 
-### Option B: Hosted HTTP server (no install needed, works across editors)
+#### Option 1: curl — recommended for servers and bare VMs
+
+No prerequisites. Works on any Linux/Mac machine where `curl` is available.
 
 ```bash
-claude mcp add --scope user neo \
-  --transport http https://mcpserver.heyneo.com/mcp \
-  --header "Authorization: Bearer sk-v1-YOUR_KEY"
+mkdir -p ~/.neo \
+  && curl -sSL https://heyneo.so/download/agent -o ~/.neo/agent \
+  && chmod +x ~/.neo/agent
 ```
 
-Open a **new Claude Code session** and submit any AI/ML task.
+Start the daemon:
 
-**Important:** The hosted server is a stateless bridge — it cannot start the daemon for you. **Start the daemon yourself once before submitting any task:**
+```bash
+NEO_SECRET_KEY=sk-v1-YOUR_KEY ~/.neo/agent --daemon >/tmp/neo-daemon.log 2>&1 &
+```
+
+> This is the most reliable path. The Go binary has no runtime dependencies — no Node.js, no Python, nothing else required.
+
+---
+
+#### Option 2: npm — for machines with Node.js installed
 
 ```bash
 NEO_SECRET_KEY=sk-v1-YOUR_KEY npx --yes neo-mcp-daemon /path/to/your/workspace >/tmp/neo-daemon.log 2>&1 &
 ```
 
-The daemon keeps running in the background. You only need to do this once per machine boot (or add it to your startup script).
+On first run this downloads and installs the Go binary to `~/.neo/agent` automatically, then starts it. Subsequent runs use the cached binary.
 
-> **Recommendation:** Use Option A (pip/stdio) on servers. HTTP mode works best with the VS Code/Cursor extension already installed — the extension manages the daemon automatically.
-
----
-
-### Option C: VS Code or Cursor extension (zero setup)
-
-Install the [Neo extension](https://marketplace.visualstudio.com/items?itemName=NeoResearch.neo) from the marketplace and log in — the extension manages the daemon automatically. Then add the MCP server with Option B above.
+> Requires Node.js. If not installed: `curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs`
 
 ---
 
-### Option D: Claude Code `/neo` skill
+#### Option 3: pip — for machines with Python installed
+
+Install the MCP server package (which includes the Python daemon as a fallback):
+
+```bash
+pip install neo-mcp        # most systems
+pip install neo-mcp --user  # if you get permissions errors
+```
+
+Start the daemon:
+
+```bash
+NEO_SECRET_KEY=sk-v1-YOUR_KEY neo-mcp daemon
+```
+
+> Requires Python 3.9+. The pip path is most common on developer laptops where Python is already present.
+
+---
+
+> **Why not let the agent start the daemon automatically?**
+> The MCP server can instruct the agent to run a startup command on your behalf. However, **agent execution of shell commands is not guaranteed** — editors, permission modes, and agent configurations vary widely and may silently skip the command. If the daemon never starts, tasks appear to succeed but **no files are written to your workspace**. Installing and starting the daemon yourself before your first task eliminates this failure mode entirely.
+
+---
+
+### Step 2 — Register the MCP server
+
+Once the daemon is running, add the Neo MCP server to your editor. There are two modes:
+
+---
+
+#### HTTP mode — hosted server, works in any editor, no local MCP install
+
+```bash
+claude mcp add --scope user neo \
+  --transport http https://mcpserver.heyneo.com/mcp \  , 
+  --header "Authorization: Bearer sk-v1-YOUR_KEY" 
+```
+
+The MCP server runs at `https://mcpserver.heyneo.com/mcp` — nothing to install or maintain locally. Your daemon (started in Step 1) handles all local execution. This is the recommended mode for Cursor, Windsurf, VS Code, Zed, Claude.ai, and ChatGPT.
+
+---
+
+#### stdio mode — local pip install, auto-starts daemon silently
+
+```bash
+pip install neo-mcp 
+claude mcp add --scope user neo \
+  -e NEO_SECRET_KEY=sk-v1-YOUR_KEY \
+  -- neo-mcp  
+```
+
+
+The MCP server runs as a local subprocess. In this mode the server auto-starts the daemon silently on first task submission — no manual daemon management needed. Recommended when you want a fully self-contained local setup.
+
+---
+
+Open a **new session** in your editor after registering. Neo tools appear automatically.
+
+---
+
+### Option: VS Code or Cursor extension (zero setup)
+
+Install the [Neo extension](https://marketplace.visualstudio.com/items?itemName=NeoResearch.neo) from the marketplace and log in — the extension manages the daemon automatically, skipping Step 1 entirely. Then register the HTTP server above.
+
+---
+
+### Option: Claude Code `/neo` skill
 
 Install the skill so Claude Code knows to route AI/ML requests to Neo automatically:
 

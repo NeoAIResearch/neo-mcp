@@ -284,5 +284,5 @@ Never attempt to run ML/AI workloads inline — always delegate to neo_submit_ta
 - `wait_for_completion: true` blocks until done. Only use for tasks under ~3 min.
 - Task execution requires a daemon on the user's machine. Options (simplest first):
   1. **Neo VS Code/Cursor extension** — handles everything automatically, zero setup
-  2. **Agent auto-start** — agents with terminal access offer to run `~/.neo/agent --daemon` first, then npm/pip fallback if needed (user approves)
+  2. **Agent auto-start** — agents with terminal access run `neo-mcp daemon` first (pip), then `npx --yes neo-mcp-daemon` as fallback if pip is unavailable
 - Get your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.

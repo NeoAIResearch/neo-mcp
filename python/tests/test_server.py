@@ -554,20 +554,6 @@ class TestNpmDaemonRunning(unittest.TestCase):
         self.assertFalse(os.path.exists(npm_pid))
 
 
-class TestGoDaemonRunning(unittest.TestCase):
-    def test_accepts_agent_binary_name_with_daemon_flag(self):
-        with patch("neo_mcp.server._read_pid_file", return_value=4242), \
-             patch("neo_mcp.server._pid_alive", return_value=True), \
-             patch("neo_mcp.server._pid_matches_any_cmdline", side_effect=[True, True]):
-            self.assertTrue(srv._go_daemon_running("abcd1234-0000-0000-0000-000000000000"))
-
-    def test_stale_pid_cleans_both_specific_and_generic_files(self):
-        with patch("neo_mcp.server._read_pid_file", return_value=4242), \
-             patch("neo_mcp.server._pid_alive", return_value=False), \
-             patch("neo_mcp.server._safe_unlink") as unlink:
-            self.assertFalse(srv._go_daemon_running("abcd1234-0000-0000-0000-000000000000"))
-        self.assertGreaterEqual(unlink.call_count, 2)
-
 
 # ---------------------------------------------------------------------------
 # 6. Message pagination
@@ -975,8 +961,6 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_py_start = AsyncMock()
 
         with patch("neo_mcp.server._register_with_daemon", mock_register), \
-             patch("neo_mcp.server._go_daemon_running", return_value=False), \
-             patch("neo_mcp.server._resolve_go_daemon_bin", return_value=""), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
@@ -989,40 +973,16 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_py_start.assert_not_called()
 
     def test_no_npm_daemon_autostart_triggered(self):
-        """When npm daemon is not running, auto-start must be called."""
+        """When pip daemon fails, npm auto-start must be called as fallback."""
         resp_ok = make_response(200, {"thread_id": "tid-no-daemon"})
-        mock_daemon = AsyncMock(return_value=True)
+        mock_npm_start = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
              patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._go_daemon_running", return_value=False), \
-             patch("neo_mcp.server._resolve_go_daemon_bin", return_value=""), \
-             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
-             patch("neo_mcp.server._auto_start_npm_daemon", mock_daemon), \
-             patch("asyncio.sleep", new_callable=AsyncMock), \
-             patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
-             patch("asyncio.create_task"):
-            ctx, _ = make_async_client({"DEFAULT": resp_ok})
-            MockClient.return_value = ctx
-            result = call_tool("neo_submit_task", {"description": "train model"})
-
-        mock_daemon.assert_called_once()
-        self.assertIn("tid-no-daemon", text_of(result))
-
-    def test_python_daemon_fallback_when_npm_start_fails(self):
-        """If npm daemon cannot start, Python daemon fallback is attempted."""
-        resp_ok = make_response(200, {"thread_id": "tid-py-fallback"})
-        mock_npm_start = AsyncMock(return_value=False)
-        mock_py_start = AsyncMock(return_value=True)
-
-        with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
-             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._go_daemon_running", return_value=False), \
-             patch("neo_mcp.server._resolve_go_daemon_bin", return_value=""), \
-             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._auto_start_python_daemon", new_callable=AsyncMock, return_value=False), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
-             patch("neo_mcp.server._auto_start_python_daemon", mock_py_start), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
@@ -1031,8 +991,30 @@ class TestNeoSubmitTask(unittest.TestCase):
             result = call_tool("neo_submit_task", {"description": "train model"})
 
         mock_npm_start.assert_called_once()
+        self.assertIn("tid-no-daemon", text_of(result))
+
+    def test_python_daemon_starts_first_before_npm(self):
+        """Python daemon (pip) is tried first; npm is not called if pip succeeds."""
+        resp_ok = make_response(200, {"thread_id": "tid-py-primary"})
+        mock_py_start = AsyncMock(return_value=True)
+        mock_npm_start = AsyncMock(return_value=True)
+
+        with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
+             patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
+             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._auto_start_python_daemon", mock_py_start), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
+             patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
+             patch("asyncio.sleep", new_callable=AsyncMock), \
+             patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
+             patch("asyncio.create_task"):
+            ctx, _ = make_async_client({"DEFAULT": resp_ok})
+            MockClient.return_value = ctx
+            result = call_tool("neo_submit_task", {"description": "train model"})
+
         mock_py_start.assert_called_once()
-        self.assertIn("tid-py-fallback", text_of(result))
+        mock_npm_start.assert_not_called()
+        self.assertIn("tid-py-primary", text_of(result))
 
     def test_npm_daemon_already_running_no_restart(self):
         """If daemon already running for deployment, skip auto-start."""
@@ -1052,25 +1034,20 @@ class TestNeoSubmitTask(unittest.TestCase):
         mock_daemon.assert_not_called()
 
     def test_running_npm_daemon_without_registration_attempts_restart(self):
-        """If npm daemon is alive but un-registerable, restart recovery is attempted."""
+        """If pip fails and npm daemon is alive but un-registerable, restart recovery is attempted."""
         with patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._go_daemon_running", return_value=False), \
-             patch("neo_mcp.server._resolve_go_daemon_bin", return_value=""), \
-             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
-             patch("neo_mcp.server._restart_npm_daemon", new_callable=AsyncMock, return_value=True) as mock_restart, \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
-             patch("neo_mcp.server._auto_start_python_daemon", new_callable=AsyncMock) as mock_py_start:
+             patch("neo_mcp.server._auto_start_python_daemon", new_callable=AsyncMock, return_value=False), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=True), \
+             patch("neo_mcp.server._restart_npm_daemon", new_callable=AsyncMock, return_value=True) as mock_restart:
             ready = self._run(srv._ensure_local_daemon("sk-v1-test", "dep-xyz", "/tmp/ws"))
 
         self.assertTrue(ready)
         mock_restart.assert_called_once_with("sk-v1-test", "dep-xyz", "/tmp/ws")
-        mock_py_start.assert_not_called()
 
     def test_npm_restart_failure_falls_back_to_python(self):
         """If npm recovery fails, ensure_local_daemon should still try Python fallback."""
         with patch("neo_mcp.server._register_with_daemon", new_callable=AsyncMock, return_value=False), \
-             patch("neo_mcp.server._go_daemon_running", return_value=False), \
-             patch("neo_mcp.server._resolve_go_daemon_bin", return_value=""), \
              patch("neo_mcp.server._npm_daemon_running", return_value=True), \
              patch("neo_mcp.server._restart_npm_daemon", new_callable=AsyncMock, return_value=False), \
              patch("neo_mcp.server._auto_start_npm_daemon", new_callable=AsyncMock, return_value=False), \
