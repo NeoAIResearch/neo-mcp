@@ -53,9 +53,11 @@ class BackendPoller:
 
     async def run(self) -> None:
         """Async entry point — run until cancelled or stop() is called."""
+        import time
         self._running = True
         self._consecutive_errors = 0
         self._current_interval = POLL_BASE_INTERVAL
+        last_command_time: float = 0.0  # monotonic clock, 0 = never
 
         self._write_daemon_log()
 
@@ -66,8 +68,16 @@ class BackendPoller:
         )
 
         while self._running:
+            got_commands = False
             try:
-                await self._poll()
+                # During active execution use wait_time=1 so the poll returns quickly
+                # after the backend queues the next command (reduces worst-case per-file
+                # latency from ~5s to ~1s). Idle: use full POLL_WAIT_TIME (less traffic).
+                recently_active = (time.monotonic() - last_command_time) < 60
+                wait_time = 1 if recently_active else POLL_WAIT_TIME
+                got_commands = await self._poll(wait_time=wait_time)
+                if got_commands:
+                    last_command_time = time.monotonic()
                 # Success — reset backoff
                 if self._consecutive_errors > 0:
                     self._consecutive_errors = 0
@@ -87,8 +97,12 @@ class BackendPoller:
             except Exception as exc:  # noqa: BLE001
                 self._handle_error(exc)
 
-            if self._running:
-                await asyncio.sleep(self._current_interval)
+            if self._running and not got_commands:
+                if recently_active:
+                    # Small yield so the event loop can process cancellation/signals.
+                    await asyncio.sleep(0.1)
+                else:
+                    await asyncio.sleep(self._current_interval)
 
         self._running = False
         logger.info("BackendPoller stopped")
@@ -98,6 +112,17 @@ class BackendPoller:
 
     def set_thread_status(self, thread_id: str, status: str) -> None:
         self._thread_statuses[thread_id] = status
+
+    def register_thread_workspace(self, thread_id: str, workspace: str) -> None:
+        """Register workspace for a new thread immediately after task submission.
+
+        Must be called right after init_chat returns thread_id — before any
+        poll commands arrive — so write_code uses the correct local path.
+        The shared dict is also read by ActionHandlers, so no extra wiring needed.
+        """
+        self._thread_workspaces[thread_id] = workspace
+        self._save_thread_workspaces()
+        logger.info("Registered workspace for thread %s: %s", thread_id, workspace)
 
     # ------------------------------------------------------------------
     # Internal
@@ -117,13 +142,15 @@ class BackendPoller:
             backoff,
         )
 
-    async def _poll(self) -> None:
-        commands = await self._client.poll_deployment(self._deployment_id)
+    async def _poll(self, wait_time: int = POLL_WAIT_TIME) -> bool:
+        """Poll for commands and process them. Returns True if any commands were received."""
+        commands = await self._client.poll_deployment(self._deployment_id, wait_time=wait_time)
         if not commands:
-            return
+            return False
         logger.info("Received %d command(s)", len(commands))
         for command in commands:
             await self._process_command(command)
+        return True
 
     async def _process_command(self, command: dict[str, Any]) -> None:
         request_id = command.get("request_id", "")
@@ -150,8 +177,11 @@ class BackendPoller:
             await self._safe_send(error_resp)
             return
 
-        # Update thread workspace mapping if present
-        if thread_id and command.get("workspace"):
+        # Update thread workspace mapping only if not already set — the backend
+        # sends its internal container path (e.g. /app/project) which is wrong
+        # for local execution.  register_thread_workspace() sets the correct
+        # local path before any commands arrive; don't clobber it.
+        if thread_id and command.get("workspace") and thread_id not in self._thread_workspaces:
             self._thread_workspaces[thread_id] = command["workspace"]
             self._save_thread_workspaces()
 
@@ -171,10 +201,24 @@ class BackendPoller:
         await self._safe_send(response)
 
     async def _safe_send(self, response: dict[str, Any]) -> None:
-        try:
-            await self._client.send_response(self._deployment_id, response)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to send response for %s: %s", response.get("request_id"), exc)
+        delay = 0.5
+        for attempt in range(1, 4):
+            try:
+                await self._client.send_response(self._deployment_id, response)
+                return
+            except Exception as exc:  # noqa: BLE001
+                if attempt < 3:
+                    logger.warning(
+                        "sendResponse attempt %d failed for %s: %s — retrying in %.1fs",
+                        attempt, response.get("request_id"), exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.error(
+                        "sendResponse failed after 3 attempts for %s: %s",
+                        response.get("request_id"), exc,
+                    )
 
     def _should_accept(self, thread_id: str) -> bool:
         status = self._thread_statuses.get(thread_id)

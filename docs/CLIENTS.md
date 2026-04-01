@@ -217,21 +217,23 @@ claude mcp add --scope user neo -e NEO_SECRET_KEY=YOUR_SECRET_KEY -- docker run 
 
 ## How local execution works
 
-Tasks execute on your machine via a daemon process that polls the Neo backend for commands.
+**Files are always written to your local machine.** The Neo daemon runs as a background process on your machine, receives commands from Neo's backend, and writes files directly to your workspace directory. The hosted MCP bridge at `mcpserver.heyneo.com` only translates MCP calls to Neo API requests — it never writes files itself.
+
+Neo's backend uses `/app/project/` as its internal container path. When Neo's output mentions a path like `/app/project/src/model.py`, the actual file is at `<workspace>/src/model.py` on your machine. The daemon remaps these paths automatically — no action needed from you.
+
+**Workspace is auto-detected.** The agent picks up the workspace from your current project context (git root or working directory) and passes it to `neo_submit_task` automatically. Files always land in the right place without you specifying a path.
 
 **Stdio (local pip install):** The daemon starts automatically and silently when you submit your first task. No manual steps needed.
 
-**Hosted server (HTTP transport):** The hosted server can't start a daemon on your machine. Instead, when no daemon is found, `neo_submit_task` returns a message telling your agent to run (in this order):
+**Hosted server (HTTP transport):** The hosted server can't start a daemon on your machine. Instead, when no daemon is found, `neo_submit_task` returns a message telling your agent to run:
 ```bash
-~/.neo/agent --daemon
-npx --yes neo-mcp-daemon &
-neo-mcp daemon
+npx --yes neo-mcp-daemon /path/to/your/workspace &
 ```
 Agents with terminal access (Claude Code, Cursor, Windsurf, Codex CLI) will ask your permission and start it automatically. Web clients (ChatGPT, Claude.ai) will show you the command to run.
 
 **To keep the daemon running across reboots**, add to `~/.zshrc` or `~/.bashrc`:
 ```bash
-pgrep -f "/.neo/agent --daemon" > /dev/null || NEO_SECRET_KEY=sk-v1-YOUR_KEY ~/.neo/agent --daemon &
+pgrep -f "neo-mcp-daemon" > /dev/null || NEO_SECRET_KEY=sk-v1-YOUR_KEY npx --yes neo-mcp-daemon /your/workspace &
 ```
 
 The daemon authenticates with `NEO_SECRET_KEY` directly — no login step needed.

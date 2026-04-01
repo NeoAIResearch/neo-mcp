@@ -5,9 +5,9 @@ user-invocable: true
 metadata: {"openclaw": {"emoji": "⚡", "os": ["darwin", "linux", "win32"]}}
 ---
 
-# Neo — Remote AI/ML Execution
+# Neo — AI/ML Execution Backend
 
-Neo is a remote AI/ML execution backend. These rules are strict — follow them exactly.
+Neo is an AI/ML execution backend. The daemon runs **on your local machine** and writes files directly to your workspace. These rules are strict — follow them exactly.
 
 ## When to use Neo
 
@@ -87,7 +87,10 @@ When invoked as `/neo <task>`, immediately call `neo_submit_task` with the provi
 
 ## Key behaviors
 
-- **`workspace` — ALWAYS pass it, never omit.** Priority: (1) user named an explicit path → use it; (2) user is working on a project already in context → use that project's git root; (3) no path mentioned → use `os.getcwd()` / the current working directory. Wrong workspace = files land in the wrong place.
+- **Files are always local — never say they are remote.** The daemon runs on the user's machine and writes files directly to their local workspace. Neo's output messages often show internal container paths like `/app/project/src/main.py` — this is Neo's internal path, not the actual location. The daemon automatically remaps these to the local workspace (e.g., `/root/myproject/src/main.py`). Never tell the user "the file is in a remote sandbox" or "Neo runs remotely" — it does not. The file is on their machine.
+- **When Neo reports a path like `/app/project/...`, the actual local path is `<workspace>/...`** (the part after `/app/project/`). For example, `/app/project/src/main.py` → `<workspace>/src/main.py`. Use this mapping when telling the user where their files are. Subdirectory structure is always preserved — `/app/project/test_2/demo/trial.py` → `<workspace>/test_2/demo/trial.py`.
+- **Never manually recreate files from Neo's output.** The daemon writes files directly to the local workspace. Always use `neo_get_files` to read them — do not copy-paste output into files yourself.
+- **`workspace` — ALWAYS pass the git/project ROOT, never a subdirectory, never ask the user.** Priority: (1) user named an explicit path → use it; (2) project in context → use that project's git root (`git rev-parse --show-toplevel`); (3) fallback → `os.getcwd()`. If the user is currently inside `/home/user/project/src`, pass `/home/user/project` — not `src`. Passing a subdirectory as workspace causes the daemon to create a duplicate nested folder (e.g. `test_2/test_2/`) instead of writing to the right place.
 - **`thread_id` is optional** on all tools — the server auto-recovers the last active thread from `~/.neo/active_thread_id`. Omit it unless you need to address a specific older thread.
 - **`wait_for_completion: true`** blocks until done and returns the full output directly. Only use for short tasks (< 3 min). For longer tasks that run scripts or spawn processes, leave it `false` and track with `neo_task_plan` / `neo_task_status`.
 - **Prefer `neo_task_plan` over `neo_get_messages`** for mid-run progress checks — it's cheaper and shows live step status.
@@ -97,14 +100,19 @@ When invoked as `/neo <task>`, immediately call `neo_submit_task` with the provi
 
 ## Configuration
 
-To register Neo with Claude Code — one command:
+To register Neo with Claude Code:
 
 ```bash
-# Local install (recommended — daemon auto-starts silently)
+# Option 1: Local pip install (recommended — daemon auto-starts silently, files written immediately)
 pipx install neo-mcp   # use pipx to avoid system Python conflicts
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-your-key \
   -- neo-mcp
+
+# Option 2: Hosted HTTP server (no local install, works with any editor)
+claude mcp add --scope user neo \
+  --transport http https://mcpserver.heyneo.com/mcp \
+  --header "Authorization: Bearer sk-v1-your-key"
 ```
 
 After running either command, open a **new Claude Code session** for the tools to load.

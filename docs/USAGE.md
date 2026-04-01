@@ -10,6 +10,16 @@
 
 ---
 
+## How files work
+
+Files are **always written to your local machine** — never to a remote sandbox.
+
+The Neo daemon runs as a background process on your machine. It receives `write_code` commands from the Neo backend and writes files directly to your workspace. When the agent passes `workspace=/home/you/myproject`, that is exactly where the files appear.
+
+Neo's backend uses `/app/project/` as its internal container path. When you see paths like `/app/project/src/model.py` in Neo's output messages, those map to `<workspace>/src/model.py` on your local filesystem — the daemon remaps them automatically. You do not need to do anything.
+
+---
+
 ## How a task works
 
 ```
@@ -130,7 +140,7 @@ For short tasks (< 3 min):
 |---|---|---|
 | `Invalid API key` (401) | Wrong key | Re-check `NEO_SECRET_KEY` |
 | `Trial or quota ended` (403) | Out of credits | Top up at Neo dashboard |
-| Task submitted but no files appear locally | Daemon failed to auto-start | Start daemon in order: `~/.neo/agent --daemon`, then `npx --yes neo-mcp-daemon &`, then `neo-mcp daemon` |
+| Task submitted but no files appear locally | Daemon failed to auto-start | Start daemon: `npx --yes neo-mcp-daemon /your/workspace &` or `neo-mcp daemon`. Files land in the `workspace` you passed to `neo_submit_task` (the agent picks this up from your project context automatically). |
 | Status stuck on RUNNING | Step waiting for daemon response | Check `neo_task_plan` to see which step is blocked |
 | `neo-mcp` not found | Install incomplete | Re-run `pip install neo-mcp`, check PATH |
 

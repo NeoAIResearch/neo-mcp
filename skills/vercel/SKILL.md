@@ -1,6 +1,6 @@
 # Neo — Vercel AI SDK Integration
 
-Use Neo's MCP server as a set of tools inside any Vercel AI SDK application. Neo runs AI/ML workloads remotely so they don't block your serverless functions or local machine.
+Use Neo's MCP server as a set of tools inside any Vercel AI SDK application. Neo executes AI/ML workloads locally on the user's machine via a daemon — files are written directly to their workspace, never to a remote server.
 
 **MCP server:** `https://mcpserver.heyneo.com/mcp`
 **Auth:** `Authorization: Bearer sk-v1-YOUR_KEY`
@@ -9,7 +9,7 @@ Use Neo's MCP server as a set of tools inside any Vercel AI SDK application. Neo
 
 ## Option A: MCP Client (recommended — zero tool duplication)
 
-Connect to the hosted server with the Vercel AI SDK's built-in MCP client. All 10 Neo tools are loaded automatically — no manual schema definitions needed.
+Connect to the hosted server with the Vercel AI SDK's built-in MCP client. All 7 Neo tools are loaded automatically — no manual schema definitions needed.
 
 ```typescript
 // lib/neo.ts
@@ -48,9 +48,10 @@ export async function POST(req: Request) {
     model: openai('gpt-4o'),
     tools: neoTools,
     messages,
-    system: `You are an AI assistant with access to Neo, a remote AI/ML execution backend.
+    system: `You are an AI assistant with access to Neo, a local AI/ML execution backend.
 Use neo_submit_task for any ML/AI work (training, fine-tuning, RAG, agents, data preprocessing).
-After submitting, use neo_task_plan to check progress and neo_get_messages for the final output.`,
+Files are written directly to the user's local machine — never to a remote server.
+After submitting, poll neo_task_status until COMPLETED, then call neo_get_messages for the final output.`,
     onFinish: async () => {
       await neoClient.close();
     },
@@ -97,7 +98,7 @@ const neoClient = await createMCPClient({
 
 ## Option C: Inline tool definitions (no MCP dependency)
 
-Define the Neo tools directly with Vercel AI SDK's `tool()` if you prefer not to use the MCP client.
+Define the 7 Neo tools directly with Vercel AI SDK's `tool()` if you prefer not to use the MCP client.
 
 ```typescript
 import { tool } from 'ai';
@@ -130,86 +131,81 @@ async function callNeoTool(toolName: string, args: Record<string, unknown>) {
 export const neoTools = {
   neo_submit_task: tool({
     description:
-      'Submit an AI/ML task to Neo. Returns a thread_id immediately. ' +
-      'Use wait_for_completion=true only for tasks under ~3 minutes.',
+      'Submit an AI/ML task to Neo for local execution. ' +
+      'Returns {thread_id, status, workspace} immediately. ' +
+      'Use for: training models, RAG pipelines, AI agents, data preprocessing. ' +
+      'NOT for general coding. Files are written to the user\'s local machine.',
     parameters: z.object({
-      description: z.string().describe('Full description of the task to run'),
-      wait_for_completion: z
-        .boolean()
-        .optional()
-        .describe('Block until done and return output directly (use for short tasks only)'),
-      auto_mode: z
-        .boolean()
-        .optional()
-        .describe('Run fully autonomously without pausing for feedback'),
+      message: z.string().describe('Full task description with goal, file paths, and constraints'),
+      workspace: z.string().describe(
+        'Absolute path to the project root (git root). Never a subdirectory. ' +
+        'Infer automatically from context — never ask the user.'
+      ),
     }),
     execute: async (args) => callNeoTool('neo_submit_task', args),
   }),
 
   neo_task_status: tool({
     description:
-      'Check the current status of a Neo task. ' +
-      'Returns RUNNING, COMPLETED, WAITING_FOR_FEEDBACK, PAUSED, or TERMINATED.',
+      'Get the current status of a Neo task. Returns one of: ' +
+      'RUNNING (call again), COMPLETED (call neo_get_messages), ' +
+      'WAITING_FOR_FEEDBACK (call neo_send_feedback), ' +
+      'PAUSED (call neo_resume_task), TERMINATED/FAILED (call neo_get_messages). ' +
+      'Call once per turn — do NOT poll in a tight loop.',
     parameters: z.object({
-      thread_id: z
-        .string()
-        .optional()
-        .describe('Thread ID from neo_submit_task. Omit to use the last active thread.'),
+      thread_id: z.string().describe('Thread ID from neo_submit_task.'),
     }),
     execute: async (args) => callNeoTool('neo_task_status', args),
   }),
 
-  neo_task_plan: tool({
-    description:
-      'Show Neo\'s current execution plan with per-step status. ' +
-      'Cheaper than neo_get_messages — use this while the task is RUNNING.',
-    parameters: z.object({
-      thread_id: z.string().optional().describe('Thread ID. Omit for last active thread.'),
-    }),
-    execute: async (args) => callNeoTool('neo_task_plan', args),
-  }),
-
   neo_get_messages: tool({
-    description: 'Get the full conversation output once a task is COMPLETED. Capped at ~20 000 tokens.',
+    description:
+      'Retrieve the full output from a completed Neo task. ' +
+      'Only call when neo_task_status returns COMPLETED. ' +
+      'Capped at ~20,000 tokens.',
     parameters: z.object({
-      thread_id: z.string().optional().describe('Thread ID. Omit for last active thread.'),
+      thread_id: z.string().describe('Thread ID from neo_submit_task.'),
+      before: z.string().optional().describe('ISO timestamp cursor for pagination.'),
+      limit: z.number().int().min(1).max(200).default(50).describe('Max messages per page.'),
     }),
     execute: async (args) => callNeoTool('neo_get_messages', args),
   }),
 
-  neo_get_files: tool({
-    description: 'Download files generated by a completed task (code, models, scripts). Returns contents inline.',
-    parameters: z.object({
-      thread_id: z.string().optional().describe('Thread ID. Omit for last active thread.'),
-    }),
-    execute: async (args) => callNeoTool('neo_get_files', args),
-  }),
-
   neo_send_feedback: tool({
-    description: 'Reply to Neo when it is WAITING_FOR_FEEDBACK.',
+    description:
+      'Reply to Neo when it is WAITING_FOR_FEEDBACK. ' +
+      'After sending, call neo_task_status to confirm task resumed.',
     parameters: z.object({
-      message: z.string().describe('Your reply to Neo\'s question'),
-      thread_id: z.string().optional().describe('Thread ID. Omit for last active thread.'),
+      thread_id: z.string().describe('Thread ID of the waiting task.'),
+      message: z.string().describe('Your reply to Neo\'s question or additional instructions.'),
     }),
     execute: async (args) => callNeoTool('neo_send_feedback', args),
   }),
 
-  neo_list_tasks: tool({
+  neo_pause_task: tool({
     description:
-      'List running or recent Neo tasks. Use when the user has closed a window or lost track of a task. ' +
-      'Reconnects background pollers automatically so other tools work immediately after.',
-    parameters: z.object({}),
-    execute: async () => callNeoTool('neo_list_tasks', {}),
+      'Pause a running task mid-execution. Resumable via neo_resume_task. ' +
+      'To cancel permanently, use neo_stop_task.',
+    parameters: z.object({
+      thread_id: z.string().describe('Thread ID of the running task.'),
+    }),
+    execute: async (args) => callNeoTool('neo_pause_task', args),
+  }),
+
+  neo_resume_task: tool({
+    description: 'Resume a paused Neo task from where it stopped.',
+    parameters: z.object({
+      thread_id: z.string().describe('Thread ID of the paused task.'),
+    }),
+    execute: async (args) => callNeoTool('neo_resume_task', args),
   }),
 
   neo_stop_task: tool({
-    description: 'Stop and clean up a running or paused task.',
+    description:
+      'Permanently stop and clean up a Neo task. IRREVERSIBLE. ' +
+      'Only call when the user explicitly asks to cancel.',
     parameters: z.object({
-      thread_id: z.string().optional().describe('Thread ID. Omit for last active thread.'),
-      delete_remote_artifacts: z
-        .boolean()
-        .optional()
-        .describe('Also delete files stored on Neo\'s servers'),
+      thread_id: z.string().describe('Thread ID of the task to stop.'),
     }),
     execute: async (args) => callNeoTool('neo_stop_task', args),
   }),
@@ -230,8 +226,9 @@ export async function POST(req: Request) {
     tools: neoTools,
     messages,
     maxSteps: 20,
-    system: 'Route all AI/ML tasks to Neo via neo_submit_task. ' +
-            'Poll with neo_task_plan until COMPLETED, then call neo_get_messages.',
+    system:
+      'Route all AI/ML tasks to Neo via neo_submit_task. ' +
+      'Poll with neo_task_status until COMPLETED, then call neo_get_messages.',
   });
 
   return result.toDataStreamResponse();
@@ -243,7 +240,8 @@ export async function POST(req: Request) {
 ## Recommended agent system prompt
 
 ```
-You are an AI assistant with access to Neo, a remote AI/ML execution backend.
+You are an AI assistant with access to Neo, a local AI/ML execution backend.
+Files are written directly to the user's machine — never to a remote server.
 
 Use Neo for:
 - Training or fine-tuning ML models (classification, regression, NLP, CV, etc.)
@@ -254,12 +252,12 @@ Use Neo for:
 
 Workflow:
 1. Call neo_submit_task — returns thread_id immediately
-2. Call neo_task_plan repeatedly until status is COMPLETED
-3. If WAITING_FOR_FEEDBACK, call neo_send_feedback with a reply
-4. Call neo_get_messages for full output
-5. Call neo_get_files to retrieve any generated code or models
+2. Call neo_task_status until COMPLETED or WAITING_FOR_FEEDBACK
+3. If WAITING_FOR_FEEDBACK, call neo_send_feedback with a reply, then check status again
+4. Call neo_get_messages for full output once COMPLETED
 
 Never attempt to run ML/AI workloads inline — always delegate to neo_submit_task.
+Always pass workspace as the project root (git root), never a subdirectory.
 ```
 
 ---
@@ -280,9 +278,8 @@ Never attempt to run ML/AI workloads inline — always delegate to neo_submit_ta
 
 ## Notes
 
-- `thread_id` is optional on all tools — the server auto-recovers the last active thread.
-- `wait_for_completion: true` blocks until done. Only use for tasks under ~3 min.
-- Task execution requires a daemon on the user's machine. Options (simplest first):
+- Task execution requires a daemon running on the user's machine. Options:
   1. **Neo VS Code/Cursor extension** — handles everything automatically, zero setup
-  2. **Agent auto-start** — agents with terminal access run `neo-mcp daemon` first (pip), then `npx --yes neo-mcp-daemon` as fallback if pip is unavailable
+  2. **Agent auto-start** — agents with terminal access run `npx --yes neo-mcp-daemon /workspace &` automatically on first task; user clicks Allow once
+- Files land in the `workspace` passed to `neo_submit_task` — the agent infers this from the current project directory automatically.
 - Get your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.

@@ -115,6 +115,41 @@ function hCreateSession(cmd: Command): ActionResult {
   };
 }
 
+function remapToWorkspace(absPath: string, workspace: string, workdir: string): string {
+  let relative: string | null = null;
+
+  // Try workdir as the container root (e.g. workdir=/app/project, path=/app/project/src/main.py)
+  if (workdir && isAbsolute(workdir)) {
+    const wd = resolve(workdir);
+    if (absPath.startsWith(wd + '/')) relative = absPath.slice(wd.length + 1);
+  }
+
+  // Try known backend container roots
+  if (relative === null) {
+    for (const root of ['/app/project', '/app', '/workspace', '/project']) {
+      if (absPath.startsWith(root + '/')) {
+        relative = absPath.slice(root.length + 1);
+        break;
+      }
+    }
+  }
+
+  // Last resort: preserve just the filename
+  if (relative === null) return join(workspace, absPath.split('/').pop() ?? absPath);
+
+  // Deduplicate: if workspace ends with the first path segment of relative,
+  // the user's workspace IS that directory — don't nest it again.
+  // e.g. workspace=/project/test_2, relative=test_2/file.py → file.py
+  const wsBase = workspace.endsWith('/') ? workspace.slice(0, -1) : workspace;
+  const slashIdx = relative.indexOf('/');
+  const firstSeg = slashIdx >= 0 ? relative.slice(0, slashIdx) : relative;
+  if (firstSeg && wsBase.endsWith('/' + firstSeg)) {
+    relative = slashIdx >= 0 ? relative.slice(slashIdx + 1) : '';
+  }
+
+  return relative ? join(workspace, relative) : workspace;
+}
+
 function hWriteCode(cmd: Command, workspace: string): ActionResult {
   const filename = fieldString(cmd, 'filename');
   const code = fieldString(cmd, 'code') ?? (typeof cmd.code === 'string' ? cmd.code : undefined);
@@ -122,13 +157,33 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
     return { request_id: cmd.request_id, status: 'error', error: 'filename and code are required' };
   }
   const workdir = fieldString(cmd, 'workdir') ?? '';
-  // Use resolve() not join() so absolute workdir replaces workspace (mirrors Python os.path.join behaviour)
-  const base = workdir ? (isAbsolute(workdir) ? workdir : join(workspace, workdir)) : workspace;
-  const full = safeResolve(base, filename) ?? safeResolve(workspace, filename);
-  if (!full) {
-    console.warn(`[write_code] BLOCKED path=${filename} (outside workspace/tmp)`);
-    return { request_id: cmd.request_id, status: 'error', error: `Path escapes allowed directories: ${filename}` };
+
+  let full: string;
+
+  if (isAbsolute(filename)) {
+    const resolved = resolve(filename);
+    // If the path is already inside the local workspace or /tmp, use it as-is.
+    // Otherwise it's a backend container path (e.g. /app/project/src/main.py) — remap.
+    const direct = safeResolve(workspace, filename);
+    full = direct ?? remapToWorkspace(resolved, workspace, workdir);
+    console.log(`[write_code] remapped ${filename} → ${full}`);
+  } else {
+    // Relative filename: if workdir is absolute (backend container path like /app/project/test_2/demo),
+    // remap it to the local workspace to preserve subdirectory structure.
+    // e.g. workdir=/app/project/test_2/demo → base=<workspace>/test_2/demo
+    const base = workdir
+      ? isAbsolute(workdir)
+        ? remapToWorkspace(resolve(workdir), workspace, '')
+        : join(workspace, workdir)
+      : workspace;
+    const candidate = safeResolve(base, filename) ?? safeResolve(workspace, filename);
+    if (!candidate) {
+      console.warn(`[write_code] BLOCKED path=${filename} (outside workspace/tmp)`);
+      return { request_id: cmd.request_id, status: 'error', error: `Path escapes allowed directories: ${filename}` };
+    }
+    full = candidate;
   }
+
   mkdirSync(dirname(full), { recursive: true });
   writeFileSync(full, code, 'utf8');
   console.log(`[write_code] wrote ${full}`);
@@ -164,9 +219,8 @@ async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionRe
 
   const detach = fieldBoolean(cmd, 'detach', true);
   const cmdWorkdir = fieldString(cmd, 'workdir');
-  const cwd = cmdWorkdir
-    ? (isAbsolute(cmdWorkdir) ? cmdWorkdir : join(workspace, cmdWorkdir))
-    : workspace;
+  // Ignore absolute workdir from backend container — always run in local workspace.
+  const cwd = cmdWorkdir && !isAbsolute(cmdWorkdir) ? join(workspace, cmdWorkdir) : workspace;
   const safeCwd = safeResolve(workspace, cwd) ?? workspace;
 
   // Ensure workspace exists before spawning — cwd must exist or spawn throws ENOENT

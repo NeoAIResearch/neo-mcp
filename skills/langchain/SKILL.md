@@ -1,6 +1,6 @@
 # Neo — LangChain Integration
 
-Use Neo's MCP server as a toolset inside LangChain agents. Neo runs AI/ML workloads remotely so your agent doesn't need to execute training or data-processing jobs inline.
+Use Neo's MCP server as a toolset inside LangChain agents. Neo executes AI/ML workloads locally on the user's machine — files are written directly to their workspace, never to a remote server.
 
 **MCP server:** `https://mcpserver.heyneo.com/mcp`
 **Auth:** `Authorization: Bearer sk-v1-YOUR_KEY`
@@ -9,9 +9,9 @@ Use Neo's MCP server as a toolset inside LangChain agents. Neo runs AI/ML worklo
 
 ## Option A: MCP Toolset (recommended)
 
-LangChain's `langchain-mcp-adapters` package loads all 10 Neo tools from the MCP server automatically.
+LangChain's `langchain-mcp-adapters` package loads all 7 Neo tools from the MCP server automatically.
 
-```pythontest
+```python
 import asyncio
 import os
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -34,9 +34,11 @@ async def main():
             ChatOpenAI(model="gpt-4o"),
             neo_tools,
             prompt=(
-                "You are an AI assistant with access to Neo, a remote AI/ML backend. "
+                "You are an AI assistant with access to Neo, a local AI/ML execution backend. "
+                "Files are written directly to the user's machine — never to a remote server. "
                 "Use neo_submit_task for any ML/AI work. "
-                "Poll with neo_task_plan until COMPLETED, then use neo_get_messages."
+                "Poll with neo_task_status until COMPLETED, then call neo_get_messages. "
+                "Always pass workspace as the project root (git root), never a subdirectory."
             ),
         )
 
@@ -60,7 +62,7 @@ export OPENAI_API_KEY=...
 
 ## Option B: Custom tools (no MCP dependency)
 
-Define Neo tools as LangChain `StructuredTool` objects for full control.
+Define the 7 Neo tools as LangChain `StructuredTool` objects for full control.
 
 ```python
 import os
@@ -92,132 +94,115 @@ def _call_neo(tool_name: str, arguments: dict) -> str:
 # --- Input schemas ---
 
 class SubmitTaskInput(BaseModel):
-    description: str = Field(description="Full description of the AI/ML task to run")
-    wait_for_completion: Optional[bool] = Field(
-        default=False,
-        description="Block until done and return output directly (tasks under ~3 min only)"
-    )
-    auto_mode: Optional[bool] = Field(
-        default=False,
-        description="Run fully autonomously without pausing for questions"
+    message: str = Field(description="Full task description with goal, file paths, and constraints")
+    workspace: str = Field(
+        description="Absolute path to the project root (git root). Never a subdirectory. "
+                    "Infer from context — never ask the user."
     )
 
 class ThreadIdInput(BaseModel):
-    thread_id: Optional[str] = Field(
-        default=None,
-        description="Thread ID from neo_submit_task. Omit to use last active thread."
-    )
+    thread_id: str = Field(description="Thread ID from neo_submit_task.")
+
+class ThreadIdLimitInput(BaseModel):
+    thread_id: str = Field(description="Thread ID from neo_submit_task.")
+    limit: Optional[int] = Field(default=50, description="Max messages (1–200).")
 
 class FeedbackInput(BaseModel):
-    message: str = Field(description="Your reply to Neo's question")
-    thread_id: Optional[str] = Field(
-        default=None,
-        description="Thread ID. Omit for last active thread."
-    )
-
-class StopInput(BaseModel):
-    thread_id: Optional[str] = Field(default=None, description="Thread ID. Omit for last active.")
-    delete_remote_artifacts: Optional[bool] = Field(
-        default=False,
-        description="Also delete files stored on Neo's servers"
-    )
+    thread_id: str = Field(description="Thread ID of the WAITING_FOR_FEEDBACK task.")
+    message: str = Field(description="Your reply to Neo's question or additional instructions.")
 
 
 # --- Tool definitions ---
 
 neo_submit_task = StructuredTool.from_function(
-    func=lambda description, wait_for_completion=False, auto_mode=False: _call_neo(
-        "neo_submit_task",
-        {"description": description, "wait_for_completion": wait_for_completion, "auto_mode": auto_mode},
+    func=lambda message, workspace: _call_neo(
+        "neo_submit_task", {"message": message, "workspace": workspace}
     ),
     name="neo_submit_task",
     description=(
-        "Submit an AI/ML task to Neo's remote backend. "
-        "Returns thread_id immediately. Use wait_for_completion=True only for short tasks (< 3 min). "
-        "Always use this for: training models, RAG pipelines, AI agents, data preprocessing."
+        "Submit an AI/ML task to Neo for local execution. "
+        "Returns {thread_id, status, workspace} immediately. "
+        "Use for: training models, RAG pipelines, AI agents, data preprocessing. "
+        "NOT for general coding. Files are written directly to the user's local machine."
     ),
     args_schema=SubmitTaskInput,
 )
 
-neo_task_plan = StructuredTool.from_function(
-    func=lambda thread_id=None: _call_neo("neo_task_plan", {"thread_id": thread_id} if thread_id else {}),
-    name="neo_task_plan",
-    description=(
-        "Show Neo's current execution plan with per-step status (PENDING/RUNNING/COMPLETED/FAILED). "
-        "Much cheaper than neo_get_messages — use while the task is RUNNING."
-    ),
-    args_schema=ThreadIdInput,
-)
-
 neo_task_status = StructuredTool.from_function(
-    func=lambda thread_id=None: _call_neo("neo_task_status", {"thread_id": thread_id} if thread_id else {}),
+    func=lambda thread_id: _call_neo("neo_task_status", {"thread_id": thread_id}),
     name="neo_task_status",
     description=(
-        "Check the current status of a Neo task: "
-        "RUNNING / COMPLETED / WAITING_FOR_FEEDBACK / PAUSED / TERMINATED."
+        "Get the current status of a Neo task. Returns one of: "
+        "RUNNING (call again), COMPLETED (call neo_get_messages), "
+        "WAITING_FOR_FEEDBACK (call neo_send_feedback), "
+        "PAUSED (call neo_resume_task), TERMINATED/FAILED (call neo_get_messages). "
+        "Call once per turn — do NOT poll in a tight loop."
     ),
     args_schema=ThreadIdInput,
 )
 
 neo_get_messages = StructuredTool.from_function(
-    func=lambda thread_id=None: _call_neo("neo_get_messages", {"thread_id": thread_id} if thread_id else {}),
+    func=lambda thread_id, limit=50: _call_neo(
+        "neo_get_messages", {"thread_id": thread_id, "limit": limit}
+    ),
     name="neo_get_messages",
-    description="Get the full conversation output once a task is COMPLETED. Capped at ~20 000 tokens.",
-    args_schema=ThreadIdInput,
-)
-
-neo_get_files = StructuredTool.from_function(
-    func=lambda thread_id=None: _call_neo("neo_get_files", {"thread_id": thread_id} if thread_id else {}),
-    name="neo_get_files",
-    description="Download files generated by a completed task (code, models, scripts). Returns contents inline.",
-    args_schema=ThreadIdInput,
+    description=(
+        "Retrieve full output from a completed Neo task. "
+        "Only call when neo_task_status returns COMPLETED. "
+        "Capped at ~20,000 tokens."
+    ),
+    args_schema=ThreadIdLimitInput,
 )
 
 neo_send_feedback = StructuredTool.from_function(
-    func=lambda message, thread_id=None: _call_neo(
-        "neo_send_feedback",
-        {"message": message, **({"thread_id": thread_id} if thread_id else {})},
+    func=lambda thread_id, message: _call_neo(
+        "neo_send_feedback", {"thread_id": thread_id, "message": message}
     ),
     name="neo_send_feedback",
-    description="Reply to Neo when it is WAITING_FOR_FEEDBACK.",
+    description=(
+        "Reply to Neo when it is WAITING_FOR_FEEDBACK. "
+        "After sending, call neo_task_status to confirm the task resumed."
+    ),
     args_schema=FeedbackInput,
 )
 
-neo_list_tasks = StructuredTool.from_function(
-    func=lambda: _call_neo("neo_list_tasks", {}),
-    name="neo_list_tasks",
+neo_pause_task = StructuredTool.from_function(
+    func=lambda thread_id: _call_neo("neo_pause_task", {"thread_id": thread_id}),
+    name="neo_pause_task",
     description=(
-        "List running or recent Neo tasks. Use when the user has closed a window or lost track of a task. "
-        "Discovers tasks from in-memory state, local file, and the Neo API. "
-        "Reconnects background pollers automatically for any active tasks found."
+        "Pause a running Neo task mid-execution. Resumable via neo_resume_task. "
+        "To cancel permanently, use neo_stop_task."
     ),
-    args_schema=None,
+    args_schema=ThreadIdInput,
+)
+
+neo_resume_task = StructuredTool.from_function(
+    func=lambda thread_id: _call_neo("neo_resume_task", {"thread_id": thread_id}),
+    name="neo_resume_task",
+    description="Resume a paused Neo task from where it stopped.",
+    args_schema=ThreadIdInput,
 )
 
 neo_stop_task = StructuredTool.from_function(
-    func=lambda thread_id=None, delete_remote_artifacts=False: _call_neo(
-        "neo_stop_task",
-        {
-            "delete_remote_artifacts": delete_remote_artifacts,
-            **({"thread_id": thread_id} if thread_id else {}),
-        },
-    ),
+    func=lambda thread_id: _call_neo("neo_stop_task", {"thread_id": thread_id}),
     name="neo_stop_task",
-    description="Stop and clean up a running or paused task.",
-    args_schema=StopInput,
+    description=(
+        "Permanently stop and clean up a Neo task. IRREVERSIBLE. "
+        "Only call when the user explicitly asks to cancel."
+    ),
+    args_schema=ThreadIdInput,
 )
 
 
-# --- Agent setup ---
+# --- Tool list ---
 
 NEO_TOOLS = [
     neo_submit_task,
-    neo_list_tasks,
-    neo_task_plan,
     neo_task_status,
     neo_get_messages,
-    neo_get_files,
     neo_send_feedback,
+    neo_pause_task,
+    neo_resume_task,
     neo_stop_task,
 ]
 ```
@@ -231,9 +216,10 @@ agent = create_react_agent(
     ChatOpenAI(model="gpt-4o"),
     NEO_TOOLS,
     prompt=(
-        "You have access to Neo, a remote AI/ML execution backend. "
+        "You have access to Neo, a local AI/ML execution backend. "
+        "Files are written directly to the user's machine — never to a remote server. "
         "Use neo_submit_task for any ML/AI work. "
-        "Poll with neo_task_plan until COMPLETED, then call neo_get_messages."
+        "Poll with neo_task_status until COMPLETED, then call neo_get_messages."
     ),
 )
 
@@ -279,6 +265,8 @@ chain = prompt | llm | StrOutputParser()
 
 ## Notes
 
-- `thread_id` is optional — the server auto-recovers the last active thread.
-- Task execution requires a daemon on the user's machine: install the **Neo VS Code/Cursor extension** (zero setup), or let an agent with terminal access start it automatically on first task (`neo-mcp daemon` via pip, then `npx --yes neo-mcp-daemon` as fallback if pip is unavailable — uses `NEO_SECRET_KEY` directly).
+- Task execution requires a daemon running on the user's machine. Options:
+  1. **Neo VS Code/Cursor extension** — handles everything automatically, zero setup
+  2. **Agent auto-start** — agents with terminal access run `npx --yes neo-mcp-daemon /workspace &` automatically; user clicks Allow once
+- Files land in the `workspace` passed to `neo_submit_task` — infer from the current project directory.
 - Get your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.

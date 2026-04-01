@@ -45,7 +45,9 @@ Your agent will detect no daemon is running and offer to start it:
 ```
 Neo daemon needs to run locally. Can I start it?  [Yes / No]
 ```
-Click **Yes** — the daemon starts with your API key and the task proceeds.
+Click **Yes** — the daemon starts automatically using your API key and the task proceeds.
+
+All files are written directly to your local machine, never to any remote server.
 
 ### Alternative: VS Code/Cursor extension
 Install the Neo extension and log in. It manages the daemon completely automatically — no manual steps, no CLI.
@@ -55,13 +57,12 @@ Install the Neo extension and log in. It manages the daemon completely automatic
 ## Troubleshooting
 
 ### `DAEMON_NOT_RUNNING` on first task
-Agent will offer to start the daemon — click yes. If running a web client (ChatGPT, Claude.ai), run manually in this order:
+Agent will offer to start the daemon — click yes. If running a web client (ChatGPT, Claude.ai), run manually:
 ```bash
-NEO_SECRET_KEY=sk-v1-... ~/.neo/agent --daemon
+NEO_SECRET_KEY=sk-v1-... npx --yes neo-mcp-daemon /path/to/your/workspace &
 ```
-Fallbacks:
+Fallback (pip install):
 ```bash
-NEO_SECRET_KEY=sk-v1-... npx --yes neo-mcp-daemon &
 NEO_SECRET_KEY=sk-v1-... neo-mcp daemon
 ```
 
@@ -80,15 +81,22 @@ claude mcp add --scope user neo --transport http https://mcpserver.heyneo.com/mc
 ### `Invalid API key` (401)
 Re-check your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.
 
+### Files not appearing locally after task completes
+The daemon must be running on your machine. Start it and resubmit:
+```bash
+NEO_SECRET_KEY=sk-v1-... npx --yes neo-mcp-daemon /path/to/your/project &
+```
+Files are written to the `workspace` passed in `neo_submit_task` — the agent picks this up from your current project directory automatically.
+
 ---
 
 ## Current state
 
 ```bash
-# One command. Done. No login, no daemon startup needed manually.
+# One command. Done.
 claude mcp add --scope user neo \
   --transport http https://mcpserver.heyneo.com/mcp \
   --header "Authorization: Bearer sk-v1-your-key"
 ```
 
-Submit a task → agent auto-starts daemon → daemon polls with `NEO_SECRET_KEY` → everything works.
+Submit a task → agent auto-starts daemon → daemon writes files locally → everything works.
