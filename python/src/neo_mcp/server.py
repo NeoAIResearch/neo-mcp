@@ -22,7 +22,9 @@ import logging
 import os
 import signal
 import sys
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Optional
 
 import anyio
@@ -408,18 +410,38 @@ def _setup_logging() -> None:
     )
 
 
+def _start_health_server() -> None:
+    """Start a minimal HTTP health server on NEO_HEALTH_PORT (default 8080)."""
+    port = int(os.environ.get("NEO_HEALTH_PORT", "8080"))
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/health":
+                body = b'{"status":"ok"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, *args: Any) -> None:
+            pass  # silence access logs
+
+    server = HTTPServer(("0.0.0.0", port), _Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    logger.info("Health server listening on port %d", port)
+
+
 def main() -> None:
     """CLI entry point — called by the neo-mcp console script."""
     _setup_logging()
+    _start_health_server()
 
     secret_key = get_secret_key()
-    if not secret_key:
-        sys.stderr.write(
-            "Error: NEO_SECRET_KEY environment variable is not set.\n"
-            "Set it before running neo-mcp:\n"
-            "  export NEO_SECRET_KEY=sk-v1-...\n"
-        )
-        sys.exit(1)
 
     # Workspace: optional first positional arg, or NEO_WORKSPACE_DIR, or cwd
     workspace = (
@@ -431,5 +453,10 @@ def main() -> None:
     if not os.path.isdir(workspace):
         sys.stderr.write(f"Error: workspace '{workspace}' is not a directory.\n")
         sys.exit(1)
+
+    if not secret_key:
+        logger.warning("NEO_SECRET_KEY not set — MCP tools unavailable, health endpoint active")
+        threading.Event().wait()  # block forever; health server stays up
+        return
 
     anyio.run(run, secret_key, workspace)
