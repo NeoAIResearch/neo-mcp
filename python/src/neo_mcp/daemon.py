@@ -570,8 +570,8 @@ async def run_daemon(workspace: Optional[str] = None, deployment_id: Optional[st
 
                     await _send_response(client, dep_id, token, resp)
             else:
-                await asyncio.sleep(min(backoff, 10.0))
-                backoff = min(backoff * 1.5, 10.0)
+                await asyncio.sleep(min(backoff, 3.0))
+                backoff = min(backoff * 1.5, 3.0)
 
 
 # ---------------------------------------------------------------------------

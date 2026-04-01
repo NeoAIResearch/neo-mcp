@@ -602,23 +602,17 @@ async def _ensure_local_daemon(secret_key: str, deployment_id: str, workspace: s
     """Ensure there's a healthy local executor for this deployment ID.
 
     Startup order:
-    1) VS Code extension daemon already running on port 31337 → register with it
-    2) Python daemon (pip) already running → use it
-    3) Auto-start Python daemon (primary — no extra runtime needed beyond pip)
-    4) npm daemon already running → retry registration
-    5) Auto-start npm daemon via npx (fallback — requires Node.js)
+    1) VS Code extension daemon or npm/Go daemon already running on port 31337 → register
+    2) npm daemon (Go binary primary) already running → retry registration
+    3) Auto-start npm daemon via npx (installs Go binary, most reliable)
+    4) Python daemon already running → use it
+    5) Auto-start Python daemon (last resort — pure Python, no Node.js needed)
     """
-    # --- Try VS Code extension daemon or any already-running daemon on port 31337 ---
+    # --- Try any already-running daemon on port 31337 (VS Code ext / npm / Go) ---
     if await _register_with_daemon(deployment_id, secret_key, workspace):
         return True
 
-    # --- Python daemon (primary) ---
-    if _python_daemon_running(deployment_id):
-        return True
-    if await _auto_start_python_daemon(secret_key, deployment_id, workspace):
-        return True
-
-    # --- npm daemon (fallback — requires Node.js/npx) ---
+    # --- npm/Go daemon (primary — Go binary for local execution) ---
     if _npm_daemon_running(deployment_id):
         # One extra retry for transient localhost/token races.
         if await _register_with_daemon(deployment_id, secret_key, workspace):
@@ -630,13 +624,17 @@ async def _ensure_local_daemon(secret_key: str, deployment_id: str, workspace: s
 
     if await _auto_start_npm_daemon(secret_key, deployment_id, workspace):
         # Give the npm daemon a moment to write its token file before registering.
-        # Without this, _register_with_daemon can silently fail (no token yet)
-        # and _submit_via_daemon returns None, losing per-thread workspace routing.
         await asyncio.sleep(1)
         if await _register_with_daemon(deployment_id, secret_key, workspace):
             return True
         # Registration failed — daemon is alive but IPC not ready yet; still usable
         # via the direct-backend fallback + thread-workspaces.json disk re-read path.
+        return True
+
+    # --- Python daemon (fallback — no Node.js/npx required) ---
+    if _python_daemon_running(deployment_id):
+        return True
+    if await _auto_start_python_daemon(secret_key, deployment_id, workspace):
         return True
 
     return False

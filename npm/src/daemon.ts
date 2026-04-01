@@ -433,7 +433,7 @@ class NpmPollerDaemon {
       const commands = await pollBackend(dep.deploymentId, dep.authToken);
       if (commands.length === 0) {
         await this.sleep(backoffMs, poller.aborter.signal);
-        backoffMs = Math.min(Math.floor(backoffMs * 1.5), 10_000);
+        backoffMs = Math.min(Math.floor(backoffMs * 1.5), 3_000);
         continue;
       }
 
