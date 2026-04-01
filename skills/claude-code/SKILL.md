@@ -45,24 +45,18 @@ Always follow this sequence. Do not skip steps.
 If `neo_submit_task` returns a `DAEMON_NOT_RUNNING` message, **run daemon startup on the user's machine and retry automatically**:
 
 ```bash
-~/.neo/agent --daemon
+neo-mcp daemon
 ```
 
-If that fails, fallback:
+If that fails (neo-mcp not in PATH), npm fallback:
 
 ```bash
 npx --yes neo-mcp-daemon &
 ```
 
-If that still fails, final fallback:
-
-```bash
-neo-mcp daemon
-```
-
 Then immediately retry `neo_submit_task`. Do not hand the startup steps back to the user unless local command execution is unavailable in the client.
 
-> **Why this happens:** The Neo daemon must run on the user's machine to execute tasks. In stdio mode, MCP pre-check tries Go first, then npm, then pip fallback.
+> **Why this happens:** The Neo daemon must run on the user's machine to execute tasks. In stdio mode, MCP pre-check tries pip first, then npm fallback.
 
 > **If the daemon fails with an auth error:** Check that `NEO_SECRET_KEY` is set correctly — the daemon authenticates with the API key directly.
 
@@ -93,6 +87,7 @@ When invoked as `/neo <task>`, immediately call `neo_submit_task` with the provi
 
 ## Key behaviors
 
+- **`workspace` — derive from what the user asked, not from the editor.** Priority: (1) user named an explicit path → use it; (2) user is working on a project already in context → use that project's git root; (3) no path mentioned → omit entirely, the server uses its own working directory. Never blindly pass the editor workspace root or `os.getcwd()`.
 - **`thread_id` is optional** on all tools — the server auto-recovers the last active thread from `~/.neo/active_thread_id`. Omit it unless you need to address a specific older thread.
 - **`wait_for_completion: true`** blocks until done and returns the full output directly. Only use for short tasks (< 3 min). For longer tasks that run scripts or spawn processes, leave it `false` and track with `neo_task_plan` / `neo_task_status`.
 - **Prefer `neo_task_plan` over `neo_get_messages`** for mid-run progress checks — it's cheaper and shows live step status.
@@ -105,12 +100,7 @@ When invoked as `/neo <task>`, immediately call `neo_submit_task` with the provi
 To register Neo with Claude Code — one command:
 
 ```bash
-# Hosted server (recommended — no install needed)
-claude mcp add --scope user neo \
-  --transport http https://mcpserver.heyneo.com/mcp \
-  --header "Authorization: Bearer sk-v1-your-key"
-
-# Or: Local pip install (daemon auto-starts silently)
+# Local pip install (recommended — daemon auto-starts silently)
 pip install neo-mcp
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-your-key \
