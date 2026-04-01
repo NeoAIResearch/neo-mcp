@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neo-mcp"
-version = "0.4.1"
+version = "0.4.2"
 description = "MCP server for the Neo AI/ML backend — submit tasks, poll status, read output"
 readme = {text = "MCP server for the Neo AI/ML backend — submit tasks, poll status, read output.", content-type = "text/plain"}
 license = { text = "MIT" }

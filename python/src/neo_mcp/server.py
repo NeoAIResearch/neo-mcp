@@ -69,9 +69,8 @@ def _poller_already_running(deployment_id: str = "") -> bool:
 
     Checks (in order):
     1. Our own lock file (neo-mcp.lock)
-    2. Go agent PID file: daemon_{deployment_id}.pid  (written by ~/.neo/agent)
-    3. Go agent generic PID file: go_daemon.pid
-    4. npm daemon generic PID file: npm_daemon.pid / python_daemon.pid
+    2. npm daemon PID file: daemon_{deployment_id}.pid
+    3. Generic fallback PID files: npm_daemon.pid / python_daemon.pid
     """
     # 1. Our own lock file
     if LOCK_FILE.exists():
@@ -83,13 +82,12 @@ def _poller_already_running(deployment_id: str = "") -> bool:
         except (OSError, ValueError, TypeError):
             pass
 
-    # 2–4. Any other daemon writing a PID file under ~/.neo/daemon/
+    # 2–3. Any other daemon writing a PID file under ~/.neo/daemon/
     candidates = []
     if deployment_id:
         candidates.append(DAEMON_DIR / f"daemon_{deployment_id.replace('-', '')[:8]}.pid")
         candidates.append(DAEMON_DIR / f"daemon_{deployment_id}.pid")
     candidates += [
-        DAEMON_DIR / "go_daemon.pid",
         DAEMON_DIR / "npm_daemon.pid",
         DAEMON_DIR / "python_daemon.pid",
     ]

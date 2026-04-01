@@ -114,23 +114,20 @@ claude mcp logs neo
 - `_headers()` raises `ValueError` with a clear message if `NEO_SECRET_KEY` is missing; the error is returned as a tool response (no crash).
 - In HTTP mode, the per-request key from the `Authorization` header is stored in a context var (`_ctx_secret_key`) and takes priority over the module-level env var.
 
-### Daemon — Go binary is primary
+### Daemon — npm daemon is primary
 
-**The primary daemon is the Go binary at `~/.neo/agent`**, installed automatically by `npx neo-mcp-daemon` (via `postinstall.js` + bin entrypoint). The Node.js npm daemon and Python daemon (`daemon.py`) are fallbacks for platforms without a pre-built Go binary.
+**The primary daemon is the npm daemon (`npx neo-mcp-daemon`)**. The Python BackendPoller (built into the pip package) is the fallback when no other daemon is running.
 
 The daemon executes tasks on the user's machine — polls the Neo backend for commands (`write_code`, `run_subprocess`, `get_file`, `list_files`, etc.) and runs them locally.
 
-`_ensure_local_daemon()` startup priority:
-1. Go binary already running → done
-2. `~/.neo/agent` exists → `_auto_start_go_daemon()` (preferred)
-3. `npx neo-mcp-daemon` available → `_auto_start_npm_daemon()` (which itself installs + execs Go binary)
-4. Python daemon → last resort
+Startup priority (in `server.py`):
+1. npm daemon already running (`npm_daemon.pid` alive) → skip Python poller
+2. Python poller starts as a background asyncio task alongside the MCP server
 
 Deployment UUID: derived from `NEO_SECRET_KEY` via SHA-256 — both the hosted server and all daemon types use the same formula, so no coordination needed.
 
-- **Go daemon** writes PID to `~/.neo/daemon/go_daemon.pid`
 - **npm daemon** writes PID to `~/.neo/daemon/npm_daemon.pid`
-- **Python daemon** writes PID to `~/.neo/daemon/python_daemon.pid`
+- **Python poller** writes lock to `~/.neo/daemon/neo-mcp.lock`
 - All write `{"sandboxId": "..."}` entries to `~/.neo/daemon/daemon.log`
 - All write thread→workspace mappings to `~/.neo/daemon/thread-workspaces.json`
 
@@ -167,9 +164,9 @@ The hosted server (`mcpserver.heyneo.com`) is a **stateless bridge** — it tran
 **Agent-driven daemon start (HTTP mode):**
 When no daemon is found, `neo_submit_task` returns a `DAEMON_NOT_RUNNING` message with the exact startup command — `NEO_SECRET_KEY` pre-filled:
 ```
-NEO_SECRET_KEY=sk-v1-... ~/.neo/agent --daemon >/tmp/neo-daemon.log 2>&1 &
+NEO_SECRET_KEY=sk-v1-... npx neo-mcp-daemon /path/to/workspace &
 ```
-Agents with terminal access (Claude Code, Cursor, Windsurf, Codex CLI) ask user permission and run it. The user clicks **Allow** once — the Go binary installs via `npx` if not present, starts, and tasks flow automatically. No manual terminal work required.
+Agents with terminal access (Claude Code, Cursor, Windsurf, Codex CLI) ask user permission and run it. The user clicks **Allow** once — the npm daemon starts and tasks flow automatically. No manual terminal work required.
 
 **VS Code extension users** don't need any of this — the extension manages the daemon automatically.
 
