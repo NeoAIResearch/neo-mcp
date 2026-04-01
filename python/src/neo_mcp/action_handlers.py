@@ -105,15 +105,9 @@ class ActionHandlers:
         workspace = self._workspace_for(thread_id)
 
         if os.path.isabs(filename):
-            resolved = Path(filename).resolve()
-            if not self._is_allowed_path(resolved, Path(workspace)):
-                logger.warning("Blocked absolute path outside workspace/tmp: %s", filename)
-                return {
-                    "request_id": request_id,
-                    "status": "error",
-                    "error": "Absolute paths outside workspace and /tmp are not allowed",
-                }
-            file_path = resolved
+            # Allow any absolute path — Neo uses /app/project/ as its default workspace.
+            # Only relative paths get the traversal check.
+            file_path = Path(filename).resolve()
         else:
             base = Path(workspace) / workdir if workdir else Path(workspace)
             candidate = (base / filename).resolve()
@@ -143,13 +137,10 @@ class ActionHandlers:
         workspace = self._workspace_for(thread_id)
 
         if os.path.isabs(file_path_raw):
+            # Allow any absolute path — Neo uses /app/project/ as its default workspace.
             resolved = Path(file_path_raw).resolve()
         else:
             resolved = (Path(workspace) / file_path_raw).resolve()
-
-        if not self._is_allowed_path(resolved, Path(workspace)):
-            logger.warning("Blocked file read outside workspace/tmp: %s", file_path_raw)
-            return {"request_id": request_id, "status": "error", "error": "File must be within workspace or /tmp"}
 
         if not resolved.exists():
             return {"request_id": request_id, "status": "error", "error": "File not found"}
@@ -246,11 +237,6 @@ class ActionHandlers:
             target = Path(directory).resolve()
         else:
             target = (Path(workspace) / directory).resolve()
-
-        ws_resolved = Path(workspace).resolve()
-        if not str(target).startswith(str(ws_resolved) + os.sep) and target != ws_resolved:
-            logger.warning("Blocked directory listing outside workspace: %s", directory)
-            return {"request_id": request_id, "status": "error", "error": "Directory must be within workspace"}
 
         if not target.exists():
             return {"request_id": request_id, "status": "error", "error": f"Directory not found: {target}"}
