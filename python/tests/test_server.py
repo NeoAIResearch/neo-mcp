@@ -952,14 +952,15 @@ class TestNeoSubmitTask(unittest.TestCase):
 
     # -- daemon-only auto-start routing tests --------------------------------
 
-    def test_no_npm_daemon_autostart_triggered(self):
-        """When no daemon running, npm auto-start is called."""
+    def test_no_daemon_running_python_autostart_triggered(self):
+        """When no daemon running, Python auto-start is called first."""
         resp_ok = make_response(200, {"thread_id": "tid-no-daemon"})
-        mock_npm_start = AsyncMock(return_value=True)
+        mock_py_start = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
+             patch("neo_mcp.server._python_daemon_running", return_value=False), \
+             patch("neo_mcp.server._auto_start_python_daemon", mock_py_start), \
              patch("neo_mcp.server._npm_daemon_running", return_value=False), \
-             patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
@@ -967,20 +968,20 @@ class TestNeoSubmitTask(unittest.TestCase):
             MockClient.return_value = ctx
             result = call_tool("neo_submit_task", {"description": "train model"})
 
-        mock_npm_start.assert_called_once()
+        mock_py_start.assert_called_once()
         self.assertIn("tid-no-daemon", text_of(result))
 
-    def test_npm_daemon_starts_first_before_python(self):
-        """npm daemon is tried first; Python daemon is not called if npm succeeds."""
-        resp_ok = make_response(200, {"thread_id": "tid-npm-primary"})
+    def test_python_daemon_starts_first_before_npm(self):
+        """Python daemon is tried first; npm daemon is not called if Python succeeds."""
+        resp_ok = make_response(200, {"thread_id": "tid-py-primary"})
         mock_npm_start = AsyncMock(return_value=True)
         mock_py_start = AsyncMock(return_value=True)
 
         with patch("neo_mcp.server._get_deployment_id", return_value="dep-xyz"), \
-             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
-             patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
              patch("neo_mcp.server._python_daemon_running", return_value=False), \
              patch("neo_mcp.server._auto_start_python_daemon", mock_py_start), \
+             patch("neo_mcp.server._npm_daemon_running", return_value=False), \
+             patch("neo_mcp.server._auto_start_npm_daemon", mock_npm_start), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              patch("neo_mcp.server.httpx.AsyncClient") as MockClient, \
              patch("asyncio.create_task"):
@@ -988,9 +989,9 @@ class TestNeoSubmitTask(unittest.TestCase):
             MockClient.return_value = ctx
             result = call_tool("neo_submit_task", {"description": "train model"})
 
-        mock_npm_start.assert_called_once()
-        mock_py_start.assert_not_called()
-        self.assertIn("tid-npm-primary", text_of(result))
+        mock_py_start.assert_called_once()
+        mock_npm_start.assert_not_called()
+        self.assertIn("tid-py-primary", text_of(result))
 
     def test_npm_daemon_already_running_no_restart(self):
         """If daemon already running for deployment, skip auto-start."""

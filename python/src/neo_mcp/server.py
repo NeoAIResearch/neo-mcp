@@ -430,14 +430,14 @@ async def _auto_start_python_daemon(secret_key: str, deployment_id: str = "", wo
 
 
 async def _start_daemon(secret_key: str, deployment_id: str, workspace: str) -> bool:
-    """Start a local daemon if none is running. npm (Node.js) first, Python fallback."""
-    if _npm_daemon_running(deployment_id):
-        return True
-    if await _auto_start_npm_daemon(secret_key, deployment_id, workspace):
-        return True
+    """Start a local daemon if none is running. Python first, npm fallback."""
     if _python_daemon_running(deployment_id):
         return True
-    return await _auto_start_python_daemon(secret_key, deployment_id, workspace)
+    if await _auto_start_python_daemon(secret_key, deployment_id, workspace):
+        return True
+    if _npm_daemon_running(deployment_id):
+        return True
+    return await _auto_start_npm_daemon(secret_key, deployment_id, workspace)
 
 
 # Capture working directory at server startup — this is where the user launched the MCP client from
