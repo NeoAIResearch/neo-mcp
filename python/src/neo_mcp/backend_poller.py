@@ -203,6 +203,18 @@ class BackendPoller:
             self._thread_workspaces[thread_id] = command["workspace"]
             self._save_thread_workspaces()
 
+        # If this thread still has no registered workspace, reload from disk —
+        # covers the case where a daemon restart lost in-memory state.
+        if thread_id and thread_id not in self._thread_workspaces:
+            fresh = BackendPoller._load_thread_workspaces()
+            if thread_id in fresh:
+                self._thread_workspaces.update(fresh)
+            else:
+                logger.warning(
+                    "No workspace registered for thread %s — using default: %s",
+                    thread_id, self._handlers._default_workspace,
+                )
+
         try:
             async with self._cmd_semaphore:
                 response = await self._handlers.handle_command(command)
