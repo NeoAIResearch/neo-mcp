@@ -147,16 +147,19 @@ class ActionHandlers:
 
         workspace = self._workspace_for(thread_id)
 
+        ws_resolved = Path(workspace).resolve()
         if os.path.isabs(file_path_raw):
             candidate = Path(file_path_raw).resolve()
-            ws_resolved = Path(workspace).resolve()
             if self._is_allowed_path(candidate, ws_resolved):
                 resolved = candidate
             else:
                 # Backend container path (e.g. /app/project/src/file.py) — remap to local workspace
                 resolved = self._remap_to_workspace(candidate, ws_resolved)
         else:
-            resolved = (Path(workspace) / file_path_raw).resolve()
+            resolved = (ws_resolved / file_path_raw).resolve()
+            if not self._is_allowed_path(resolved, ws_resolved):
+                logger.warning("Path traversal blocked in get_file: %s", file_path_raw)
+                return {"request_id": request_id, "status": "error", "error": "Path traversal detected"}
 
         if not resolved.exists():
             return {"request_id": request_id, "status": "error", "error": "File not found"}
