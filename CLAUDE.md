@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 7 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — via stdio or HTTP transport. The hosted server runs at `https://mcpserver.heyneo.com/mcp`.
 
+Current pip version: **0.4.12**.
+
 ## Project structure
 
 Each concern lives in its own top-level folder.
@@ -20,8 +22,9 @@ neo-mcp/
 │   │   ├── daemon.py               # Python daemon (fallback — primary is npm daemon)
 │   │   └── login.py                # browser OAuth flow (neo-mcp login)
 │   ├── tests/
-│   │   ├── test_server.py          # unit test suite (no key needed)
-│   │   └── test_connection.py      # connectivity smoke test (needs key)
+│   │   ├── test_concurrent_workspaces.py  # primary unit suite (60 tests, no key needed)
+│   │   ├── test_server.py                 # legacy tests (stale — references old API)
+│   │   └── test_connection.py             # connectivity smoke test (needs key)
 │   ├── scripts/start-daemon.sh     # standalone daemon launcher (bash)
 │   ├── pyproject.toml              # package metadata + entry points
 │   ├── requirements.txt            # runtime deps
@@ -116,12 +119,23 @@ claude mcp logs neo
 
 ## Architecture
 
-**`python/src/neo_mcp/server.py`** is the entire server — no submodules, ~1000 lines.
+The Python server is split into focused modules (not a single monolithic file):
+
+| Module | Role |
+|---|---|
+| `server.py` | MCP server wiring — 7 tool definitions + call dispatch |
+| `backend_client.py` | Async HTTP client for all Neo API routes |
+| `backend_poller.py` | Background poll loop — fetches commands, dispatches them, sends responses |
+| `action_handlers.py` | Executes commands locally — write_code, get_file, run_subprocess, list_files, create_session |
+| `job_manager.py` | Async subprocess lifecycle — create, stream output, terminate, cleanup |
+| `auth.py` | Key resolution + deterministic deployment UUID derivation |
+| `paths.py` | All `~/.neo/daemon/` path constants in one place |
+| `config.py` | Tunable constants — poll intervals, timeouts, API URL |
 
 ### Auth
 - Only `NEO_SECRET_KEY` is required (`sk-v1-...`) — passed as `Authorization: Bearer` on every request.
-- `_headers()` raises `ValueError` with a clear message if `NEO_SECRET_KEY` is missing; the error is returned as a tool response (no crash).
-- In HTTP mode, the per-request key from the `Authorization` header is stored in a context var (`_ctx_secret_key`) and takes priority over the module-level env var.
+- `BackendClient._headers()` raises `ValueError` with a clear message if `NEO_SECRET_KEY` is missing; the error surfaces as a tool response (no crash).
+- In HTTP mode, the per-request key from the `Authorization` header takes priority over the env var.
 
 ### Daemon — npm daemon is primary
 
@@ -149,9 +163,26 @@ The Neo backend runs tasks inside a container where paths are prefixed with `/ap
 
 **Deduplication:** if the workspace directory name matches the first segment of the remapped relative path, that segment is stripped. Example: workspace `/home/user/test_2`, Neo sends `/app/project/test_2/model.py` → remaps to `/home/user/test_2/model.py` (not `/home/user/test_2/test_2/model.py`).
 
+**Exact-root handling:** `/app/project` with no trailing slash (rare) is handled as an exact match → maps to workspace root.
+
 **Adaptive polling:** the daemon uses `wait_time=1` for long-poll requests when a command was received within the last 60 s (active execution), and `wait_time=5` when idle. This reduces worst-case per-file latency from ~5 s to ~1 s during active task execution.
 
 **Workspace must be the git/project ROOT** — never a subdirectory. Passing a subdirectory causes files to land in a duplicate nested folder.
+
+### Path security — file operations are sandboxed
+
+All file reads and writes are validated to be within the thread's workspace or `/tmp`:
+- `write_code` with a relative filename: `_is_allowed_path` blocks traversal (e.g. `../../etc/passwd`). Returns `"Path traversal detected"`.
+- `write_code` with an absolute container path (e.g. `/app/project/src/main.py`): remapped to workspace via `_remap_to_workspace`, never written to the container path directly.
+- `get_file` with a relative path: same traversal check applied after resolving.
+- `get_file` with an absolute path outside workspace: remapped (not read directly). A compromised backend cannot read `/etc/passwd` or `~/.ssh/id_rsa`.
+
+### Job lifecycle and memory management
+
+`JobManager` (`job_manager.py`) tracks all subprocesses spawned by `run_subprocess`:
+- Output is streamed into memory (capped at 10 MB per stream) and also written to per-job log files under `~/.neo/daemon/jobs/`.
+- `cleanup_old_jobs()` removes **completed** jobs older than 24 h from the in-memory registry. Running jobs are never evicted regardless of age.
+- `cleanup_old_jobs()` is called automatically by `BackendPoller` every hour — no manual intervention needed.
 
 ### Task submission — always vscode mode
 
@@ -232,11 +263,36 @@ When the VS Code/Cursor extension daemon is running:
 
 Auth on every request: `Authorization: Bearer $NEO_SECRET_KEY`
 
+## Test suite
+
+Primary test file: `python/tests/test_concurrent_workspaces.py` (60 tests, no API key required).
+
+```bash
+python3 -m pytest python/tests/test_concurrent_workspaces.py -v
+```
+
+Coverage:
+
+| Class | What it tests |
+|---|---|
+| `TestWriteCode` | relative/absolute/workdir paths, subdir creation, overwrite, unicode, traversal blocked, missing fields |
+| `TestGetFileSecurity` | reads inside workspace, absolute path blocked/remapped, relative traversal blocked, missing file/field |
+| `TestRemapToWorkspace` | all 4 container roots, deduplication, exact root match, nested paths, workdir hint, unknown root fallback |
+| `TestListFiles` | basic listing, hidden files on/off, max_depth, missing directory, file count |
+| `TestCreateSession` | with/without session_id, payload form |
+| `TestUnknownAction` | unknown action, empty action, missing action |
+| `TestConcurrentWorkspaceIsolation` | 3 threads × separate workspaces, concurrent `asyncio.gather`, 15 files across 3 threads, unknown thread fallback |
+| `TestJobCleanup` | old completed removed, recent kept, running never evicted, empty registry, mixed, logs return None after cleanup |
+| `TestWorkspaceRegistration` | default fallback, per-thread lookup, isolation, runtime registration, None thread_id |
+
+When adding new features to `action_handlers.py`, `job_manager.py`, or `backend_poller.py` — add tests to this file.
+
 ## Known constraints
 
 - Without the npm daemon running, tasks submit and track correctly via thread_id polling — but local file execution depends on the daemon being active.
 - Do NOT send a fabricated `NEO_DEPLOYMENT_ID` unless it matches a real running sandbox — it causes a 30 s ReadTimeout.
 - Workspace must always be the project/git root. Subdirectories cause duplicate nested folder creation (e.g. `test_2/test_2/`) due to path remapping logic.
+- `test_server.py` tests an older monolithic server API and is no longer accurate — do not rely on it as a reference.
 
 ## Docker / CI
 
