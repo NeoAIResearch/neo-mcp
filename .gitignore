@@ -23,7 +23,13 @@ filelister_*.py
 neo_test_*.py
 go_daemon_proof.txt
 workspace_check.txt
-    
+
+# Neo daemon runtime state (not source code)
+.neo/
+
+# Claude Code / skills framework state
+skills-lock.json
+.agents/
+
 # vscode_extension is tracked separately
 vscode_extension/
-#
