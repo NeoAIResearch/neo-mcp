@@ -252,10 +252,17 @@ class ActionHandlers:
         include_hidden: bool = cmd.get("include_hidden") or payload.get("include_hidden") or False
 
         # Resolve and validate target directory
+        ws_resolved = Path(workspace).resolve()
         if os.path.isabs(directory):
-            target = Path(directory).resolve()
+            candidate = Path(directory).resolve()
+            if self._is_allowed_path(candidate, ws_resolved):
+                target = candidate
+            else:
+                # Backend container path (e.g. /app/project) — remap to local workspace
+                target = self._remap_to_workspace(candidate, ws_resolved)
+                logger.info("list_files: remapped %s → %s", directory, target)
         else:
-            target = (Path(workspace) / directory).resolve()
+            target = (ws_resolved / directory).resolve()
 
         if not target.exists():
             return {"request_id": request_id, "status": "error", "error": f"Directory not found: {target}"}

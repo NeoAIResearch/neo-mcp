@@ -9,6 +9,10 @@ Mirrors BackendClient.ts:
   - send_feedback      → POST /v2/thread/feedback/{thread_id}
   - control_thread     → POST /v2/thread/control/{thread_id}
   - stop_thread        → DELETE /v2/thread/cleanup-direct/{thread_id}
+
+Uses a single persistent httpx.AsyncClient with connection pooling so that
+concurrent command handlers (poll, send_response × N, init_chat, …) reuse
+TCP/TLS connections instead of opening a fresh one for every call.
 """
 
 import logging
@@ -26,14 +30,29 @@ from .config import (
 
 logger = logging.getLogger(__name__)
 
+# Connection pool limits — 20 total connections, up to 10 kept alive between
+# requests.  Enough for many concurrent command handlers without exhausting
+# local file descriptors.
+_POOL_LIMITS = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+
 
 class BackendClient:
     def __init__(self, auth_token: str, base_url: str = API_URL) -> None:
         self._base_url = base_url.rstrip("/")
         self._auth_token = auth_token
+        # Persistent client — connections are reused across calls.
+        # Per-request timeouts override this default where needed.
+        self._http = httpx.AsyncClient(
+            limits=_POOL_LIMITS,
+            timeout=REQUEST_TIMEOUT,
+        )
 
     def update_token(self, token: str) -> None:
         self._auth_token = token
+
+    async def aclose(self) -> None:
+        """Close the underlying connection pool. Call on shutdown."""
+        await self._http.aclose()
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -67,13 +86,12 @@ class BackendClient:
 
         logger.debug("Polling backend: %s", url)
 
-        async with httpx.AsyncClient(timeout=POLL_TIMEOUT) as client:
-            try:
-                resp = await client.get(url, headers=self._headers())
-            except httpx.TimeoutException as exc:
-                raise RuntimeError(f"Poll timeout: {exc}") from exc
-            except httpx.RequestError as exc:
-                raise RuntimeError(f"Poll network error: {exc}") from exc
+        try:
+            resp = await self._http.get(url, headers=self._headers(), timeout=POLL_TIMEOUT)
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(f"Poll timeout: {exc}") from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Poll network error: {exc}") from exc
 
         if resp.status_code == 401:
             raise RuntimeError("UNAUTHORIZED")
@@ -102,11 +120,10 @@ class BackendClient:
             response.get("status"),
         )
 
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            try:
-                resp = await client.post(url, json=response, headers=self._headers())
-            except httpx.RequestError as exc:
-                raise RuntimeError(f"send_response network error: {exc}") from exc
+        try:
+            resp = await self._http.post(url, json=response, headers=self._headers())
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"send_response network error: {exc}") from exc
 
         if not resp.is_success:
             raise RuntimeError(f"send_response HTTP {resp.status_code}: {resp.text[:200]}")
@@ -131,11 +148,10 @@ class BackendClient:
         if workspace:
             payload["workspace"] = workspace
 
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            try:
-                resp = await client.post(url, json=payload, headers=self._headers())
-            except httpx.RequestError as exc:
-                raise RuntimeError(f"init_chat network error: {exc}") from exc
+        try:
+            resp = await self._http.post(url, json=payload, headers=self._headers())
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"init_chat network error: {exc}") from exc
 
         if resp.status_code == 401:
             raise RuntimeError("UNAUTHORIZED")
@@ -149,11 +165,10 @@ class BackendClient:
         """GET /v2/thread/status/{thread_id}"""
         url = f"{self._base_url}/v2/thread/status/{thread_id}"
 
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            try:
-                resp = await client.get(url, headers=self._headers())
-            except httpx.RequestError as exc:
-                raise RuntimeError(f"get_thread_status network error: {exc}") from exc
+        try:
+            resp = await self._http.get(url, headers=self._headers())
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"get_thread_status network error: {exc}") from exc
 
         if resp.status_code == 401:
             raise RuntimeError("UNAUTHORIZED")
@@ -182,11 +197,10 @@ class BackendClient:
 
         url = f"{self._base_url}/v2/thread/thread-messages"
 
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            try:
-                resp = await client.get(url, params=params, headers=self._headers())
-            except httpx.RequestError as exc:
-                raise RuntimeError(f"get_thread_messages network error: {exc}") from exc
+        try:
+            resp = await self._http.get(url, params=params, headers=self._headers())
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"get_thread_messages network error: {exc}") from exc
 
         if resp.status_code == 401:
             raise RuntimeError("UNAUTHORIZED")
@@ -201,13 +215,12 @@ class BackendClient:
         """POST /v2/thread/feedback/{thread_id}"""
         url = f"{self._base_url}/v2/thread/feedback/{thread_id}"
 
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            try:
-                resp = await client.post(
-                    url, json={"input": message}, headers=self._headers()
-                )
-            except httpx.RequestError as exc:
-                raise RuntimeError(f"send_feedback network error: {exc}") from exc
+        try:
+            resp = await self._http.post(
+                url, json={"input": message}, headers=self._headers()
+            )
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"send_feedback network error: {exc}") from exc
 
         if resp.status_code == 401:
             raise RuntimeError("UNAUTHORIZED")
@@ -219,13 +232,12 @@ class BackendClient:
         """POST /v2/thread/control/{thread_id} with signal PAUSE or RESUME."""
         url = f"{self._base_url}/v2/thread/control/{thread_id}"
 
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            try:
-                resp = await client.post(
-                    url, json={"signal": signal}, headers=self._headers()
-                )
-            except httpx.RequestError as exc:
-                raise RuntimeError(f"control_thread network error: {exc}") from exc
+        try:
+            resp = await self._http.post(
+                url, json={"signal": signal}, headers=self._headers()
+            )
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"control_thread network error: {exc}") from exc
 
         if resp.status_code == 401:
             raise RuntimeError("UNAUTHORIZED")
@@ -237,11 +249,10 @@ class BackendClient:
         """DELETE /v2/thread/cleanup-direct/{thread_id}"""
         url = f"{self._base_url}/v2/thread/cleanup-direct/{thread_id}?delete_remote_artifacts=false"
 
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            try:
-                resp = await client.delete(url, headers=self._headers())
-            except httpx.RequestError as exc:
-                raise RuntimeError(f"stop_thread network error: {exc}") from exc
+        try:
+            resp = await self._http.delete(url, headers=self._headers())
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"stop_thread network error: {exc}") from exc
 
         if resp.status_code == 401:
             raise RuntimeError("UNAUTHORIZED")

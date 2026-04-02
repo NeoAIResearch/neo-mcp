@@ -215,11 +215,16 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
 
     backoffMs = 1_000;
     lastCommandTime = Date.now();
-    for (const cmd of commands) {
+
+    // Resolve workspace for each command synchronously first (no async/await here),
+    // then dispatch all commands concurrently so a batch of write_code + run_subprocess
+    // calls across different threads don't serialize behind each other.
+    await Promise.all(commands.map(async (cmd) => {
       const tid = cmd.thread_id as string | undefined;
 
       // Re-read workspace file on first command for a new thread —
       // server.py writes thread→workspace right after getting thread_id.
+      // loadThreadWorkspaces() is synchronous so this is safe under Promise.all.
       if (tid && !threadWorkspaces[tid]) {
         Object.assign(threadWorkspaces, loadThreadWorkspaces());
       }
@@ -238,6 +243,6 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
         result['response_queue_name'] = cmd.response_queue_name;
       }
       await sendResponse(depId, token, result);
-    }
+    }));
   }
 }

@@ -31,6 +31,11 @@ _ACCEPTED_STATUSES = frozenset({"RUNNING", "PAUSED"})
 class BackendPoller:
     """Runs as an asyncio background task."""
 
+    # Max commands processed in parallel within a single poll batch.
+    # High enough to keep all concurrent threads busy; low enough to avoid
+    # overwhelming the local filesystem or spawning too many subprocesses.
+    _MAX_CONCURRENT_COMMANDS = 32
+
     def __init__(
         self,
         deployment_id: str,
@@ -46,6 +51,10 @@ class BackendPoller:
         self._running = False
         self._consecutive_errors = 0
         self._current_interval = POLL_BASE_INTERVAL
+        # Semaphore limits concurrent command handlers so a large batch of
+        # commands (e.g. 10 write_code + 10 run_subprocess) can all execute
+        # in parallel without unbounded goroutine/task explosion.
+        self._cmd_semaphore = asyncio.Semaphore(self._MAX_CONCURRENT_COMMANDS)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -156,8 +165,9 @@ class BackendPoller:
         if not commands:
             return False
         logger.info("Received %d command(s)", len(commands))
-        for command in commands:
-            await self._process_command(command)
+        # Dispatch all commands in this batch concurrently — each command runs
+        # independently (different thread/file), so there's no need to serialize them.
+        await asyncio.gather(*[self._process_command(c) for c in commands])
         return True
 
     async def _process_command(self, command: dict[str, Any]) -> None:
@@ -194,7 +204,8 @@ class BackendPoller:
             self._save_thread_workspaces()
 
         try:
-            response = await self._handlers.handle_command(command)
+            async with self._cmd_semaphore:
+                response = await self._handlers.handle_command(command)
         except Exception as exc:  # noqa: BLE001
             logger.error("Handler failed: %s", exc, exc_info=True)
             response = {"request_id": request_id, "status": "error", "error": str(exc)}

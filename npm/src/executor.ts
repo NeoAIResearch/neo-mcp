@@ -215,7 +215,12 @@ function hGetFile(cmd: Command, workspace: string): ActionResult {
   if (!fp) {
     return { request_id: cmd.request_id, status: 'error', error: 'file_path is required' };
   }
-  const full = safeResolve(workspace, fp);
+  // Try direct resolution first; if outside workspace (backend container path), remap it.
+  let full = safeResolve(workspace, fp);
+  if (!full && isAbsolute(fp)) {
+    full = remapToWorkspace(resolve(fp), workspace, '');
+    console.log(`[get_file] remapped ${fp} → ${full}`);
+  }
   if (!full || !existsSync(full) || !statSync(full).isFile()) {
     return { request_id: cmd.request_id, status: 'error', error: `File not found: ${fp}` };
   }
@@ -334,9 +339,19 @@ function hListFiles(cmd: Command, workspace: string): ActionResult {
   const maxDepth = Number(cmd.max_depth ?? payload['max_depth'] ?? 10);
   const includeHidden = Boolean(cmd.include_hidden ?? payload['include_hidden'] ?? false);
 
-  const target = isAbsolute(directory)
-    ? resolve(directory)
-    : (safeResolve(workspace, directory) ?? workspace);
+  let target: string;
+  if (isAbsolute(directory)) {
+    // If outside workspace (backend container path like /app/project), remap to local workspace.
+    const direct = safeResolve(workspace, directory);
+    if (direct) {
+      target = direct;
+    } else {
+      target = remapToWorkspace(resolve(directory), workspace, '');
+      console.log(`[list_files] remapped ${directory} → ${target}`);
+    }
+  } else {
+    target = safeResolve(workspace, directory) ?? workspace;
+  }
 
   if (!existsSync(target) || !statSync(target).isDirectory()) {
     return { request_id: cmd.request_id, status: 'error', error: `Directory not found: ${directory}` };
