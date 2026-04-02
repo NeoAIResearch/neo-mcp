@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 from .action_handlers import ActionHandlers
 from .backend_client import BackendClient
-from .config import POLL_BACKOFF_FACTOR, POLL_BASE_INTERVAL, POLL_MAX_INTERVAL
+from .config import POLL_BACKOFF_FACTOR, POLL_BASE_INTERVAL, POLL_MAX_INTERVAL, POLL_WAIT_TIME
 from .paths import DAEMON_DIR, DAEMON_LOG, THREAD_WORKSPACES_FILE
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,8 @@ class BackendPoller:
         self._consecutive_errors = 0
         self._current_interval = POLL_BASE_INTERVAL
         last_command_time: float = 0.0  # monotonic clock, 0 = never
+        last_cleanup_time: float = 0.0  # monotonic clock, 0 = never
+        _CLEANUP_INTERVAL = 3600.0  # run cleanup_old_jobs every hour
 
         self._write_daemon_log()
 
@@ -96,6 +98,12 @@ class BackendPoller:
                 self._handle_error(exc)
             except Exception as exc:  # noqa: BLE001
                 self._handle_error(exc)
+
+            # Periodic job cleanup — every hour
+            now_mono = time.monotonic()
+            if now_mono - last_cleanup_time >= _CLEANUP_INTERVAL:
+                self._handlers._job_manager.cleanup_old_jobs()
+                last_cleanup_time = now_mono
 
             if self._running and not got_commands:
                 if recently_active:

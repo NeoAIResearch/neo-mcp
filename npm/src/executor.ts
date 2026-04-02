@@ -57,7 +57,22 @@ interface Job {
 // Job registry
 // ---------------------------------------------------------------------------
 
-const _jobs = new Map<string, Job>();
+interface JobWithMeta extends Job {
+  startedAt: number; // Date.now() ms
+}
+
+const _jobs = new Map<string, JobWithMeta>();
+const _JOB_TTL_MS = 24 * 60 * 60 * 1_000; // 24 hours
+let _cleanupCounter = 0;
+
+function cleanupOldJobs(): void {
+  const cutoff = Date.now() - _JOB_TTL_MS;
+  for (const [id, job] of _jobs.entries()) {
+    if (job.exitCode !== null && job.startedAt < cutoff) {
+      _jobs.delete(id);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Path safety — mirrors Python _safe_resolve()
@@ -127,6 +142,7 @@ function remapToWorkspace(absPath: string, workspace: string, workdir: string): 
   // Try known backend container roots
   if (relative === null) {
     for (const root of ['/app/project', '/app', '/workspace', '/project']) {
+      if (absPath === root) { relative = ''; break; }
       if (absPath.startsWith(root + '/')) {
         relative = absPath.slice(root.length + 1);
         break;
@@ -231,8 +247,10 @@ async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionRe
     const proc = spawn(command, { shell: true, cwd: safeCwd });
     let stdout = '';
     let stderr = '';
-    proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
-    proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    proc.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    proc.stdout?.on('error', () => { /* ignore stream errors */ });
+    proc.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    proc.stderr?.on('error', () => { /* ignore stream errors */ });
 
     const exitCode = await new Promise<number>((resolveExit) => {
       proc.on('close', (code: number | null) => resolveExit(code ?? -1));
@@ -255,12 +273,17 @@ async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionRe
 
   const jobId = randomUUID();
   const proc = spawn(command, { shell: true, cwd: safeCwd });
-  const job: Job = { proc, stdout: '', stderr: '', exitCode: null };
+  const job: JobWithMeta = { proc, stdout: '', stderr: '', exitCode: null, startedAt: Date.now() };
   _jobs.set(jobId, job);
 
-  proc.stdout.on('data', (chunk: Buffer) => { job.stdout += chunk.toString(); });
-  proc.stderr.on('data', (chunk: Buffer) => { job.stderr += chunk.toString(); });
+  proc.stdout?.on('data', (chunk: Buffer) => { job.stdout += chunk.toString(); });
+  proc.stdout?.on('error', () => { /* ignore stream errors */ });
+  proc.stderr?.on('data', (chunk: Buffer) => { job.stderr += chunk.toString(); });
+  proc.stderr?.on('error', () => { /* ignore stream errors */ });
   proc.on('close', (code: number | null) => { job.exitCode = code ?? -1; });
+
+  // Periodic cleanup every 200 jobs to prevent unbounded memory growth
+  if (++_cleanupCounter % 200 === 0) cleanupOldJobs();
 
   return {
     request_id: cmd.request_id,

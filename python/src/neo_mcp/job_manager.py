@@ -121,12 +121,12 @@ class JobManager:
         return True
 
     def cleanup_old_jobs(self) -> None:
-        """Remove jobs older than JOB_TTL from memory."""
+        """Remove completed jobs older than JOB_TTL from memory."""
         now = datetime.now(timezone.utc).timestamp()
         stale = [
             jid
             for jid, j in self._jobs.items()
-            if (now - j.started_at.timestamp()) > JOB_TTL
+            if j.exit_code is not None and (now - j.started_at.timestamp()) > JOB_TTL
         ]
         for jid in stale:
             j = self._jobs.pop(jid)
