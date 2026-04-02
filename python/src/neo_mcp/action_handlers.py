@@ -148,8 +148,13 @@ class ActionHandlers:
         workspace = self._workspace_for(thread_id)
 
         if os.path.isabs(file_path_raw):
-            # Allow any absolute path — Neo uses /app/project/ as its default workspace.
-            resolved = Path(file_path_raw).resolve()
+            candidate = Path(file_path_raw).resolve()
+            ws_resolved = Path(workspace).resolve()
+            if self._is_allowed_path(candidate, ws_resolved):
+                resolved = candidate
+            else:
+                # Backend container path (e.g. /app/project/src/file.py) — remap to local workspace
+                resolved = self._remap_to_workspace(candidate, ws_resolved)
         else:
             resolved = (Path(workspace) / file_path_raw).resolve()
 
