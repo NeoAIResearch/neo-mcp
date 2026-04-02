@@ -216,25 +216,50 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
     backoffMs = 1_000;
     lastCommandTime = Date.now();
 
-    // Resolve workspace for each command synchronously first (no async/await here),
-    // then dispatch all commands concurrently so a batch of write_code + run_subprocess
-    // calls across different threads don't serialize behind each other.
+    // Dispatch all commands in this batch concurrently — each runs in its own
+    // thread's workspace so there is no ordering dependency between them.
     await Promise.all(commands.map(async (cmd) => {
       const tid = cmd.thread_id as string | undefined;
 
-      // Re-read workspace file on first command for a new thread —
-      // server.py writes thread→workspace right after getting thread_id.
-      // loadThreadWorkspaces() is synchronous so this is safe under Promise.all.
-      if (tid && !threadWorkspaces[tid]) {
+      // Resolve the local workspace for this thread.  The MCP server writes
+      // thread→workspace to the shared file right after submit; the file may
+      // not exist yet if this command raced the registration.  Retry with
+      // back-off before falling back so all 10 concurrent projects each land
+      // in their own directory instead of sharing the daemon's default.
+      let ws: string | undefined = tid ? threadWorkspaces[tid] : undefined;
+      if (tid && !ws) {
+        // Attempt 1 — synchronous file reload (usually sufficient in stdio mode)
         Object.assign(threadWorkspaces, loadThreadWorkspaces());
+        ws = threadWorkspaces[tid];
       }
+      if (tid && !ws) {
+        // Attempt 2 — wait 250 ms for MCP server to finish writing the file
+        await sleep(250);
+        Object.assign(threadWorkspaces, loadThreadWorkspaces());
+        ws = threadWorkspaces[tid];
+      }
+      if (tid && !ws) {
+        // Attempt 3 — one final reload at 500 ms
+        await sleep(500);
+        Object.assign(threadWorkspaces, loadThreadWorkspaces());
+        ws = threadWorkspaces[tid];
+      }
+      if (tid && !ws) {
+        // Still nothing — log a warning so the user can diagnose misrouted files.
+        // Do NOT persist the fallback: if the registration arrives later we want
+        // the next command to pick up the real workspace, not a cached default.
+        console.warn(`[daemon] workspace not registered for thread ${tid} — using default: ${workspace}`);
+      }
+      const resolvedWs = ws ?? workspace;
 
-      const ws = (tid && threadWorkspaces[tid]) ? threadWorkspaces[tid] : workspace;
-      const result = await dispatch(cmd, ws) as unknown as Record<string, unknown>;
+      const result = await dispatch(cmd, resolvedWs) as unknown as Record<string, unknown>;
 
       if (tid) {
         result['thread_id'] = tid;
-        if (!threadWorkspaces[tid]) {
+        // Only persist the mapping when it came from an explicit registration
+        // (not the fallback default) so a late-arriving registration can still
+        // override a previously saved default.
+        if (ws && !threadWorkspaces[tid]) {
           threadWorkspaces[tid] = ws;
           saveThreadWorkspaces(threadWorkspaces);
         }
