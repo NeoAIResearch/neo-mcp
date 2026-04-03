@@ -37,7 +37,7 @@ from .auth import derive_deployment_id, get_secret_key
 from .backend_client import BackendClient
 from .backend_poller import BackendPoller
 from .job_manager import JobManager
-from .paths import DAEMON_DIR, LOCK_FILE, PID_FILE
+from .paths import DAEMON_DIR, LOCK_FILE, PID_FILE, THREAD_WORKSPACES_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -378,6 +378,30 @@ def build_server(
                     openWorldHint=True,
                 ),
             ),
+            types.Tool(
+                name="neo_list_tasks",
+                description=(
+                    "List all known Neo tasks with their current live status. "
+                    "Use this when returning to a session — e.g. after closing and reopening "
+                    "Claude Code — to see which tasks are still RUNNING, which are COMPLETED, "
+                    "and which need feedback. "
+                    "Returns tasks sorted newest-first. For each task: thread_id, workspace, "
+                    "status, and last-updated timestamp. "
+                    "After getting thread_ids, use neo_task_status or neo_get_messages to "
+                    "drill into a specific task."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=True,
+                ),
+            ),
         ]
 
     # ----------------------------------------------------------------
@@ -405,6 +429,8 @@ def build_server(
                 result = await _resume_task(client, args)
             elif name == "neo_stop_task":
                 result = await _stop_task(client, poller, args)
+            elif name == "neo_list_tasks":
+                result = await _list_tasks(client)
             else:
                 result = {"error": f"Unknown tool: {name}"}
         except RuntimeError as exc:
@@ -476,6 +502,48 @@ async def _stop_task(
     await client.stop_thread(thread_id=thread_id)
     poller.set_thread_status(thread_id, "TERMINATED")
     return {"status": "stopped", "thread_id": thread_id}
+
+
+async def _list_tasks(client: BackendClient) -> dict:
+    """Return all known tasks with live status, sorted newest-first.
+
+    Reads thread→workspace from the persisted local file so tasks submitted in
+    previous sessions are included — useful for reconnecting after a restart.
+    Fetches status for each thread concurrently to keep latency low.
+    """
+    workspaces = _load_thread_workspaces()
+    if not workspaces:
+        return {"tasks": [], "count": 0}
+
+    # Load raw file to get updated_at timestamps for sorting
+    raw: dict[str, Any] = {}
+    if THREAD_WORKSPACES_FILE.exists():
+        try:
+            raw = json.loads(THREAD_WORKSPACES_FILE.read_text())
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def fetch_status(thread_id: str, workspace: str) -> dict[str, Any]:
+        entry = raw.get(thread_id, {})
+        updated_at = entry.get("updated_at", "") if isinstance(entry, dict) else ""
+        try:
+            status_data = await client.get_thread_status(thread_id)
+            status = status_data.get("status", "UNKNOWN")
+        except Exception:  # noqa: BLE001
+            status = "UNKNOWN"
+        return {
+            "thread_id": thread_id,
+            "workspace": workspace,
+            "status": status,
+            "updated_at": updated_at,
+        }
+
+    results = await asyncio.gather(
+        *[fetch_status(tid, ws) for tid, ws in workspaces.items()]
+    )
+    # Sort newest-first by updated_at (ISO string comparison works correctly)
+    tasks = sorted(results, key=lambda t: t["updated_at"], reverse=True)
+    return {"tasks": tasks, "count": len(tasks)}
 
 
 # ---------------------------------------------------------------------------

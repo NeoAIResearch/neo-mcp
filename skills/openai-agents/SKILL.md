@@ -9,7 +9,7 @@ Use Neo's MCP server as a toolset inside the OpenAI Agents SDK. Neo executes AI/
 
 ## Option A: MCP Server tool (recommended)
 
-The OpenAI Agents SDK has native MCP support via `MCPServerHTTP`. This loads all 7 Neo tools automatically.
+The OpenAI Agents SDK has native MCP support via `MCPServerHTTP`. This loads all 8 Neo tools automatically.
 
 ```python
 import asyncio
@@ -63,7 +63,7 @@ export NEO_SECRET_KEY=sk-v1-...
 
 ## Option B: Function tools (inline definitions)
 
-Define the 7 Neo tools as Python functions for full control, without the MCP client.
+Define the 8 Neo tools as Python functions for full control, without the MCP client.
 
 ```python
 import os
@@ -88,6 +88,18 @@ def _call_neo(tool_name: str, arguments: dict) -> str:
     r.raise_for_status()
     content = r.json().get("result", {}).get("content", [])
     return content[0].get("text", "") if content else ""
+
+
+@function_tool
+def neo_list_tasks() -> str:
+    """List all known Neo tasks with their current live status.
+
+    Use when returning to a session after closing a window, or to find a task
+    you lost track of. Returns tasks sorted by status (RUNNING first), each with
+    thread_id, workspace, and status. Use the returned thread_ids with
+    neo_task_status or neo_get_messages to reconnect.
+    """
+    return _call_neo("neo_list_tasks", {})
 
 
 @function_tool
@@ -189,6 +201,7 @@ Use neo_submit_task for any ML/AI work. Files are written directly to the user's
 Poll with neo_task_status until COMPLETED, then call neo_get_messages for the final output.
 Always pass workspace as the project root (git root), never a subdirectory.""",
     tools=[
+        neo_list_tasks,
         neo_submit_task,
         neo_task_status,
         neo_get_messages,

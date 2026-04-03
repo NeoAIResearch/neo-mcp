@@ -15,6 +15,7 @@ or /tmp — no traversal outside those boundaries is allowed.
 
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -82,9 +83,11 @@ class ActionHandlers:
     # ------------------------------------------------------------------
 
     async def _create_session(self, cmd: dict) -> dict:
-        session_id = cmd.get("payload", {}).get("session_id") or cmd.get("session_id")
-        if not session_id:
-            return {"request_id": cmd["request_id"], "status": "error", "error": "Missing session_id"}
+        session_id = (
+            cmd.get("payload", {}).get("session_id")
+            or cmd.get("session_id")
+            or str(uuid.uuid4())  # generate one if backend omits it (matches npm daemon)
+        )
         logger.info("Session created: %s", session_id)
         return {
             "request_id": cmd["request_id"],
