@@ -98,7 +98,7 @@ const neoClient = await createMCPClient({
 
 ## Option C: Inline tool definitions (no MCP dependency)
 
-Define the 7 Neo tools directly with Vercel AI SDK's `tool()` if you prefer not to use the MCP client.
+Define the 8 Neo tools directly with Vercel AI SDK's `tool()` if you prefer not to use the MCP client.
 
 ```typescript
 import { tool } from 'ai';
@@ -129,6 +129,16 @@ async function callNeoTool(toolName: string, args: Record<string, unknown>) {
 }
 
 export const neoTools = {
+  neo_list_tasks: tool({
+    description:
+      'List all known Neo tasks with their current live status. ' +
+      'Use when returning to a session after closing a window, or to find a task you lost track of. ' +
+      'Returns tasks sorted by status (RUNNING first), each with thread_id, workspace, and status. ' +
+      'Use the returned thread_ids with neo_task_status or neo_get_messages.',
+    parameters: z.object({}),
+    execute: async () => callNeoTool('neo_list_tasks', {}),
+  }),
+
   neo_submit_task: tool({
     description:
       'Submit an AI/ML task to Neo for local execution. ' +

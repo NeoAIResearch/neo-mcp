@@ -21,7 +21,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio';
 import { z } from 'zod';
 import { deriveDeploymentId, getAuthToken } from './auth';
-import { registerThreadWorkspace, runDaemon } from './daemon';
+import { loadThreadWorkspaces, registerThreadWorkspace, runDaemon } from './daemon';
 import {
   controlThread, getMessages, getTaskStatus,
   sendFeedback, stopThread, submitTask,
@@ -317,6 +317,57 @@ export async function runMcpServer(opts: {
       try {
         await stopThread(token, thread_id);
         return ok({ status: 'stopped', thread_id });
+      } catch (e) {
+        return toolErr(e);
+      }
+    },
+  );
+
+  // ----------------------------------------------------------------
+  // neo_list_tasks
+  // ----------------------------------------------------------------
+  server.registerTool(
+    'neo_list_tasks',
+    {
+      title: 'List Neo Tasks',
+      description:
+        'List all known Neo tasks with their current live status. ' +
+        'Use this when returning to a session — e.g. after closing and reopening ' +
+        'Claude Code — to see which tasks are still RUNNING, which are COMPLETED, ' +
+        'and which need feedback. ' +
+        'Returns tasks sorted newest-first. For each task: thread_id, workspace, ' +
+        'status, and last-updated timestamp. ' +
+        'After getting thread_ids, use neo_task_status or neo_get_messages to drill into a specific task.',
+      inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async () => {
+      try {
+        const workspaces = loadThreadWorkspaces();
+        const entries = Object.entries(workspaces);
+        if (entries.length === 0) return ok({ tasks: [], count: 0 });
+
+        const tasks = await Promise.all(
+          entries.map(async ([threadId, workspace]) => {
+            let status = 'UNKNOWN';
+            try {
+              const data = await getTaskStatus(token, threadId);
+              status = (data['status'] as string) ?? 'UNKNOWN';
+            } catch { /* unreachable thread — leave as UNKNOWN */ }
+            return { thread_id: threadId, workspace, status };
+          }),
+        );
+
+        // Sort RUNNING first, then by thread_id (newest IDs tend to be lexicographically last)
+        const order: Record<string, number> = { RUNNING: 0, WAITING_FOR_FEEDBACK: 1, PAUSED: 2, COMPLETED: 3, FAILED: 4, TERMINATED: 5, UNKNOWN: 6 };
+        tasks.sort((a, b) => (order[a.status] ?? 6) - (order[b.status] ?? 6));
+
+        return ok({ tasks, count: tasks.length });
       } catch (e) {
         return toolErr(e);
       }

@@ -409,10 +409,12 @@ class TestCreateSession(unittest.TestCase):
         self.assertEqual(res["status"], "success")
         self.assertEqual(res["data"]["coding_session_id"], "sess-xyz")
 
-    def test_without_session_id_returns_error(self):
+    def test_without_session_id_generates_uuid(self):
+        # When the backend omits session_id, a UUID is auto-generated (mirrors npm daemon).
         res = arun(self.h.handle_command({"action": "create_session", "request_id": "r"}))
-        self.assertEqual(res["status"], "error")
-        self.assertIn("session_id", res["error"].lower())
+        self.assertEqual(res["status"], "success")
+        self.assertIn("coding_session_id", res["data"])
+        self.assertTrue(len(res["data"]["coding_session_id"]) > 0)
 
 
 # ---------------------------------------------------------------------------

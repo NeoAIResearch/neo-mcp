@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Connection pool limits — 20 total connections, up to 10 kept alive between
 # requests.  Enough for many concurrent command handlers without exhausting
 # local file descriptors.
-_POOL_LIMITS = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+_POOL_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=20)
 
 
 class BackendClient:

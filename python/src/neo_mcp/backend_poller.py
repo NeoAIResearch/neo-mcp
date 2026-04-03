@@ -15,6 +15,7 @@ are rejected with an error response (mirrors shouldAcceptCommands()).
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -272,7 +273,12 @@ class BackendPoller:
                 tid: {"workspace": ws, "updated_at": datetime.now(timezone.utc).isoformat()}
                 for tid, ws in self._thread_workspaces.items()
             }
-            THREAD_WORKSPACES_FILE.write_text(json.dumps(data, indent=2))
+            # Atomic write: write to a temp file then rename so a crash mid-write
+            # never leaves a corrupted file (matches npm daemon's renameSync pattern).
+            THREAD_WORKSPACES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = THREAD_WORKSPACES_FILE.with_suffix(f".tmp-{os.getpid()}")
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.replace(THREAD_WORKSPACES_FILE)
         except OSError as exc:
             logger.warning("Could not save thread workspaces: %s", exc)
 

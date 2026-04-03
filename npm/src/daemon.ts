@@ -120,7 +120,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 export async function pollBackend(depId: string, token: string, waitTime = 5): Promise<Command[]> {
   try {
     const res = await fetchWithTimeout(
-      `${NEO_API_URL}/v2/poll/${depId}?max_messages=10&wait_time=${waitTime}`,
+      `${NEO_API_URL}/v2/poll/${depId}?max_messages=20&wait_time=${waitTime}`,
       { headers: { 'Authorization': `Bearer ${token}` } },
       Math.max(waitTime * 2, 10) * 1_000, // timeout = 2× wait_time, minimum 10s
     );

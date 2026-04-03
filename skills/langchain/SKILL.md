@@ -9,7 +9,7 @@ Use Neo's MCP server as a toolset inside LangChain agents. Neo executes AI/ML wo
 
 ## Option A: MCP Toolset (recommended)
 
-LangChain's `langchain-mcp-adapters` package loads all 7 Neo tools from the MCP server automatically.
+LangChain's `langchain-mcp-adapters` package loads all 8 Neo tools from the MCP server automatically.
 
 ```python
 import asyncio
@@ -62,7 +62,7 @@ export OPENAI_API_KEY=...
 
 ## Option B: Custom tools (no MCP dependency)
 
-Define the 7 Neo tools as LangChain `StructuredTool` objects for full control.
+Define the 8 Neo tools as LangChain `StructuredTool` objects for full control.
 
 ```python
 import os
@@ -93,6 +93,9 @@ def _call_neo(tool_name: str, arguments: dict) -> str:
 
 # --- Input schemas ---
 
+class EmptyInput(BaseModel):
+    pass
+
 class SubmitTaskInput(BaseModel):
     message: str = Field(description="Full task description with goal, file paths, and constraints")
     workspace: str = Field(
@@ -113,6 +116,18 @@ class FeedbackInput(BaseModel):
 
 
 # --- Tool definitions ---
+
+neo_list_tasks = StructuredTool.from_function(
+    func=lambda: _call_neo("neo_list_tasks", {}),
+    name="neo_list_tasks",
+    description=(
+        "List all known Neo tasks with their current live status. "
+        "Use when returning to a session after closing a window, or to find a task you lost track of. "
+        "Returns tasks sorted by status (RUNNING first), each with thread_id, workspace, and status. "
+        "Use the returned thread_ids with neo_task_status or neo_get_messages to reconnect."
+    ),
+    args_schema=EmptyInput,
+)
 
 neo_submit_task = StructuredTool.from_function(
     func=lambda message, workspace: _call_neo(
@@ -197,6 +212,7 @@ neo_stop_task = StructuredTool.from_function(
 # --- Tool list ---
 
 NEO_TOOLS = [
+    neo_list_tasks,
     neo_submit_task,
     neo_task_status,
     neo_get_messages,
