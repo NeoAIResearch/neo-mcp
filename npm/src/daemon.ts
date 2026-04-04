@@ -8,7 +8,7 @@
 import { randomUUID } from 'crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
-import { deriveDeploymentId, getAuthToken } from './auth.js';
+import { getAuthToken } from './auth.js';
 import { NEO_API_URL } from './config.js';
 import { Command, dispatch } from './executor.js';
 import {
@@ -37,14 +37,22 @@ function cleanupPidFiles(deploymentId: string): void {
 
 export function getOrCreateDeploymentId(): string {
   if (process.env['NEO_DEPLOYMENT_ID']) return process.env['NEO_DEPLOYMENT_ID'];
-  const sk = process.env['NEO_SECRET_KEY'];
-  if (sk) return deriveDeploymentId(sk);
 
   mkdirSync(DAEMON_DIR, { recursive: true });
+
+  // Always prefer a persisted machine-specific UUID over key-derived.
+  // This prevents command-queue collision when the same API key is used on
+  // multiple machines simultaneously — each machine must have its own sandbox.
+  // Mirrors what the VS Code extension does (unique UUID per user+machine).
   if (existsSync(STANDALONE_UUID_FILE)) {
     const uid = readFileSync(STANDALONE_UUID_FILE, 'utf8').trim();
     if (uid) return uid;
   }
+
+  // No persisted UUID yet — generate a fresh random one for this machine.
+  // Do NOT derive from the API key: same key on two machines would produce
+  // identical deployment IDs, causing the backend to split commands between
+  // daemons (files on one machine, folders on another).
   const uid = randomUUID();
   writeFileSync(STANDALONE_UUID_FILE, uid);
   return uid;

@@ -20,8 +20,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio';
 import { z } from 'zod';
-import { deriveDeploymentId, getAuthToken } from './auth';
-import { loadThreadWorkspaces, registerThreadWorkspace, runDaemon } from './daemon';
+import { getAuthToken } from './auth';
+import { getOrCreateDeploymentId, loadThreadWorkspaces, registerThreadWorkspace, runDaemon } from './daemon';
 import {
   controlThread, getMessages, getTaskStatus,
   sendFeedback, stopThread, submitTask,
@@ -53,7 +53,7 @@ export async function runMcpServer(opts: {
     process.exit(1);
   }
 
-  const deploymentId = opts.deploymentId ?? deriveDeploymentId(token);
+  const deploymentId = opts.deploymentId ?? getOrCreateDeploymentId();
   const workspace = opts.workspace;
 
   // Start daemon polling in the background so tasks actually execute locally.

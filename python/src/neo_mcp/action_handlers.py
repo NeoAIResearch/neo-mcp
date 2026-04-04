@@ -23,8 +23,15 @@ from .job_manager import JobManager
 
 logger = logging.getLogger(__name__)
 
-# Directories whose contents are excluded from list_files recursion
-_SKIP_DIRS = frozenset({"venv", ".venv", "env", "node_modules", ".git", "__pycache__"})
+# Directories whose contents are excluded from list_files recursion.
+# Mirrors npm executor.ts SKIP_DIRS — keep both in sync.
+_SKIP_DIRS = frozenset({
+    "venv", ".venv", "env",          # Python virtualenvs
+    "node_modules",                   # JS deps
+    ".git",                           # version control
+    "__pycache__", ".tox",            # Python build artefacts
+    "dist", "build",                  # build output
+})
 
 # Temp directories that are always permitted for file operations
 _TMP_DIRS = [Path("/tmp"), Path("/private/tmp")]
@@ -97,9 +104,13 @@ class ActionHandlers:
 
     async def _write_code(self, cmd: dict) -> dict:
         request_id = cmd["request_id"]
-        filename = cmd.get("filename")
-        code = cmd.get("code")
-        workdir = cmd.get("workdir")
+        payload = cmd.get("payload") or {}
+        # Check top-level first, fall back to payload (mirrors npm fieldString()).
+        filename = cmd.get("filename") or payload.get("filename")
+        # code may be empty string ("") which is valid — only fall back if truly absent (None).
+        _code_top = cmd.get("code")
+        code = _code_top if _code_top is not None else payload.get("code")
+        workdir = cmd.get("workdir") or payload.get("workdir")
         thread_id = cmd.get("thread_id")
 
         if not filename or code is None:
@@ -142,7 +153,8 @@ class ActionHandlers:
 
     async def _get_file(self, cmd: dict) -> dict:
         request_id = cmd["request_id"]
-        file_path_raw = cmd.get("file_path")
+        payload = cmd.get("payload") or {}
+        file_path_raw = cmd.get("file_path") or payload.get("file_path")
         thread_id = cmd.get("thread_id")
 
         if not file_path_raw:
@@ -176,15 +188,25 @@ class ActionHandlers:
         }
 
     async def _run_subprocess(self, cmd: dict) -> dict:
+        import asyncio
+        import re
+
         request_id = cmd["request_id"]
-        command_str = cmd.get("command")
+        payload = cmd.get("payload") or {}
+        command_str = cmd.get("command") or payload.get("command")
         thread_id = cmd.get("thread_id")
 
         if not command_str:
             return {"request_id": request_id, "status": "error", "error": "Missing command"}
 
+        # Normalise the detach flag — backend may send bool or string.
+        raw_detach = cmd.get("detach", True)
+        if isinstance(raw_detach, str):
+            detach = raw_detach.lower() not in ("false", "0", "no")
+        else:
+            detach = bool(raw_detach)
+
         # Pre-flight: check if backend is sending a /tmp script that doesn't exist locally
-        import re
         m = re.search(r"(?:bash|sh)\s+(/tmp/bash_exec_[a-f0-9]+\.sh)", command_str)
         if m:
             script_path = Path(m.group(1))
@@ -200,6 +222,34 @@ class ActionHandlers:
                 }
 
         workspace = self._workspace_for(thread_id)
+
+        if not detach:
+            # Blocking (synchronous) mode — mirrors npm executor.ts hRunSubprocess detach=false.
+            # Run command to completion and return stdout/stderr immediately in the response.
+            proc = await asyncio.create_subprocess_shell(
+                command_str,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace,
+            )
+            stdout_bytes, stderr_bytes = await proc.communicate()
+            exit_code = proc.returncode or 0
+            logger.info(
+                "Subprocess (blocking) done: exit=%d cmd=%r", exit_code, command_str[:80]
+            )
+            return {
+                "request_id": request_id,
+                "status": "completed" if exit_code == 0 else "error",
+                "data": {
+                    "detached": False,
+                    "completed": True,
+                    "exit_code": exit_code,
+                    "stdout": stdout_bytes.decode("utf-8", errors="replace"),
+                    "stderr": stderr_bytes.decode("utf-8", errors="replace"),
+                },
+                **({"error": f"Command failed with exit code {exit_code}"} if exit_code != 0 else {}),
+            }
+
         job_id = await self._job_manager.create_job(command_str, workspace, thread_id or "unknown")
         logger.info("Subprocess started: job_id=%s cmd=%r", job_id, command_str[:80])
         return {

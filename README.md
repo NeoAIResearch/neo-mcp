@@ -179,7 +179,7 @@ Assistant: Submitting to Neo…
            Step 3/4  Train XGBoost — AUC-ROC: 0.942, Recall: 0.91
            Step 4/4  Save fraud_model.pkl + evaluation_report.html
 
-           Done. Files available via neo_get_files.
+           Done. Files written to your local workspace.
 ```
 
 ---
@@ -190,7 +190,6 @@ Assistant: Submitting to Neo…
 neo_submit_task
       │
       ├─ stdio mode: auto-starts daemon if not running
-      ├─ http mode: returns DAEMON_NOT_RUNNING if no daemon → agent runs startup command
       │
       ├─ POST /v2/thread/init-chat-direct  →  thread_id  (returns immediately)
       │         deployment_type: "vscode"
@@ -267,7 +266,6 @@ claude mcp add --scope user neo \
 ```
 
 > Open a **new Claude Code session** after running either command.
-> Use a different API key per machine to avoid deployment-id collisions across devices.
 
 ### Cursor
 
@@ -386,7 +384,6 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for the full guide including Docker, scop
 | `NEO_DEPLOYMENT_ID` | No | Pin a specific VS Code/Cursor extension sandbox ID (auto-discovered by default) |
 | `NEO_READ_ONLY` | No | `true` = expose only status/plan/message tools (no submit, stop, pause) |
 | `NEO_WORKSPACE_DIR` | No | Override working directory (useful in Docker) |
-| `NEO_NO_DAEMON` | No | `true` = disable the background Python poller — set automatically in Docker bridge deployments |
 | `NEO_TRANSPORT` | No | `stdio` (default) or `http` |
 | `NEO_PUBLIC_URL` | No | Override public base URL for OAuth discovery (default: `https://mcpserver.heyneo.com`) |
 
@@ -405,6 +402,6 @@ See [docs/CLIENTS.md](docs/CLIENTS.md) for the full guide including Docker, scop
 | Task submission hangs or times out | Daemon stopped — restart with `npx --yes neo-mcp-daemon /workspace &` |
 | `neo-mcp` not found | Re-run `pip install neo-mcp` and verify `which neo-mcp` |
 | Neo tools don't appear after `claude mcp add` | Open a **new Claude Code session** — tools load at session start |
-| Output truncated | Cap is ~20 000 tokens — use `neo_task_plan` for a concise step summary |
-| Status stuck on RUNNING | Call `neo_task_plan` to see which step is blocked |
+| Output truncated | Cap is ~20 000 tokens — use `neo_task_status` to check progress |
+| Status stuck on RUNNING | Call `neo_task_status` to check; restart the daemon if it stopped |
 | `Failed to connect` in `claude mcp list` | Re-run `claude mcp add` with `--header "Authorization: Bearer YOUR_KEY"` on one line |
