@@ -44,11 +44,13 @@ docker run --rm \
 | `NEO_SECRET_KEY` | — | **Required.** Your Neo API key (`sk-v1-...`) |
 | `NEO_ENV` | `prod` | Set to `staging` to use the staging backend |
 | `NEO_API_URL` | auto | Explicit backend URL override (takes priority over `NEO_ENV`) |
-| `NEO_DEPLOYMENT_ID` | auto | Override the deployment UUID (derived from API key by default) |
+| `NEO_DEPLOYMENT_ID` | auto | Explicit deployment UUID override (highest priority) |
+| `NEO_DEPLOYMENT_ID_MODE` | `machine` | `machine` (default persisted UUID) or `key-derived` (deterministic UUID from API key) |
 
 ## How it works
 
-1. Derives a stable deployment UUID from your API key (SHA-256 → UUID v5) — same key always maps to the same UUID, no config files needed
+1. Resolves deployment UUID in precedence order:
+   explicit `NEO_DEPLOYMENT_ID` > `NEO_DEPLOYMENT_ID_MODE=key-derived` > persisted machine UUID
 2. Registers with the Neo backend under that UUID
 3. Polls `GET /v2/poll/{deployment_id}` for commands
 4. Dispatches commands locally: `write_code`, `run_subprocess`, `get_file`, `list_files`, `get_job_status`, `terminate_job`, `create_session`

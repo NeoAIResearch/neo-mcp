@@ -8,7 +8,7 @@
 import { randomUUID } from 'crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
-import { getAuthToken } from './auth.js';
+import { deriveDeploymentId, getAuthToken } from './auth.js';
 import { NEO_API_URL } from './config.js';
 import { Command, dispatch } from './executor.js';
 import {
@@ -37,6 +37,11 @@ function cleanupPidFiles(deploymentId: string): void {
 
 export function getOrCreateDeploymentId(): string {
   if (process.env['NEO_DEPLOYMENT_ID']) return process.env['NEO_DEPLOYMENT_ID'];
+  const mode = (process.env['NEO_DEPLOYMENT_ID_MODE'] ?? '').trim().toLowerCase();
+  const token = getAuthToken();
+  if ((mode === 'key-derived' || mode === 'key' || mode === 'deterministic') && token) {
+    return deriveDeploymentId(token);
+  }
 
   mkdirSync(DAEMON_DIR, { recursive: true });
 

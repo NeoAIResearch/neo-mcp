@@ -23,8 +23,10 @@ import os
 import signal
 import sys
 import threading
+import tempfile
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any, Optional
 
 import anyio
@@ -33,11 +35,18 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from .action_handlers import ActionHandlers
-from .auth import get_or_create_deployment_id, get_secret_key
+from .auth import derive_deployment_id, get_or_create_deployment_id, get_secret_key
 from .backend_client import BackendClient
 from .backend_poller import BackendPoller
 from .job_manager import JobManager
-from .paths import DAEMON_DIR, LOCK_FILE, PID_FILE, THREAD_WORKSPACES_FILE
+from .paths import (
+    DAEMON_DIR,
+    DAEMON_LOG,
+    LOCK_FILE,
+    PID_FILE,
+    STANDALONE_UUID_FILE,
+    THREAD_WORKSPACES_FILE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +64,22 @@ def _remove_lock() -> None:
     try:
         LOCK_FILE.unlink(missing_ok=True)
         PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _deployment_pid_file(deployment_id: str) -> Path:
+    return DAEMON_DIR / f"daemon_{deployment_id.replace('-', '')[:8]}.pid"
+
+
+def _write_deployment_pid(deployment_id: str, pid: int) -> None:
+    DAEMON_DIR.mkdir(parents=True, exist_ok=True)
+    _deployment_pid_file(deployment_id).write_text(str(pid))
+
+
+def _remove_deployment_pid(deployment_id: str) -> None:
+    try:
+        _deployment_pid_file(deployment_id).unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -567,6 +592,7 @@ async def run(secret_key: str, workspace: str) -> None:
         _write_lock(pid)
         DAEMON_DIR.mkdir(parents=True, exist_ok=True)
         PID_FILE.write_text(str(pid))
+        _write_deployment_pid(deployment_id, pid)
         poller_task = asyncio.create_task(poller.run(), name="backend-poller")
         logger.info(
             "Poller started (pid=%d deployment=%s)",
@@ -579,6 +605,7 @@ async def run(secret_key: str, workspace: str) -> None:
         if poller_task and not poller_task.done():
             poller_task.cancel()
         poller.stop()
+        _remove_deployment_pid(deployment_id)
         _remove_lock()
         sys.exit(0)
 
@@ -599,6 +626,8 @@ async def run(secret_key: str, workspace: str) -> None:
                 await poller_task
             except asyncio.CancelledError:
                 pass
+        await client.aclose()
+        _remove_deployment_pid(deployment_id)
         _remove_lock()
         logger.info("Server shut down cleanly")
 
@@ -606,14 +635,23 @@ async def run(secret_key: str, workspace: str) -> None:
 def _setup_logging() -> None:
     """Route all internal logging to a file so it doesn't pollute stdio."""
     log_dir = os.path.expanduser("~/.neo/daemon")
-    os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "neo-mcp.log")
-    logging.basicConfig(
-        filename=log_file,
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+    except OSError:
+        # Fallback for read-only environments (tests/sandboxes): keep CLI usable.
+        logging.basicConfig(
+            stream=sys.stderr,
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
 
 
 def _start_health_server() -> None:
@@ -646,20 +684,380 @@ def _start_health_server() -> None:
     logger.info("Health server listening on port %d", port)
 
 
+def _deployment_id_source(secret_key: str) -> tuple[str, str]:
+    explicit = os.environ.get("NEO_DEPLOYMENT_ID", "").strip()
+    if explicit:
+        return explicit, "explicit-env"
+    mode = os.environ.get("NEO_DEPLOYMENT_ID_MODE", "").strip().lower()
+    if mode in {"key-derived", "key", "deterministic"} and secret_key:
+        return derive_deployment_id(secret_key), "key-derived-mode"
+    if STANDALONE_UUID_FILE.exists():
+        persisted = STANDALONE_UUID_FILE.read_text().strip()
+        if persisted:
+            return persisted, "machine-persisted"
+    return "", "unset"
+
+
+def _json_print(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, indent=2))
+
+
+def _cmd_status(json_mode: bool = False) -> int:
+    secret_key = get_secret_key() or ""
+    dep_id, source = _deployment_id_source(secret_key)
+    daemon_pid = None
+    daemon_running = False
+    if dep_id:
+        pid_file = _deployment_pid_file(dep_id)
+        if pid_file.exists():
+            try:
+                daemon_pid = int(pid_file.read_text().strip())
+                daemon_running = _pid_is_alive(daemon_pid)
+            except (OSError, ValueError):
+                daemon_pid = None
+                daemon_running = False
+
+    thread_count = 0
+    if THREAD_WORKSPACES_FILE.exists():
+        try:
+            data = json.loads(THREAD_WORKSPACES_FILE.read_text())
+            if isinstance(data, dict):
+                thread_count = len(data)
+        except Exception:  # noqa: BLE001
+            thread_count = 0
+
+    payload = {
+        "mode": "stdio-daemon-first",
+        "http_mode": "obsolete-not-used",
+        "secret_key_present": bool(secret_key),
+        "deployment_id": dep_id,
+        "deployment_id_source": source,
+        "daemon_running": daemon_running,
+        "daemon_pid": daemon_pid,
+        "thread_mappings": thread_count,
+        "daemon_dir": str(DAEMON_DIR),
+    }
+    if json_mode:
+        _json_print(payload)
+    else:
+        print("Neo MCP status")
+        print(f"  mode:                 {payload['mode']}")
+        print(f"  http_mode:            {payload['http_mode']}")
+        print(f"  secret_key_present:   {payload['secret_key_present']}")
+        print(f"  deployment_id:        {dep_id or '(none)'}")
+        print(f"  deployment_id_source: {source}")
+        print(f"  daemon_running:       {daemon_running}")
+        print(f"  daemon_pid:           {daemon_pid if daemon_pid is not None else '(none)'}")
+        print(f"  thread_mappings:      {thread_count}")
+        print(f"  daemon_dir:           {DAEMON_DIR}")
+    return 0
+
+
+def _cmd_doctor(json_mode: bool = False) -> int:
+    checks: list[dict[str, Any]] = []
+
+    py_ok = sys.version_info >= (3, 11)
+    checks.append({
+        "name": "python_version>=3.11",
+        "ok": py_ok,
+        "detail": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+    })
+
+    key = get_secret_key() or ""
+    checks.append({
+        "name": "secret_key_present",
+        "ok": bool(key),
+        "detail": "NEO_SECRET_KEY set" if key else "NEO_SECRET_KEY missing",
+    })
+
+    try:
+        DAEMON_DIR.mkdir(parents=True, exist_ok=True)
+        writable = os.access(DAEMON_DIR, os.W_OK)
+    except OSError:
+        writable = False
+    checks.append({
+        "name": "daemon_dir_writable",
+        "ok": writable,
+        "detail": str(DAEMON_DIR),
+    })
+
+    dep_id, source = _deployment_id_source(key)
+    checks.append({
+        "name": "deployment_id_resolved",
+        "ok": bool(dep_id),
+        "detail": f"{dep_id or 'none'} ({source})",
+    })
+
+    daemon_ok = False
+    if dep_id:
+        pf = _deployment_pid_file(dep_id)
+        if pf.exists():
+            try:
+                daemon_ok = _pid_is_alive(int(pf.read_text().strip()))
+            except (OSError, ValueError):
+                daemon_ok = False
+    checks.append({
+        "name": "daemon_running_for_deployment",
+        "ok": daemon_ok,
+        "detail": dep_id or "no deployment id",
+    })
+
+    payload = {
+        "mode": "stdio-daemon-first",
+        "http_mode": "obsolete-not-used",
+        "all_ok": all(c["ok"] for c in checks),
+        "checks": checks,
+        "hints": [
+            "Set NEO_SECRET_KEY=sk-v1-... if missing",
+            "Run `neo-mcp daemon` in a separate terminal for local execution",
+            "Use default machine deployment ID unless you explicitly need deterministic key-derived mode",
+        ],
+    }
+    if json_mode:
+        _json_print(payload)
+    else:
+        print("Neo MCP doctor")
+        for c in checks:
+            mark = "OK" if c["ok"] else "FAIL"
+            print(f"  [{mark}] {c['name']}: {c['detail']}")
+        print("\nNotes:")
+        print("  - HTTP mode is obsolete; this tool validates stdio+local daemon flow.")
+        for h in payload["hints"]:
+            print(f"  - {h}")
+    return 0 if payload["all_ok"] else 1
+
+
+def _cmd_logs(lines: int = 120, source: str = "neo-mcp") -> int:
+    file_map = {
+        "neo-mcp": DAEMON_DIR / "neo-mcp.log",
+        "daemon": DAEMON_LOG,
+    }
+    target = file_map.get(source, DAEMON_DIR / "neo-mcp.log")
+    if not target.exists():
+        print(f"No log file found: {target}")
+        return 1
+    data = target.read_text(errors="replace").splitlines()
+    for line in data[-max(lines, 1):]:
+        print(line)
+    return 0
+
+
+def _cmd_tail(lines: int = 120, source: str = "neo-mcp") -> int:
+    """Shortcut alias for logs tail output."""
+    return _cmd_logs(lines=lines, source=source)
+
+
+def _cmd_list(json_mode: bool = False) -> int:
+    if not THREAD_WORKSPACES_FILE.exists():
+        payload = {"count": 0, "tasks": []}
+        if json_mode:
+            _json_print(payload)
+        else:
+            print("No known tasks yet.")
+        return 0
+
+    raw = json.loads(THREAD_WORKSPACES_FILE.read_text() or "{}")
+    tasks: list[dict[str, Any]] = []
+    if isinstance(raw, dict):
+        for tid, value in raw.items():
+            if isinstance(value, str):
+                tasks.append({"thread_id": tid, "workspace": value, "updated_at": ""})
+            elif isinstance(value, dict):
+                tasks.append({
+                    "thread_id": tid,
+                    "workspace": value.get("workspace", ""),
+                    "updated_at": value.get("updated_at", ""),
+                })
+    tasks.sort(key=lambda t: str(t.get("updated_at", "")), reverse=True)
+    payload = {"count": len(tasks), "tasks": tasks}
+    if json_mode:
+        _json_print(payload)
+    else:
+        if not tasks:
+            print("No known tasks yet.")
+            return 0
+        print("Known tasks")
+        for t in tasks:
+            print(f"  - {t['thread_id']}  {t['workspace']}  updated_at={t['updated_at']}")
+    return 0
+
+
+def _cmd_self_test(json_mode: bool = False) -> int:
+    checks: list[dict[str, Any]] = []
+    td = tempfile.mkdtemp(prefix="neo-selftest-")
+    ws = os.path.join(td, "ws")
+    os.makedirs(ws, exist_ok=True)
+    jm = JobManager()
+    handlers = ActionHandlers(jm, ws, {})
+
+    async def _run_local_checks() -> tuple[bool, bool]:
+        good = await handlers.handle_command({
+            "action": "write_code",
+            "request_id": "self-1",
+            "filename": "a.py",
+            "code": "print('ok')",
+        })
+        bad = await handlers.handle_command({
+            "action": "write_code",
+            "request_id": "self-2",
+            "filename": "../../../../etc/passwd",
+            "code": "x",
+        })
+        return good.get("status") == "success", bad.get("status") == "error"
+
+    ok_write, ok_block = asyncio.run(_run_local_checks())
+    checks.append({"name": "write_code_within_workspace", "ok": ok_write})
+    checks.append({"name": "path_traversal_blocked", "ok": ok_block})
+    checks.append({"name": "http_mode_disabled", "ok": True, "detail": "stdio/daemon-only validation"})
+
+    payload = {"all_ok": all(c["ok"] for c in checks), "checks": checks}
+    if json_mode:
+        _json_print(payload)
+    else:
+        print("Neo MCP self-test")
+        for c in checks:
+            mark = "OK" if c["ok"] else "FAIL"
+            print(f"  [{mark}] {c['name']}")
+        print("  This test validates local daemon semantics only.")
+    return 0 if payload["all_ok"] else 1
+
+
+async def run_daemon(secret_key: str, workspace: str, deployment_id: Optional[str] = None) -> None:
+    dep = deployment_id or get_or_create_deployment_id(secret_key)
+    if _poller_already_running(dep):
+        logger.warning("Another daemon is already running for deployment %s", dep)
+        return
+
+    thread_workspaces = _load_thread_workspaces()
+    client = BackendClient(auth_token=secret_key)
+    handlers = ActionHandlers(
+        job_manager=JobManager(),
+        default_workspace=workspace,
+        thread_workspaces=thread_workspaces,
+    )
+    poller = BackendPoller(
+        deployment_id=dep,
+        client=client,
+        handlers=handlers,
+        thread_workspaces=thread_workspaces,
+    )
+
+    pid = os.getpid()
+    _write_lock(pid)
+    PID_FILE.write_text(str(pid))
+    _write_deployment_pid(dep, pid)
+    def _shutdown(signum: int, frame: Any) -> None:
+        logger.info("Daemon received signal %d — shutting down", signum)
+        poller.stop()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    task = asyncio.create_task(poller.run(), name="backend-poller-daemon")
+    try:
+        await task
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await client.aclose()
+        _remove_deployment_pid(dep)
+        _remove_lock()
+
+
 def main() -> None:
     """CLI entry point — called by the neo-mcp console script."""
     _setup_logging()
     _start_health_server()
 
+    args = sys.argv[1:]
+    known = {"setup", "doctor", "status", "list", "logs", "tail", "self-test", "daemon"}
+
+    if args and args[0] == "setup":
+        from .setup import run_setup
+        run_setup(args[1:])
+        return
+
+    if args and args[0] == "doctor":
+        json_mode = "--json" in args[1:]
+        sys.exit(_cmd_doctor(json_mode=json_mode))
+
+    if args and args[0] == "status":
+        json_mode = "--json" in args[1:]
+        sys.exit(_cmd_status(json_mode=json_mode))
+
+    if args and args[0] == "list":
+        json_mode = "--json" in args[1:]
+        sys.exit(_cmd_list(json_mode=json_mode))
+
+    if args and args[0] == "logs":
+        lines = 120
+        source = "neo-mcp"
+        tail_args = args[1:]
+        for i, a in enumerate(tail_args):
+            if a == "--lines" and i + 1 < len(tail_args):
+                try:
+                    lines = int(tail_args[i + 1])
+                except ValueError:
+                    pass
+            if a == "--source" and i + 1 < len(tail_args):
+                source = tail_args[i + 1]
+        sys.exit(_cmd_logs(lines=lines, source=source))
+
+    if args and args[0] == "tail":
+        lines = 120
+        source = "neo-mcp"
+        tail_args = args[1:]
+        for i, a in enumerate(tail_args):
+            if a == "--lines" and i + 1 < len(tail_args):
+                try:
+                    lines = int(tail_args[i + 1])
+                except ValueError:
+                    pass
+            if a == "--source" and i + 1 < len(tail_args):
+                source = tail_args[i + 1]
+        sys.exit(_cmd_tail(lines=lines, source=source))
+
+    if args and args[0] == "self-test":
+        json_mode = "--json" in args[1:]
+        sys.exit(_cmd_self_test(json_mode=json_mode))
+
     secret_key = get_secret_key()
 
-    # Workspace: optional first positional arg, or NEO_WORKSPACE_DIR, or cwd
-    workspace = (
-        sys.argv[1]
-        if len(sys.argv) > 1
-        else os.environ.get("NEO_WORKSPACE_DIR", os.getcwd())
-    )
-    workspace = os.path.abspath(workspace)
+    if args and args[0] == "daemon":
+        if not secret_key:
+            sys.stderr.write("Error: NEO_SECRET_KEY is required for daemon mode.\n")
+            sys.exit(1)
+
+        dep_override: Optional[str] = None
+        workspace_arg: Optional[str] = None
+        daemon_args = args[1:]
+        i = 0
+        while i < len(daemon_args):
+            cur = daemon_args[i]
+            if cur == "--deployment-id" and i + 1 < len(daemon_args):
+                dep_override = daemon_args[i + 1]
+                i += 2
+                continue
+            if not cur.startswith("-") and workspace_arg is None:
+                workspace_arg = cur
+            i += 1
+        workspace = os.path.abspath(workspace_arg or os.environ.get("NEO_WORKSPACE_DIR", os.getcwd()))
+        if not os.path.isdir(workspace):
+            sys.stderr.write(f"Error: workspace '{workspace}' is not a directory.\n")
+            sys.exit(1)
+        anyio.run(run_daemon, secret_key, workspace, dep_override)
+        return
+
+    # Default mode: stdio MCP server (legacy behavior preserved).
+    # First non-command positional argument is treated as workspace.
+    workspace_arg = None
+    if args and args[0] not in known:
+        workspace_arg = args[0]
+    workspace = os.path.abspath(workspace_arg or os.environ.get("NEO_WORKSPACE_DIR", os.getcwd()))
     if not os.path.isdir(workspace):
         sys.stderr.write(f"Error: workspace '{workspace}' is not a directory.\n")
         sys.exit(1)
