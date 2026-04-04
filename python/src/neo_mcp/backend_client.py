@@ -148,11 +148,31 @@ class BackendClient:
         if workspace:
             payload["workspace"] = workspace
 
-        try:
-            resp = await self._http.post(url, json=payload, headers=self._headers())
-        except httpx.RequestError as exc:
-            raise RuntimeError(f"init_chat network error: {exc}") from exc
+        # Retry once on RemoteProtocolError — happens when the connection pool
+        # returns a keep-alive connection that the server has already closed.
+        # httpx auto-retries idempotent methods (GET) but not POST, so we do it
+        # ourselves. Second attempt always gets a fresh connection.
+        resp: Optional[httpx.Response] = None
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                resp = await self._http.post(url, json=payload, headers=self._headers())
+                last_exc = None
+                break
+            except httpx.RemoteProtocolError as exc:
+                last_exc = exc
+                if attempt == 0:
+                    logger.debug("init_chat: stale connection on attempt 1, retrying")
+                    continue
+            except httpx.TimeoutException as exc:
+                raise RuntimeError(f"init_chat timed out: {exc}") from exc
+            except httpx.RequestError as exc:
+                raise RuntimeError(f"init_chat network error: {exc}") from exc
 
+        if last_exc is not None:
+            raise RuntimeError(f"init_chat network error: {last_exc}") from last_exc
+
+        assert resp is not None
         if resp.status_code == 401:
             raise RuntimeError("UNAUTHORIZED")
         if not resp.is_success:
@@ -219,6 +239,8 @@ class BackendClient:
             resp = await self._http.post(
                 url, json={"input": message}, headers=self._headers()
             )
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(f"send_feedback timed out: {exc}") from exc
         except httpx.RequestError as exc:
             raise RuntimeError(f"send_feedback network error: {exc}") from exc
 
@@ -236,6 +258,8 @@ class BackendClient:
             resp = await self._http.post(
                 url, json={"signal": signal}, headers=self._headers()
             )
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(f"control_thread timed out: {exc}") from exc
         except httpx.RequestError as exc:
             raise RuntimeError(f"control_thread network error: {exc}") from exc
 
