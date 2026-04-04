@@ -32,6 +32,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from neo_mcp.action_handlers import ActionHandlers
+from neo_mcp.auth import get_or_create_deployment_id
 from neo_mcp.job_manager import JobManager, _Job
 
 
@@ -386,6 +387,31 @@ class TestListFiles(unittest.TestCase):
         lines = [l for l in res["data"]["stdout"].split("\n") if l.strip()]
         self.assertEqual(count, len(lines))
 
+    def test_skip_dirs_not_recursed(self):
+        """Directories in _SKIP_DIRS appear in listing but are not recursed into."""
+        for skip_name in ("venv", "node_modules", "__pycache__", ".tox", "dist", "build"):
+            skip_dir = Path(self.ws, skip_name)
+            skip_dir.mkdir()
+            Path(skip_dir, "inside.py").write_text("x")
+        res = self._list(include_hidden=True)
+        stdout = res["data"]["stdout"]
+        # Skip-dirs themselves should be listed
+        self.assertIn("venv", stdout)
+        self.assertIn("dist", stdout)
+        self.assertIn(".tox", stdout)
+        # But their contents must NOT appear
+        self.assertNotIn("inside.py", stdout)
+
+    def test_dirs_listed_before_files(self):
+        """Directories appear before files at each directory level."""
+        res = self._list()
+        lines = [l for l in res["data"]["stdout"].split("\n") if l.strip()]
+        # In workspace: sub/ (dir) and a.py (file) — sub should appear before a.py
+        dir_idx = next((i for i, l in enumerate(lines) if "|d|0" in l and "sub" in l), None)
+        file_idx = next((i for i, l in enumerate(lines) if "|f|" in l and "a.py" in l), None)
+        if dir_idx is not None and file_idx is not None:
+            self.assertLess(dir_idx, file_idx, "Directories should be listed before files")
+
 
 # ---------------------------------------------------------------------------
 # TestCreateSession
@@ -622,6 +648,67 @@ class TestWorkspaceRegistration(unittest.TestCase):
 
     def test_none_thread_id_returns_default(self):
         self.assertEqual(self.h._workspace_for(None), self._td)
+
+
+# ---------------------------------------------------------------------------
+# TestDeploymentIdIsolation
+# ---------------------------------------------------------------------------
+
+class TestDeploymentIdIsolation(unittest.TestCase):
+    """Verify that get_or_create_deployment_id() gives each machine a unique UUID."""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp()
+        self._orig_home = os.environ.get("HOME")
+        os.environ["HOME"] = self._td
+
+    def tearDown(self):
+        if self._orig_home is not None:
+            os.environ["HOME"] = self._orig_home
+        else:
+            del os.environ["HOME"]
+
+    def _daemon_file(self) -> Path:
+        return Path(self._td) / ".neo" / "daemon" / "standalone_deployment_id"
+
+    def test_creates_file_on_first_call(self):
+        """Generates UUID and writes standalone_deployment_id on first use."""
+        uid = get_or_create_deployment_id("sk-v1-test")
+        self.assertTrue(self._daemon_file().exists(), "standalone_deployment_id should be written")
+        self.assertEqual(uid, self._daemon_file().read_text().strip())
+
+    def test_stable_across_calls(self):
+        """Repeated calls return the same UUID once the file exists."""
+        uid1 = get_or_create_deployment_id("sk-v1-test")
+        uid2 = get_or_create_deployment_id("sk-v1-test")
+        self.assertEqual(uid1, uid2)
+
+    def test_not_derived_from_key(self):
+        """UUID must NOT be deterministically derived from the key (prevents collision)."""
+        import hashlib, uuid as _uuid
+        digest = hashlib.sha256(b"sk-v1-test").digest()[:16]
+        key_derived = str(_uuid.UUID(bytes=digest, version=5))
+        uid = get_or_create_deployment_id("sk-v1-test")
+        self.assertNotEqual(uid, key_derived, "UUID must be random, not key-derived")
+
+    def test_honours_existing_file(self):
+        """If standalone_deployment_id already exists, use it."""
+        daemon_dir = Path(self._td) / ".neo" / "daemon"
+        daemon_dir.mkdir(parents=True)
+        (daemon_dir / "standalone_deployment_id").write_text("my-persisted-uuid")
+        uid = get_or_create_deployment_id("sk-v1-test")
+        self.assertEqual(uid, "my-persisted-uuid")
+
+    def test_two_fresh_machines_get_different_uuids(self):
+        """Simulates two machines: each generates an independent random UUID."""
+        uid_machine1 = get_or_create_deployment_id("sk-v1-same-key")
+
+        # Simulate a second machine: remove the written file
+        self._daemon_file().unlink()
+        uid_machine2 = get_or_create_deployment_id("sk-v1-same-key")
+
+        self.assertNotEqual(uid_machine1, uid_machine2,
+                            "Same key on two machines must produce different UUIDs")
 
 
 if __name__ == "__main__":

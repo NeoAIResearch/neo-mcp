@@ -14,6 +14,10 @@ PID_FILE: Path = DAEMON_DIR / "neo-mcp.pid"
 # Append-only log of daemon starts: {"sandboxId": "...", "source": "neo-mcp"}
 DAEMON_LOG: Path = DAEMON_DIR / "daemon.log"
 
+# Machine-specific deployment UUID written by the npm daemon on first run.
+# Mirrors npm/src/paths.ts STANDALONE_UUID_FILE.
+STANDALONE_UUID_FILE: Path = DAEMON_DIR / "standalone_deployment_id"
+
 # thread_id → workspace path mapping written by daemon, read by MCP tools
 THREAD_WORKSPACES_FILE: Path = DAEMON_DIR / "thread-workspaces.json"
 

@@ -357,7 +357,8 @@ function hListFiles(cmd: Command, workspace: string): ActionResult {
     return { request_id: cmd.request_id, status: 'error', error: `Directory not found: ${directory}` };
   }
 
-  const lines: string[] = [`${target}|d|0`];
+  // Target directory itself is NOT included — matches VS Code extension and Python daemon.
+  const lines: string[] = [];
 
   function walk(dir: string, depth: number): void {
     if (depth > maxDepth) return;
@@ -367,9 +368,11 @@ function hListFiles(cmd: Command, workspace: string): ActionResult {
     } catch {
       return;
     }
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-    for (const entry of entries) {
-      if (!includeHidden && entry.name.startsWith('.')) continue;
+    // Dirs first, then files — each group sorted alphabetically.
+    // Mirrors VS Code DaemonActionHandlers and Python action_handlers.
+    const dirs = entries.filter(e => e.isDirectory() && (includeHidden || !e.name.startsWith('.'))).sort((a, b) => a.name.localeCompare(b.name));
+    const files = entries.filter(e => e.isFile() && (includeHidden || !e.name.startsWith('.'))).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of [...dirs, ...files]) {
       const fullPath = join(dir, entry.name);
       if (entry.isDirectory()) {
         lines.push(`${fullPath}|d|0`);

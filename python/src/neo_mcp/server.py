@@ -33,7 +33,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from .action_handlers import ActionHandlers
-from .auth import derive_deployment_id, get_secret_key
+from .auth import get_or_create_deployment_id, get_secret_key
 from .backend_client import BackendClient
 from .backend_poller import BackendPoller
 from .job_manager import JobManager
@@ -119,7 +119,7 @@ def build_server(
     workspace: str,
 ) -> tuple[Server, BackendClient, BackendPoller]:
     """Build and wire the MCP server, client, and poller. Returns all three."""
-    deployment_id = derive_deployment_id(secret_key)
+    deployment_id = get_or_create_deployment_id(secret_key)
     thread_workspaces = _load_thread_workspaces()
 
     client = BackendClient(auth_token=secret_key)
@@ -556,13 +556,8 @@ async def run(secret_key: str, workspace: str) -> None:
 
     pid = os.getpid()
     poller_task: Optional[asyncio.Task] = None
-    deployment_id = derive_deployment_id(secret_key)
-
-    # Lock file — single poller instance; also yield to Go/npm/extension daemons
-    _no_daemon = os.environ.get("NEO_NO_DAEMON", "").lower() in ("1", "true", "yes")
-    if _no_daemon:
-        logger.info("NEO_NO_DAEMON is set — skipping local poller (bridge/hosted mode)")
-    elif _poller_already_running(deployment_id):
+    deployment_id = get_or_create_deployment_id(secret_key)
+    if _poller_already_running(deployment_id):
         logger.warning(
             "Another daemon is already running for deployment %s. "
             "MCP server will start without a local poller.",
