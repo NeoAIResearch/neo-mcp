@@ -9,7 +9,7 @@ API_URL: str = (
 )
 
 # Poll parameters (mirroring BackendPoller.ts defaults)
-POLL_MAX_MESSAGES: int = 20
+POLL_MAX_MESSAGES: int = 10
 POLL_WAIT_TIME: int = 5           # seconds — backend long-poll window
 POLL_BASE_INTERVAL: float = 2.0   # seconds between poll cycles
 POLL_MAX_INTERVAL: float = 60.0   # cap for exponential backoff
