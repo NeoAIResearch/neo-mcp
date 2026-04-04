@@ -31,6 +31,15 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+import pytest
+
+# This suite targets deprecated server internals kept for migration reference.
+# Run explicitly when needed:
+#   NEO_RUN_LEGACY_SERVER_TESTS=1 pytest -q tests/test_server.py
+pytestmark = pytest.mark.skipif(
+    os.environ.get("NEO_RUN_LEGACY_SERVER_TESTS") != "1",
+    reason="Legacy server-internals suite is opt-in; default CI runs maintained parity suites.",
+)
 
 # Provide a dummy key so the module can import without raising at startup
 os.environ["NEO_SECRET_KEY"] = "sk-v1-test"

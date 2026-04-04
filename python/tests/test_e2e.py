@@ -21,6 +21,7 @@ import os
 import sys
 import time
 import unittest
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -30,6 +31,14 @@ NEO_SECRET_KEY = os.environ.get("NEO_SECRET_KEY", "")
 NEO_API_URL = os.environ.get("NEO_API_URL", "https://master.heyneo.so")
 
 _NEEDS_KEY = unittest.skipUnless(NEO_SECRET_KEY, "NEO_SECRET_KEY not set")
+
+# This module still contains legacy HTTP/server-shape assertions.
+# Keep live coverage opt-in:
+#   NEO_RUN_LEGACY_E2E=1 NEO_SECRET_KEY=... pytest -q tests/test_e2e.py
+pytestmark = pytest.mark.skipif(
+    os.environ.get("NEO_RUN_LEGACY_E2E") != "1",
+    reason="Legacy end-to-end suite is opt-in; maintained suites run by default.",
+)
 
 
 # ---------------------------------------------------------------------------

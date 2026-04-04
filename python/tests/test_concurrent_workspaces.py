@@ -660,6 +660,8 @@ class TestDeploymentIdIsolation(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.mkdtemp()
         self._orig_home = os.environ.get("HOME")
+        self._orig_dep = os.environ.get("NEO_DEPLOYMENT_ID")
+        self._orig_mode = os.environ.get("NEO_DEPLOYMENT_ID_MODE")
         os.environ["HOME"] = self._td
 
     def tearDown(self):
@@ -667,6 +669,14 @@ class TestDeploymentIdIsolation(unittest.TestCase):
             os.environ["HOME"] = self._orig_home
         else:
             del os.environ["HOME"]
+        if self._orig_dep is not None:
+            os.environ["NEO_DEPLOYMENT_ID"] = self._orig_dep
+        else:
+            os.environ.pop("NEO_DEPLOYMENT_ID", None)
+        if self._orig_mode is not None:
+            os.environ["NEO_DEPLOYMENT_ID_MODE"] = self._orig_mode
+        else:
+            os.environ.pop("NEO_DEPLOYMENT_ID_MODE", None)
 
     def _daemon_file(self) -> Path:
         return Path(self._td) / ".neo" / "daemon" / "standalone_deployment_id"
@@ -709,6 +719,17 @@ class TestDeploymentIdIsolation(unittest.TestCase):
 
         self.assertNotEqual(uid_machine1, uid_machine2,
                             "Same key on two machines must produce different UUIDs")
+
+    def test_explicit_env_override_takes_priority(self):
+        os.environ["NEO_DEPLOYMENT_ID"] = "explicit-uuid-123"
+        uid = get_or_create_deployment_id("sk-v1-test")
+        self.assertEqual(uid, "explicit-uuid-123")
+
+    def test_key_derived_mode_is_deterministic_when_enabled(self):
+        os.environ["NEO_DEPLOYMENT_ID_MODE"] = "key-derived"
+        uid1 = get_or_create_deployment_id("sk-v1-test")
+        uid2 = get_or_create_deployment_id("sk-v1-test")
+        self.assertEqual(uid1, uid2)
 
 
 if __name__ == "__main__":
