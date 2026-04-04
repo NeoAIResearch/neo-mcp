@@ -732,5 +732,64 @@ class TestDeploymentIdIsolation(unittest.TestCase):
         self.assertEqual(uid1, uid2)
 
 
+# ---------------------------------------------------------------------------
+# TestSymlinkEscape (Test 7 parity — both pip and npm)
+# ---------------------------------------------------------------------------
+
+class TestSymlinkEscape(unittest.TestCase):
+    """Verify symlinks inside workspace cannot be used to escape to external paths."""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp()
+        self.ws = os.path.join(self._td, "workspace")
+        os.makedirs(self.ws)
+        self.h = make_handlers(self._td, workspace=self.ws,
+                               thread_workspaces={"t1": self.ws})
+        # Create a symlink inside workspace pointing to /etc (outside workspace)
+        self.symlink = os.path.join(self.ws, "outside-link")
+        os.symlink("/etc", self.symlink)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._td, ignore_errors=True)
+
+    def test_write_via_symlink_is_blocked(self):
+        """Writing outside-link/passwd must not reach /etc/passwd."""
+        res = arun(self.h.handle_command({
+            "action": "write_code", "request_id": "r", "thread_id": "t1",
+            "filename": "outside-link/passwd", "code": "evil",
+        }))
+        self.assertEqual(res["status"], "error")
+        self.assertIn("traversal", res["error"].lower())
+        # Confirm /etc/passwd was NOT modified
+        self.assertNotEqual(Path("/etc/passwd").read_text(), "evil")
+
+    def test_absolute_symlink_path_remapped_not_written_to_etc(self):
+        """Absolute path through symlink → remapped into workspace, never /etc."""
+        res = arun(self.h.handle_command({
+            "action": "write_code", "request_id": "r", "thread_id": "t1",
+            "filename": os.path.join(self.ws, "outside-link", "test.conf"),
+            "code": "evil",
+        }))
+        if res["status"] == "success":
+            p = Path(res["data"]["file_path"])
+            self.assertTrue(str(p).startswith(self.ws),
+                            f"Write escaped workspace to {p}")
+        # Either blocked or remapped into workspace — /etc must be untouched
+        self.assertFalse(Path("/etc/test.conf").exists(),
+                         "File was written to /etc via symlink escape!")
+
+    def test_get_file_via_symlink_blocked_or_remapped(self):
+        """Reading outside-link/hostname must not read /etc/hostname directly."""
+        res = arun(self.h.handle_command({
+            "action": "get_file", "request_id": "r", "thread_id": "t1",
+            "file_path": "outside-link/hostname",
+        }))
+        if res["status"] == "success":
+            self.assertTrue(res["data"]["file_path"].startswith(self.ws),
+                            f"get_file leaked outside workspace: {res['data']['file_path']}")
+        # error (blocked or not found) is also acceptable
+
+
 if __name__ == "__main__":
     unittest.main()

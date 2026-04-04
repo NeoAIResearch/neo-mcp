@@ -6,7 +6,7 @@
 
 import { randomUUID } from 'crypto';
 import { spawn, ChildProcess } from 'child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { dirname, isAbsolute, join, relative, resolve } from 'path';
 
@@ -78,11 +78,43 @@ function cleanupOldJobs(): void {
 // Path safety — mirrors Python _safe_resolve()
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolve symlinks in a path, handling non-existent tails gracefully.
+ *
+ * realpathSync() throws if any component doesn't exist yet (e.g. a new file
+ * about to be written).  We walk up the path to find the longest existing
+ * prefix, resolve symlinks there, then re-append the non-existent tail.
+ *
+ * This ensures symlinks inside the workspace (e.g. outside-link → /etc) are
+ * followed before the safety check, matching Python's Path.resolve() semantics.
+ */
+export function realResolve(p: string): string {
+  const normalized = resolve(p);
+  try {
+    return realpathSync(normalized);
+  } catch {
+    // Walk up path components until we find an existing prefix to resolve.
+    const parts = normalized.split('/').filter(Boolean);
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const prefix = '/' + parts.slice(0, i + 1).join('/');
+      try {
+        const real = realpathSync(prefix);
+        const rest = parts.slice(i + 1).join('/');
+        return rest ? join(real, rest) : real;
+      } catch {
+        continue;
+      }
+    }
+    return normalized;
+  }
+}
+
 export function safeResolve(workspace: string, pathStr: string): string | null {
   const home = homedir();
   const tmp = tmpdir();
-  // On macOS, /tmp is a symlink to /private/tmp — include both so resolve() never surprises us
-  const allowed = [workspace, home, tmp, resolve(tmp)].filter(Boolean).map(p => resolve(p));
+  // On macOS, /tmp is a symlink to /private/tmp — include both so resolve() never surprises us.
+  // Use realResolve so the allowed-roots list also has symlinks followed.
+  const allowed = [workspace, home, tmp, resolve(tmp)].filter(Boolean).map(p => realResolve(resolve(p)));
 
   function isWithin(root: string, target: string): boolean {
     const rel = relative(root, target);
@@ -90,11 +122,13 @@ export function safeResolve(workspace: string, pathStr: string): string | null {
   }
 
   if (isAbsolute(pathStr)) {
-    const r = resolve(pathStr);
+    // Follow symlinks before checking containment — prevents symlink escape.
+    const r = realResolve(pathStr);
     return allowed.some(a => isWithin(a, r)) ? r : null;
   }
-  const w = resolve(workspace);
-  const r = resolve(join(w, pathStr));
+  const w = realResolve(resolve(workspace));
+  // Follow symlinks in the joined path — catches symlinks inside the workspace.
+  const r = realResolve(resolve(join(w, pathStr)));
   return isWithin(w, r) ? r : null;
 }
 

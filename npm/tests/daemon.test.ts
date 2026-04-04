@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, symlinkSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
 import { deriveDeploymentId } from '../src/auth.js';
 import { pidFileForDeployment, DAEMON_LOG } from '../src/paths.js';
 import { getOrCreateDeploymentId, runDaemon } from '../src/daemon.js';
+import { safeResolve } from '../src/executor.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -261,5 +262,43 @@ describe('daemon: 401 refresh retry', () => {
     });
 
     expect(requestCount).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// safeResolve: symlink escape prevention (Test 7 parity)
+// ---------------------------------------------------------------------------
+
+describe('safeResolve: symlink escape blocked', () => {
+  let ws: string;
+  let symlinkPath: string;
+
+  beforeEach(() => {
+    ws = mkdtempSync(join(tmpdir(), 'neo-symlink-test-'));
+    symlinkPath = join(ws, 'outside-link');
+    // Symlink inside workspace pointing to /etc (outside workspace and not in allowed dirs)
+    symlinkSync('/etc', symlinkPath);
+  });
+
+  afterEach(() => {
+    try { unlinkSync(symlinkPath); } catch { /* ignore */ }
+    rmSync(ws, { recursive: true, force: true });
+  });
+
+  it('blocks relative path that traverses a symlink pointing outside workspace', () => {
+    // outside-link → /etc, so "outside-link/passwd" would reach /etc/passwd without symlink check
+    const result = safeResolve(ws, 'outside-link/passwd');
+    expect(result).toBeNull();
+  });
+
+  it('blocks absolute path inside workspace that traverses a symlink', () => {
+    const result = safeResolve(ws, join(ws, 'outside-link', 'passwd'));
+    expect(result).toBeNull();
+  });
+
+  it('still allows normal relative paths inside workspace', () => {
+    const result = safeResolve(ws, 'src/model.py');
+    expect(result).not.toBeNull();
+    expect(result).toContain(ws);
   });
 });
