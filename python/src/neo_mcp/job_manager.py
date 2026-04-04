@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 MAX_LOG_BYTES = 10 * 1024 * 1024  # 10 MB per stream
 JOB_TTL = 24 * 60 * 60            # 24 hours in seconds
+JOB_MAX_RUNTIME = 30 * 60         # 30 minutes — kill hung subprocesses
 
 
 @dataclass
@@ -153,14 +154,26 @@ class JobManager:
             )
             job.pid = proc.pid
 
-            # Stream stdout and stderr concurrently into memory + log files
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(
-                    self._stream_output(proc.stdout, job, "stdout", stdout_path)
+            # Stream stdout and stderr concurrently into memory + log files,
+            # with a hard timeout to kill hung subprocesses.
+            try:
+                async with asyncio.timeout(JOB_MAX_RUNTIME):
+                    async with asyncio.TaskGroup() as tg:
+                        tg.create_task(
+                            self._stream_output(proc.stdout, job, "stdout", stdout_path)
+                        )
+                        tg.create_task(
+                            self._stream_output(proc.stderr, job, "stderr", stderr_path)
+                        )
+            except TimeoutError:
+                logger.warning(
+                    "Job %s exceeded max runtime (%ds) — killing", job.job_id, JOB_MAX_RUNTIME
                 )
-                tg.create_task(
-                    self._stream_output(proc.stderr, job, "stderr", stderr_path)
-                )
+                job.stderr += f"\n[Killed: exceeded {JOB_MAX_RUNTIME}s max runtime]"
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
 
             job.exit_code = await proc.wait()
         except asyncio.CancelledError:
