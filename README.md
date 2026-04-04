@@ -96,7 +96,7 @@ The MCP server runs at `https://mcpserver.heyneo.com/mcp` — nothing to install
 pipx install neo-mcp   # use pipx to avoid system Python conflicts
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-YOUR_KEY \
-  -- neo-mcp
+  -- $(which neo-mcp)
 ```
 
 > `pipx` is recommended over `pip` — it installs CLI tools in isolated environments and works on all platforms. Install it with `apt install pipx` or `pip install pipx`.
@@ -252,12 +252,13 @@ neo_get_messages →  read output of any COMPLETED task
 
 ### Claude Code
 
+
 ```bash
 # pip (local stdio — most reliable, auto-starts daemon)
-pip install neo-mcp
+pipx install neo-mcp
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-... \
-  -- neo-mcp
+  -- $(which neo-mcp)
 
 # Hosted HTTP server (no install needed)
 claude mcp add --scope user neo \

@@ -104,7 +104,7 @@ To register Neo with Claude Code:
 pipx install neo-mcp   # use pipx to avoid system Python conflicts
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-your-key \
-  -- neo-mcp
+  -- $(which neo-mcp)
 
 # Option 2: Hosted HTTP server (no local install, works with any editor)
 claude mcp add --scope user neo \
