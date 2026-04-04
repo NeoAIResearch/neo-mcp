@@ -636,7 +636,11 @@ def _start_health_server() -> None:
         def log_message(self, *args: Any) -> None:
             pass  # silence access logs
 
-    server = HTTPServer(("0.0.0.0", port), _Handler)
+    try:
+        server = HTTPServer(("0.0.0.0", port), _Handler)
+    except OSError:
+        logger.warning("Health server port %d already in use — skipping health endpoint", port)
+        return
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     logger.info("Health server listening on port %d", port)
