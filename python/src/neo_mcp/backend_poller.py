@@ -25,6 +25,7 @@ from .config import POLL_BACKOFF_FACTOR, POLL_BASE_INTERVAL, POLL_MAX_INTERVAL, 
 from .paths import DAEMON_DIR, DAEMON_LOG, THREAD_WORKSPACES_FILE
 
 logger = logging.getLogger(__name__)
+_TRACE_ROUTING = os.environ.get("NEO_TRACE_ROUTING", "").strip().lower() in {"1", "true", "yes", "on"}
 
 _ACCEPTED_STATUSES = frozenset({"RUNNING", "PAUSED"})
 
@@ -206,11 +207,14 @@ class BackendPoller:
 
         # If this thread still has no registered workspace, reload from disk —
         # covers the case where a daemon restart lost in-memory state.
+        workspace_source = "memory"
         if thread_id and thread_id not in self._thread_workspaces:
             fresh = BackendPoller._load_thread_workspaces()
             if thread_id in fresh:
                 self._thread_workspaces.update(fresh)
+                workspace_source = "disk-reload"
             else:
+                workspace_source = "default-fallback"
                 logger.warning(
                     "No workspace registered for thread %s — using default: %s",
                     thread_id, self._handlers._default_workspace,
@@ -227,6 +231,14 @@ class BackendPoller:
         response["sandbox_id"] = deployment_id
         if thread_id:
             response["thread_id"] = thread_id
+            if _TRACE_ROUTING:
+                logger.info(
+                    "Routing trace: thread=%s workspace=%s source=%s action=%s",
+                    thread_id,
+                    self._thread_workspaces.get(thread_id, self._handlers._default_workspace),
+                    workspace_source,
+                    action,
+                )
         if response_queue:
             response["response_queue_name"] = response_queue
 

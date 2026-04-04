@@ -7,7 +7,7 @@ Coverage:
   - run_setup: no extension + existing token → login skipped
   - run_setup: remote mode + extension → daemon not started
   - run_setup: remote mode + no extension → daemon started
-  - run_setup: deployment_id from extension used in editor config
+  - run_setup: machine deployment_id passed to editor config
 """
 from __future__ import annotations
 
@@ -181,9 +181,8 @@ class TestRunSetupExtensionDetected(unittest.TestCase):
         _, mock_daemon, _ = self._run(remote=True)
         mock_daemon.assert_not_called()
 
-    def test_extension_detected_deployment_id_is_key_derived(self):
-        """When extension is running, setup uses the key-derived deployment_id
-        (extension's actual UUID is not accessible from files at setup time)."""
+    def test_extension_detected_sets_deployment_id_for_remote_config(self):
+        """When extension is running, setup still passes deployment_id for HTTP routing."""
         captured_opts = {}
 
         def fake_configurator(sk, opts):
@@ -202,9 +201,8 @@ class TestRunSetupExtensionDetected(unittest.TestCase):
             setup_mod.run_setup(args)
 
         dep_id = captured_opts.get("deployment_id", "")
-        # Must be a stable key-derived UUID (not empty, not the old log-based ID)
+        # Must be non-empty UUID-like value for X-Neo-Deployment-Id routing
         self.assertTrue(dep_id, "deployment_id must be set in remote mode")
-        # Must be a valid UUID format
         import re
         self.assertRegex(dep_id, r"^[a-f0-9\-]{36}$")
 
@@ -257,8 +255,8 @@ class TestRunSetupNoExtension(unittest.TestCase):
         mock_login, _ = self._run(has_token=False, remote=False, login_succeeds=False)
         mock_login.assert_not_called()
 
-    def test_no_extension_key_derived_id_used_remote(self):
-        """Without extension, deployment_id is derived from API key."""
+    def test_no_extension_machine_id_used_remote(self):
+        """Without extension, setup passes machine deployment_id in remote mode."""
         captured_opts = {}
 
         def fake_configurator(sk, opts):
@@ -277,14 +275,80 @@ class TestRunSetupNoExtension(unittest.TestCase):
             setup_mod.run_setup(args)
 
         dep_id = captured_opts.get("deployment_id", "")
-        # Must be a non-empty string (the key-derived UUID)
+        # Must be a non-empty UUID-like value
         self.assertTrue(dep_id, "deployment_id should be set in remote mode")
-        # Must differ from extension ID (which is empty here)
-        self.assertNotEqual(dep_id, "")
+        import re
+        self.assertRegex(dep_id, r"^[a-f0-9\-]{36}$")
 
 
 # ---------------------------------------------------------------------------
-# 3. Detection correctness: _vscode_extension_running vs daemon.log approach
+# 3. Remote config wiring: X-Neo-Deployment-Id header
+# ---------------------------------------------------------------------------
+
+class TestRemoteConfigHeaders(unittest.TestCase):
+    def test_configure_claude_cli_includes_deployment_header(self):
+        with patch("shutil.which", return_value="/usr/bin/claude"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            ok, _ = setup_mod._configure_claude("sk-v1-test", {
+                "remote": True,
+                "scope": "user",
+                "deployment_id": "11111111-2222-3333-4444-555555555555",
+            })
+        self.assertTrue(ok)
+        cmd = mock_run.call_args.args[0]
+        joined = " ".join(cmd)
+        self.assertIn("Authorization: Bearer sk-v1-test", joined)
+        self.assertIn("X-Neo-Deployment-Id: 11111111-2222-3333-4444-555555555555", joined)
+
+    def test_configure_cursor_remote_writes_deployment_header(self):
+        tmpdir = tempfile.mkdtemp()
+        fake_home = Path(tmpdir)
+        with patch.object(Path, "home", return_value=fake_home):
+            ok, _ = setup_mod._configure_cursor("sk-v1-test", {
+                "remote": True,
+                "deployment_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "no_backup": True,
+            })
+            self.assertTrue(ok)
+            data = json.loads((fake_home / ".cursor" / "mcp.json").read_text())
+            headers = data["mcpServers"]["neo"]["headers"]
+            self.assertEqual(headers["Authorization"], "Bearer sk-v1-test")
+            self.assertEqual(headers["X-Neo-Deployment-Id"], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+    def test_configure_windsurf_remote_writes_deployment_header(self):
+        tmpdir = tempfile.mkdtemp()
+        fake_home = Path(tmpdir)
+        with patch.object(Path, "home", return_value=fake_home):
+            ok, _ = setup_mod._configure_windsurf("sk-v1-test", {
+                "remote": True,
+                "deployment_id": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+                "no_backup": True,
+            })
+            self.assertTrue(ok)
+            data = json.loads((fake_home / ".codeium" / "windsurf" / "mcp_config.json").read_text())
+            headers = data["mcpServers"]["neo"]["headers"]
+            self.assertEqual(headers["Authorization"], "Bearer sk-v1-test")
+            self.assertEqual(headers["X-Neo-Deployment-Id"], "bbbbbbbb-cccc-dddd-eeee-ffffffffffff")
+
+    def test_configure_vscode_remote_writes_deployment_header(self):
+        tmpdir = tempfile.mkdtemp()
+        cwd = Path(tmpdir)
+        with patch.object(Path, "cwd", return_value=cwd):
+            ok, _ = setup_mod._configure_vscode("sk-v1-test", {
+                "remote": True,
+                "deployment_id": "99999999-aaaa-bbbb-cccc-dddddddddddd",
+                "no_backup": True,
+            })
+            self.assertTrue(ok)
+            data = json.loads((cwd / ".vscode" / "mcp.json").read_text())
+            headers = data["servers"]["neo"]["headers"]
+            self.assertEqual(headers["Authorization"], "Bearer sk-v1-test")
+            self.assertEqual(headers["X-Neo-Deployment-Id"], "99999999-aaaa-bbbb-cccc-dddddddddddd")
+
+
+# ---------------------------------------------------------------------------
+# 4. Detection correctness: _vscode_extension_running vs daemon.log approach
 # ---------------------------------------------------------------------------
 
 class TestExtensionDetectionCorrectness(unittest.TestCase):

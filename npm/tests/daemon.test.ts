@@ -1,11 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'fs';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, existsSync, readFileSync, symlinkSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
 import { deriveDeploymentId } from '../src/auth.js';
-import { pidFileForDeployment, DAEMON_LOG, NPM_PID_FILE } from '../src/paths.js';
-import { runDaemon } from '../src/daemon.js';
+import { pidFileForDeployment, DAEMON_LOG } from '../src/paths.js';
+import { getOrCreateDeploymentId, runDaemon } from '../src/daemon.js';
+import { safeResolve } from '../src/executor.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -32,19 +33,69 @@ async function runDaemonBriefly(
 }
 
 // ---------------------------------------------------------------------------
-// Deployment ID derivation
+// Deployment ID selection policy
 // ---------------------------------------------------------------------------
 
-describe('deployment ID derivation', () => {
-  it('derives a stable UUID v5 from NEO_SECRET_KEY', () => {
-    const id1 = deriveDeploymentId('sk-v1-test');
-    const id2 = deriveDeploymentId('sk-v1-test');
-    expect(id1).toBe(id2);
-    expect(id1).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+describe('deployment ID selection', () => {
+  const ORIG_DEPLOYMENT_ID = process.env['NEO_DEPLOYMENT_ID'];
+  const ORIG_MODE = process.env['NEO_DEPLOYMENT_ID_MODE'];
+  const ORIG_SK = process.env['NEO_SECRET_KEY'];
+
+  afterEach(() => {
+    if (ORIG_DEPLOYMENT_ID !== undefined) process.env['NEO_DEPLOYMENT_ID'] = ORIG_DEPLOYMENT_ID;
+    else delete process.env['NEO_DEPLOYMENT_ID'];
+    if (ORIG_MODE !== undefined) process.env['NEO_DEPLOYMENT_ID_MODE'] = ORIG_MODE;
+    else delete process.env['NEO_DEPLOYMENT_ID_MODE'];
+    if (ORIG_SK !== undefined) process.env['NEO_SECRET_KEY'] = ORIG_SK;
+    else delete process.env['NEO_SECRET_KEY'];
   });
 
-  it('different keys → different UUIDs', () => {
-    expect(deriveDeploymentId('sk-v1-a')).not.toBe(deriveDeploymentId('sk-v1-b'));
+  it('honors explicit NEO_DEPLOYMENT_ID override', () => {
+    process.env['NEO_DEPLOYMENT_ID'] = 'explicit-id-123';
+    expect(getOrCreateDeploymentId()).toBe('explicit-id-123');
+  });
+
+  it('explicit override wins over key-derived mode', () => {
+    process.env['NEO_DEPLOYMENT_ID'] = 'explicit-id-priority';
+    process.env['NEO_DEPLOYMENT_ID_MODE'] = 'key-derived';
+    process.env['NEO_SECRET_KEY'] = 'sk-v1-mode-key';
+    expect(getOrCreateDeploymentId()).toBe('explicit-id-priority');
+  });
+
+  it('uses machine-persisted UUID by default', () => {
+    delete process.env['NEO_DEPLOYMENT_ID'];
+    delete process.env['NEO_DEPLOYMENT_ID_MODE'];
+    process.env['NEO_SECRET_KEY'] = 'sk-v1-test';
+    const id1 = getOrCreateDeploymentId();
+    const id2 = getOrCreateDeploymentId();
+    expect(id1).toBe(id2);
+    expect(id1).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('uses deterministic key-derived UUID when mode=key-derived', () => {
+    delete process.env['NEO_DEPLOYMENT_ID'];
+    process.env['NEO_DEPLOYMENT_ID_MODE'] = 'key-derived';
+    process.env['NEO_SECRET_KEY'] = 'sk-v1-mode-test';
+    const id = getOrCreateDeploymentId();
+    expect(id).toBe(deriveDeploymentId('sk-v1-mode-test'));
+  });
+
+  it('falls back to machine UUID when mode=key-derived but token missing', () => {
+    delete process.env['NEO_DEPLOYMENT_ID'];
+    process.env['NEO_DEPLOYMENT_ID_MODE'] = 'key-derived';
+    delete process.env['NEO_SECRET_KEY'];
+    const id = getOrCreateDeploymentId();
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('default machine UUID remains stable even if API key changes', () => {
+    delete process.env['NEO_DEPLOYMENT_ID'];
+    delete process.env['NEO_DEPLOYMENT_ID_MODE'];
+    process.env['NEO_SECRET_KEY'] = 'sk-v1-first';
+    const id1 = getOrCreateDeploymentId();
+    process.env['NEO_SECRET_KEY'] = 'sk-v1-second';
+    const id2 = getOrCreateDeploymentId();
+    expect(id1).toBe(id2);
   });
 });
 
@@ -92,11 +143,11 @@ describe('daemon lifecycle: empty poll', () => {
   });
 
   it('writes per-deployment PID file on startup', async () => {
-    const depId = deriveDeploymentId('sk-v1-test');
+    process.env['NEO_DEPLOYMENT_ID'] = '12345678-1111-2222-3333-444444444444';
     await runDaemonBriefly({ workspace: ws, delayMs: 150 }, async () =>
       new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
     );
-    const pidFile = pidFileForDeployment(depId);
+    const pidFile = pidFileForDeployment('12345678-1111-2222-3333-444444444444');
     // PID file is cleaned up on shutdown — just verify it ran without crashing
     expect(true).toBe(true);
   });
@@ -211,5 +262,43 @@ describe('daemon: 401 refresh retry', () => {
     });
 
     expect(requestCount).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// safeResolve: symlink escape prevention (Test 7 parity)
+// ---------------------------------------------------------------------------
+
+describe('safeResolve: symlink escape blocked', () => {
+  let ws: string;
+  let symlinkPath: string;
+
+  beforeEach(() => {
+    ws = mkdtempSync(join(tmpdir(), 'neo-symlink-test-'));
+    symlinkPath = join(ws, 'outside-link');
+    // Symlink inside workspace pointing to /etc (outside workspace and not in allowed dirs)
+    symlinkSync('/etc', symlinkPath);
+  });
+
+  afterEach(() => {
+    try { unlinkSync(symlinkPath); } catch { /* ignore */ }
+    rmSync(ws, { recursive: true, force: true });
+  });
+
+  it('blocks relative path that traverses a symlink pointing outside workspace', () => {
+    // outside-link → /etc, so "outside-link/passwd" would reach /etc/passwd without symlink check
+    const result = safeResolve(ws, 'outside-link/passwd');
+    expect(result).toBeNull();
+  });
+
+  it('blocks absolute path inside workspace that traverses a symlink', () => {
+    const result = safeResolve(ws, join(ws, 'outside-link', 'passwd'));
+    expect(result).toBeNull();
+  });
+
+  it('still allows normal relative paths inside workspace', () => {
+    const result = safeResolve(ws, 'src/model.py');
+    expect(result).not.toBeNull();
+    expect(result).toContain(ws);
   });
 });
