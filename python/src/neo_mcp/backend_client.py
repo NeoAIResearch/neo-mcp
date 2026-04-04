@@ -32,25 +32,23 @@ logger = logging.getLogger(__name__)
 
 # Connection pool limits — enough for concurrent command handlers without
 # exhausting local file descriptors.
-_POOL_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=20)
-
-# Evict idle keep-alive connections after this many seconds. Prevents stale
-# connections accumulating in long-running processes (the server backend
-# typically closes idle connections after ~60 s on its end).
-_KEEPALIVE_EXPIRY = 30.0
+# Evict idle keep-alive connections after 30 s. Prevents stale connections
+# accumulating in long-running processes (backend closes idle connections
+# after ~60 s, so we evict first to avoid RemoteProtocolError / PoolTimeout).
+_POOL_LIMITS = httpx.Limits(
+    max_connections=40,
+    max_keepalive_connections=20,
+    keepalive_expiry=30.0,
+)
 
 
 class BackendClient:
     def __init__(self, auth_token: str, base_url: str = API_URL) -> None:
         self._base_url = base_url.rstrip("/")
         self._auth_token = auth_token
-        # Persistent client — connections are reused across calls.
-        # keepalive_expiry evicts idle connections so they never go stale,
-        # preventing PoolTimeout / RemoteProtocolError in long-running processes.
         self._http = httpx.AsyncClient(
             limits=_POOL_LIMITS,
             timeout=REQUEST_TIMEOUT,
-            keepalive_expiry=_KEEPALIVE_EXPIRY,
         )
 
     def update_token(self, token: str) -> None:
