@@ -1,27 +1,46 @@
-"""Authentication helpers — API key access and deployment ID derivation.
+"""Authentication helpers — API key access and deployment ID selection.
 
-get_or_create_deployment_id() reads the machine-specific UUID from
-~/.neo/daemon/standalone_deployment_id, or creates one on first use.
-This ensures each machine gets a unique UUID even when the same API key
-is used on multiple machines simultaneously.
+Default behavior mirrors VS Code daemon safety:
+  - one machine-persisted UUID per host user
+  - avoids cross-machine collisions when the same API key is reused
+
+Override modes:
+  - NEO_DEPLOYMENT_ID: explicit deployment UUID
+  - NEO_DEPLOYMENT_ID_MODE=key-derived: deterministic UUID from API key
 """
 
+import hashlib
 import os
 import uuid
 from pathlib import Path
 from typing import Optional
 
 
+def derive_deployment_id(secret_key: str) -> str:
+    """Derive deterministic UUID from API key (compatibility mode)."""
+    digest = hashlib.sha256(secret_key.encode()).digest()[:16]
+    return str(uuid.UUID(bytes=digest, version=5))
+
+
 def get_or_create_deployment_id(secret_key: str) -> str:
-    """Return (or create) a machine-specific deployment UUID.
+    """Return deployment UUID using explicit override or machine default.
 
-    1. Reads ~/.neo/daemon/standalone_deployment_id if it exists.
-    2. Otherwise generates a fresh random UUID, writes it, and returns it.
+    Precedence:
+    1. NEO_DEPLOYMENT_ID explicit override
+    2. NEO_DEPLOYMENT_ID_MODE=key-derived (deterministic from key)
+    3. machine-persisted standalone UUID (default)
 
-    The UUID is random (not derived from the key) so two machines using the
-    same API key each get their own UUID — preventing the backend from
-    splitting commands across machines.
+    The default machine UUID prevents backend command fan-out collisions when
+    one key is active on multiple machines at once.
     """
+    explicit = os.environ.get("NEO_DEPLOYMENT_ID", "").strip()
+    if explicit:
+        return explicit
+
+    mode = os.environ.get("NEO_DEPLOYMENT_ID_MODE", "").strip().lower()
+    if mode in {"key-derived", "key", "deterministic"} and secret_key:
+        return derive_deployment_id(secret_key)
+
     daemon_dir = Path.home() / ".neo" / "daemon"
     standalone_file = daemon_dir / "standalone_deployment_id"
 

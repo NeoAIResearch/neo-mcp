@@ -152,6 +152,32 @@ cat /tmp/neo-daemon.log
 cat ~/.neo/daemon/daemon.log
 ```
 
+### Local diagnostics (stdio/daemon mode)
+
+HTTP mode is obsolete in this workflow. Use these local commands:
+
+```bash
+neo-mcp status
+neo-mcp doctor
+neo-mcp list
+neo-mcp logs --source neo-mcp --lines 120
+neo-mcp tail --source daemon --lines 120
+neo-mcp self-test
+```
+
+JSON output is available for automation:
+
+```bash
+neo-mcp status --json
+neo-mcp doctor --json
+```
+
+Optional routing trace (for workspace/thread debugging):
+
+```bash
+NEO_TRACE_ROUTING=1 neo-mcp daemon
+```
+
 ---
 
 ## What Neo is for

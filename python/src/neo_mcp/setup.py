@@ -1,6 +1,5 @@
 """neo-mcp setup wizard — stdlib only."""
 import getpass
-import hashlib
 import json
 import os
 import re
@@ -8,8 +7,9 @@ import shutil
 import subprocess
 import sys
 import time
-import uuid
 from pathlib import Path
+
+from .auth import get_or_create_deployment_id
 
 REMOTE_URL = "https://mcpserver.heyneo.com/mcp"
 
@@ -88,14 +88,14 @@ def _validate_api_key(secret_key: str) -> bool:
 # Daemon helpers (remote mode only)
 # ---------------------------------------------------------------------------
 
-def _derive_deployment_id(secret_key: str) -> str:
-    """Derive a stable, deterministic UUID from the API key.
+def _setup_deployment_id(secret_key: str) -> str:
+    """Resolve deployment UUID using runtime parity rules.
 
-    Each user's key maps to a unique UUID — no files, no collisions on hosted servers.
-    Matches the logic in server.py _derive_deployment_id().
+    Defaults to machine-persisted UUID (collision-safe), with support for:
+      - NEO_DEPLOYMENT_ID explicit override
+      - NEO_DEPLOYMENT_ID_MODE=key-derived compatibility mode
     """
-    digest = hashlib.sha256(secret_key.encode()).digest()[:16]
-    return str(uuid.UUID(bytes=digest, version=5))
+    return get_or_create_deployment_id(secret_key)
 
 
 def _daemon_pid_file(deployment_id: str) -> str:
@@ -301,8 +301,8 @@ def _configure_claude(secret_key: str, opts: dict) -> tuple:
                     "claude", "mcp", "add", "--transport", "http",
                     "--scope", scope, "neo", REMOTE_URL,
                     "--header", f"Authorization: Bearer {secret_key}",
+                    "--header", f"X-Neo-Deployment-Id: {deployment_id}",
                 ]
-                pass  # deployment_id auto-derived from API key by server
             else:
                 cmd = [
                     "claude", "mcp", "add", "--scope", scope,
@@ -321,7 +321,10 @@ def _configure_claude(secret_key: str, opts: dict) -> tuple:
         server_cfg: dict = {
             "transport": "http",
             "url": REMOTE_URL,
-            "headers": {"Authorization": f"Bearer {secret_key}"},
+            "headers": {
+                "Authorization": f"Bearer {secret_key}",
+                "X-Neo-Deployment-Id": deployment_id,
+            },
         }
     else:
         server_cfg = {
@@ -356,7 +359,13 @@ def _configure_cursor(secret_key: str, opts: dict) -> tuple:
     no_backup = opts.get("no_backup", False)
 
     if use_remote:
-        server_cfg: dict = {"url": REMOTE_URL, "headers": {"Authorization": f"Bearer {secret_key}"}}
+        server_cfg: dict = {
+            "url": REMOTE_URL,
+            "headers": {
+                "Authorization": f"Bearer {secret_key}",
+                "X-Neo-Deployment-Id": deployment_id,
+            },
+        }
     else:
         server_cfg = {
             "command": "neo-mcp",
@@ -381,7 +390,13 @@ def _configure_windsurf(secret_key: str, opts: dict) -> tuple:
     no_backup = opts.get("no_backup", False)
 
     if use_remote:
-        server_cfg: dict = {"serverUrl": REMOTE_URL, "headers": {"Authorization": f"Bearer {secret_key}"}}
+        server_cfg: dict = {
+            "serverUrl": REMOTE_URL,
+            "headers": {
+                "Authorization": f"Bearer {secret_key}",
+                "X-Neo-Deployment-Id": deployment_id,
+            },
+        }
     else:
         server_cfg = {
             "command": "neo-mcp",
@@ -440,6 +455,7 @@ def _configure_zed(secret_key: str, opts: dict) -> tuple:
 
 def _configure_vscode(secret_key: str, opts: dict) -> tuple:
     use_remote = opts.get("remote", False)
+    deployment_id = opts.get("deployment_id", "")
 
     path = Path.cwd() / ".vscode" / "mcp.json"
     no_backup = opts.get("no_backup", False)
@@ -450,6 +466,7 @@ def _configure_vscode(secret_key: str, opts: dict) -> tuple:
             "url": REMOTE_URL,
             "headers": {
                 "Authorization": f"Bearer {secret_key}",
+                "X-Neo-Deployment-Id": deployment_id,
             },
         }
     else:
@@ -588,15 +605,14 @@ def run_setup(args: list) -> None:
         print("Error: API key rejected by Neo backend. Check your NEO_SECRET_KEY.", file=sys.stderr)
         sys.exit(1)
 
-    # ── Detect VS Code/Cursor extension or derive deployment ID from key ─────
+    # ── Detect VS Code/Cursor extension and resolve deployment ID ────────────
     vscode_running = _vscode_extension_running()
+    _resolved_deployment_id = _setup_deployment_id(secret_key)
 
     if vscode_running:
-        _setup_deployment_id = _derive_deployment_id(secret_key)
         print("\nVS Code/Cursor extension detected (localhost:31337 is live).")
         print("Authentication: not required — extension daemon handles task execution.")
     else:
-        _setup_deployment_id = _derive_deployment_id(secret_key)  # no-extension path
         print("\nNo VS Code/Cursor extension detected.")
         print("The Python daemon will authenticate using your API key (NEO_SECRET_KEY).")
         existing_token = _valid_oauth_token()
@@ -609,7 +625,7 @@ def run_setup(args: list) -> None:
 
     # ── Remote mode: start daemon if needed, capture deployment ID ──────────
     if use_remote:
-        deployment_id = _setup_deployment_id
+        deployment_id = _resolved_deployment_id
         print(f"\nDeployment ID: {deployment_id}")
 
         if vscode_running:
