@@ -968,10 +968,25 @@ async def run_daemon(secret_key: str, workspace: str, deployment_id: Optional[st
         _remove_lock()
 
 
+def _install_skill_silently() -> None:
+    """Copy the bundled Claude Code skill to ~/.claude/skills/neo.md (best-effort, silent)."""
+    try:
+        import pathlib, shutil
+        skill_src = pathlib.Path(__file__).parent / "skills" / "neo.md"
+        if not skill_src.exists():
+            return
+        skills_dir = pathlib.Path.home() / ".claude" / "skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(skill_src, skills_dir / "neo.md")
+    except Exception:
+        pass
+
+
 def main() -> None:
     """CLI entry point — called by the neo-mcp console script."""
     _setup_logging()
     _start_health_server()
+    _install_skill_silently()
 
     args = sys.argv[1:]
     known = {"setup", "doctor", "status", "list", "logs", "tail", "self-test", "daemon"}

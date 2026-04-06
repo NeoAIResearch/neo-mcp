@@ -1,6 +1,6 @@
-# neo-mcp (npm)
+# neo-mcp (pip)
 
-Node.js MCP server for [Neo](https://heyneo.so) — submit AI/ML tasks, poll status, read output, and control task lifecycle from any AI editor. No Python required.
+Python MCP server for [Neo](https://heyneo.so) — submit AI/ML tasks, poll status, read output, and control task lifecycle from any AI editor.
 
 Install it, set your API key, register with your editor — that's it. Everything else is handled automatically.
 
@@ -11,12 +11,12 @@ Get your API key at [app.heyneo.so](https://app.heyneo.so) → Settings → API 
 ## Install
 
 ```bash
-npm install -g neo-mcp
+pip install neo-mcp
 ```
 
-Requires Node.js 18+.
+Requires Python 3.11+.
 
-> **No global install needed:** you can use `npx --yes neo-mcp` and npm will download it on first run.
+> **Tip:** use `pipx install neo-mcp` to install in an isolated environment and avoid conflicts with your project's virtualenv.
 
 ---
 
@@ -31,7 +31,7 @@ Replace `sk-v1-YOUR_KEY` with your actual key.
 ```bash
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=sk-v1-YOUR_KEY \
-  -- neo-mcp-daemon --mcp
+  -- neo-mcp
 ```
 
 Open a **new Claude Code session** after running this. Neo tools load at session start.
@@ -53,8 +53,7 @@ claude mcp list
 {
   "mcpServers": {
     "neo": {
-      "command": "npx",
-      "args": ["--yes", "neo-mcp", "--mcp"],
+      "command": "neo-mcp",
       "env": {
         "NEO_SECRET_KEY": "sk-v1-YOUR_KEY"
       }
@@ -75,8 +74,7 @@ Restart Cursor after editing.
 {
   "mcpServers": {
     "neo": {
-      "command": "npx",
-      "args": ["--yes", "neo-mcp", "--mcp"],
+      "command": "neo-mcp",
       "env": {
         "NEO_SECRET_KEY": "sk-v1-YOUR_KEY"
       }
@@ -98,8 +96,7 @@ Restart Windsurf after editing.
   "servers": {
     "neo": {
       "type": "stdio",
-      "command": "npx",
-      "args": ["--yes", "neo-mcp", "--mcp"],
+      "command": "neo-mcp",
       "env": {
         "NEO_SECRET_KEY": "sk-v1-YOUR_KEY"
       }
@@ -120,8 +117,8 @@ Restart Windsurf after editing.
     "neo": {
       "source": "custom",
       "command": {
-        "path": "npx",
-        "args": ["--yes", "neo-mcp", "--mcp"],
+        "path": "neo-mcp",
+        "args": [],
         "env": {
           "NEO_SECRET_KEY": "sk-v1-YOUR_KEY"
         }
@@ -144,8 +141,7 @@ Restart Windsurf after editing.
       "name": "neo",
       "transport": {
         "type": "stdio",
-        "command": "npx",
-        "args": ["--yes", "neo-mcp", "--mcp"],
+        "command": "neo-mcp",
         "env": {
           "NEO_SECRET_KEY": "sk-v1-YOUR_KEY"
         }
@@ -165,8 +161,7 @@ Restart Windsurf after editing.
 {
   "mcpServers": {
     "neo": {
-      "command": "npx",
-      "args": ["--yes", "neo-mcp", "--mcp"],
+      "command": "neo-mcp",
       "env": {
         "NEO_SECRET_KEY": "sk-v1-YOUR_KEY"
       }
@@ -198,6 +193,8 @@ Restart Windsurf after editing.
 |---|---|---|
 | `NEO_SECRET_KEY` | **Yes** | Your Neo API key (`sk-v1-...`) from [app.heyneo.so](https://app.heyneo.so) |
 | `NEO_DEPLOYMENT_ID` | No | Pin a specific deployment UUID (auto-generated and persisted by default) |
+| `NEO_WORKSPACE_DIR` | No | Override working directory (useful in Docker) |
+| `NEO_READ_ONLY` | No | `true` — expose only status/message tools, disable submit/stop/pause |
 
 ---
 
@@ -205,8 +202,9 @@ Restart Windsurf after editing.
 
 | Symptom | Fix |
 |---|---|
+| `neo-mcp: command not found` | Re-run `pip install neo-mcp` and verify your PATH with `which neo-mcp` |
 | Tools don't appear after registering | Open a **new session** — MCP tools load at session start, not mid-session |
 | `Invalid API key` (401) | Re-check your key at app.heyneo.so → Settings → API Keys |
 | `Trial or quota ended` (403) | Top up at the Neo dashboard |
-| Task submitted but no files written | Ensure `NEO_SECRET_KEY` is set correctly and the project is open in your editor |
-| Status stuck on RUNNING | Call `neo_task_status` to check current progress |
+| Task submitted but no files written | Daemon failed to start — run `neo-mcp doctor` to diagnose |
+| Status stuck on RUNNING | Call `neo_task_status` to check; run `neo-mcp status` to inspect the daemon |

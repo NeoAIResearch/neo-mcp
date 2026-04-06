@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 7 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — via stdio or HTTP transport. The hosted server runs at `https://mcpserver.heyneo.com/mcp`.
+A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 7 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — via stdio transport.
 
-Current pip version: **0.4.24**.
+Current pip version: **0.4.28**. Current npm version: **1.1.17**.
 
 ## Project structure
 
@@ -78,10 +78,10 @@ python3 python/src/neo_mcp/server.py
 cd python && pip install -e . && neo-mcp
 
 # Start the npm daemon (PRIMARY — required for task execution)
-npx neo-mcp-daemon /path/to/workspace &
+NEO_SECRET_KEY=sk-v1-your-secret npx --yes neo-mcp-daemon /path/to/workspace &
 
-# Start the Python daemon manually (fallback if npx not available)
-neo-mcp daemon
+# Start the Python daemon (fallback if npm/npx not available)
+NEO_SECRET_KEY=sk-v1-your-secret neo-mcp daemon
 
 # Run unit tests (no key needed)
 python3 -m pytest python/tests/ -v
@@ -89,29 +89,10 @@ python3 -m pytest python/tests/ -v
 # Run connectivity test (requires NEO_SECRET_KEY)
 NEO_SECRET_KEY=sk-v1-... python3 python/tests/test_connection.py
 
-# Build Docker image
-docker build -t neo-mcp-test ./python
-
-# Run via Docker
-docker run -i --rm -e NEO_SECRET_KEY=your-secret \
-  -v ~/.neo:/root/.neo:ro neo-mcp-test
-
-# Register with Claude Code (PRIMARY — hosted HTTP server, works for all editors)
-# On first task, agent asks permission to start the local daemon (one click).
-claude mcp add --scope user neo \
-  --transport http https://mcpserver.heyneo.com/mcp \
-  --header "Authorization: Bearer your-secret"
-
-# Register with Claude Code (local pip install — daemon auto-starts silently in stdio mode)
+# Register with Claude Code (pip stdio — daemon auto-starts silently)
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=your-secret \
   -- neo-mcp
-
-# Register with Claude Code (Docker, after publish)
-claude mcp add --scope user neo \
-  -e NEO_SECRET_KEY=your-secret \
-  -- docker run -i --rm -e NEO_SECRET_KEY \
-     -v ~/.neo:/root/.neo:ro ghcr.io/heyneo/neo-mcp-server
 
 # View MCP server logs
 claude mcp logs neo

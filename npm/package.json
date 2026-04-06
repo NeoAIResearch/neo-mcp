@@ -1,9 +1,10 @@
 {
-  "name": "neo-mcp-daemon",
-  "version": "1.1.11",
-  "description": "Neo local execution daemon — runs AI/ML tasks locally, no Python required",
+  "name": "neo-mcp",
+  "version": "1.1.17",
+  "description": "Neo MCP server and local execution daemon — runs AI/ML tasks locally, no Python required",
   "main": "dist/index.js",
   "bin": {
+    "neo-mcp": "bin/neo-mcp-daemon",
     "neo-mcp-daemon": "bin/neo-mcp-daemon"
   },
   "scripts": {
@@ -20,6 +21,7 @@
     "dist",
     "bin",
     "scripts/postinstall.js",
+    "skills",
     "README.md"
   ],
   "keywords": [

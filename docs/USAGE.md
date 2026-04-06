@@ -6,7 +6,7 @@
 
 - Neo account with a secret key (`sk-v1-...`) — from [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys
 - Neo MCP connected to your editor — see [CLIENTS.md](CLIENTS.md) for setup instructions
-- For local task execution: either the Neo VS Code/Cursor extension (zero setup), or nothing — if no daemon is found your agent will offer to start one for you automatically
+- For local task execution: either the Neo VS Code/Cursor extension (zero setup), or the npm daemon (`npx --yes neo-mcp-daemon /workspace &`) — if no daemon is found your agent will offer to start one automatically
 
 ---
 
@@ -136,7 +136,7 @@ For short tasks (< 3 min):
 |---|---|---|
 | `Invalid API key` (401) | Wrong key | Re-check `NEO_SECRET_KEY` |
 | `Trial or quota ended` (403) | Out of credits | Top up at Neo dashboard |
-| Task submitted but no files appear locally | Daemon failed to auto-start | Start daemon: `npx --yes neo-mcp-daemon /your/workspace &` or `neo-mcp daemon`. Files land in the `workspace` you passed to `neo_submit_task` (the agent picks this up from your project context automatically). |
+| Task submitted but no files appear locally | Daemon failed to auto-start | Start npm daemon: `NEO_SECRET_KEY=sk-v1-... npx --yes neo-mcp-daemon /your/workspace &` or Python fallback: `neo-mcp daemon`. Files land in the `workspace` you passed to `neo_submit_task` (the agent picks this up from your project context automatically). |
 | Status stuck on RUNNING | Step waiting for daemon response | Check `neo_task_status` to see the current status |
 | `neo-mcp` not found | Install incomplete | Re-run `pip install neo-mcp`, check PATH |
 
