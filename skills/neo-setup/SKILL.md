@@ -1,24 +1,13 @@
 ---
 name: neo-setup
-description: Set up Neo MCP server authentication and daemon for a user. Use this skill when the user wants to install neo-mcp, configure their editor, start the daemon, or troubleshoot login/auth issues.
+description: Set up Neo MCP server for a user. Use this skill when the user wants to install neo-mcp, configure their editor, or troubleshoot connection/auth issues.
 user-invocable: true
 metadata: {"openclaw": {"emoji": "🔧", "os": ["darwin", "linux", "win32"]}}
 ---
 
-# Neo Setup — Auth & Daemon Configuration
+# Neo Setup
 
-Use this skill to guide a user through setting up the Neo MCP server from scratch,
-fixing auth issues, or starting the daemon.
-
----
-
-## How Neo auth works
-
-Everything uses a single credential: `NEO_SECRET_KEY` (`sk-v1-...`).
-
-The API key is used for all requests — task submission, status polling, messages, and daemon polling. No OAuth, no browser login, no separate daemon credential.
-
-Agents with terminal access (Claude Code, Cursor, Codex CLI, Windsurf) automatically offer to start the daemon on first task submission — the user just clicks yes.
+Use this skill to guide a user through installing and configuring the Neo MCP server.
 
 ---
 
@@ -28,75 +17,114 @@ When invoked as `/neo-setup`, walk the user through the setup flow below.
 
 ---
 
-## Setup flow
+## Setup — pip (recommended)
 
-### Step 1 — Add the MCP server (one command)
+### Step 1 — Install
+
+```bash
+pip install neo-mcp
+# or: pipx install neo-mcp
+```
+
+### Step 2 — Register with your editor
+
+**Claude Code:**
 ```bash
 claude mcp add --scope user neo \
-  --transport http https://mcpserver.heyneo.com/mcp \
-  --header "Authorization: Bearer sk-v1-your-key"
+  -e NEO_SECRET_KEY=sk-v1-YOUR_KEY \
+  -- neo-mcp
 ```
 
 Open a **new Claude Code session** after running this.
 
-### Step 2 — Submit your first task
-
-Your agent will detect no daemon is running and offer to start it:
+**Cursor** — edit `~/.cursor/mcp.json`:
+```json
+{
+  "mcpServers": {
+    "neo": {
+      "command": "neo-mcp",
+      "env": { "NEO_SECRET_KEY": "sk-v1-YOUR_KEY" }
+    }
+  }
+}
 ```
-Neo daemon needs to run locally. Can I start it?  [Yes / No]
+
+**Windsurf** — edit `~/.codeium/windsurf/mcp_config.json`:
+```json
+{
+  "mcpServers": {
+    "neo": {
+      "command": "neo-mcp",
+      "env": { "NEO_SECRET_KEY": "sk-v1-YOUR_KEY" }
+    }
+  }
+}
 ```
-Click **Yes** — the daemon starts automatically using your API key and the task proceeds.
 
-All files are written directly to your local machine, never to any remote server.
+**VS Code** — edit `.vscode/mcp.json`:
+```json
+{
+  "servers": {
+    "neo": {
+      "type": "stdio",
+      "command": "neo-mcp",
+      "env": { "NEO_SECRET_KEY": "sk-v1-YOUR_KEY" }
+    }
+  }
+}
+```
 
-### Alternative: VS Code/Cursor extension
-Install the Neo extension and log in. It manages the daemon completely automatically — no manual steps, no CLI.
+### Step 3 — Submit your first task
+
+The daemon auto-starts on the first task submission. No manual startup needed.
+
+---
+
+## Setup — npm (Node.js, no Python required)
+
+### Step 1 — Install
+
+```bash
+npm install -g neo-mcp
+```
+
+### Step 2 — Register with your editor
+
+**Claude Code:**
+```bash
+claude mcp add --scope user neo \
+  -e NEO_SECRET_KEY=sk-v1-YOUR_KEY \
+  -- neo-mcp-daemon --mcp
+```
+
+For other editors, use `neo-mcp-daemon` as the command with `args: ["--mcp"]`. See full editor configs at [docs/GUIDE.md](../../docs/GUIDE.md).
+
+---
+
+## Verifying the connection
+
+```bash
+claude mcp list   # should show neo with a green checkmark
+```
+
+Then in a new session ask: *"What Neo tools do you have available?"* — should list `neo_submit_task`, `neo_task_status`, etc.
 
 ---
 
 ## Troubleshooting
 
-### `DAEMON_NOT_RUNNING` on first task
-Agent will offer to start the daemon — click yes. If running a web client (ChatGPT, Claude.ai), run manually:
-```bash
-NEO_SECRET_KEY=sk-v1-... npx --yes neo-mcp-daemon /path/to/your/workspace &
-```
-Fallback (pip install):
-```bash
-NEO_SECRET_KEY=sk-v1-... neo-mcp daemon
-```
-
-### Daemon exits immediately / auth error
-Check that `NEO_SECRET_KEY` is set correctly:
-```bash
-echo $NEO_SECRET_KEY   # should print sk-v1-...
-```
-
-### `Failed to connect` in `claude mcp list`
-Re-run `claude mcp add` — ensure the header is on a single line:
-```bash
-claude mcp add --scope user neo --transport http https://mcpserver.heyneo.com/mcp --header "Authorization: Bearer sk-v1-YOUR_KEY"
-```
-
-### `Invalid API key` (401)
-Re-check your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.
-
-### Files not appearing locally after task completes
-The daemon must be running on your machine. Start it and resubmit:
-```bash
-NEO_SECRET_KEY=sk-v1-... npx --yes neo-mcp-daemon /path/to/your/project &
-```
-Files are written to the `workspace` passed in `neo_submit_task` — the agent picks this up from your current project directory automatically.
-
----
-
-## Current state
+| Symptom | Fix |
+|---|---|
+| `neo-mcp: command not found` | Re-run `pip install neo-mcp`, verify with `which neo-mcp` |
+| `✗ Failed to connect` in `claude mcp list` | Run `claude mcp logs neo` — most likely `NEO_SECRET_KEY` not set |
+| Neo tools don't appear | Open a **new session** — tools load at session start |
+| `Invalid API key` (401) | Re-check key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys |
+| `No healthy deployments available` (400) | Daemon failed to auto-start — restart the MCP server |
+| Files not written locally | Daemon stopped — check `neo-mcp status` and restart |
 
 ```bash
-# One command. Done.
-claude mcp add --scope user neo \
-  --transport http https://mcpserver.heyneo.com/mcp \
-  --header "Authorization: Bearer sk-v1-your-key"
+# Diagnostics (pip)
+neo-mcp status
+neo-mcp doctor
+claude mcp logs neo
 ```
-
-Submit a task → agent auto-starts daemon → daemon writes files locally → everything works.
