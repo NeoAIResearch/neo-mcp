@@ -76,7 +76,9 @@ Open a **new Claude Code session** after running — tools load at session start
 
 ### Cursor
 
-Edit `~/.cursor/mcp.json`:
+**Open the config:**
+- GUI: `Ctrl+Shift+J` (Windows/Linux) or `Cmd+Shift+J` (Mac) → **Tools & MCP** → **New MCP Server**
+- Or edit the file directly: `~/.cursor/mcp.json`
 
 **pip:**
 ```json
@@ -103,13 +105,15 @@ Edit `~/.cursor/mcp.json`:
 }
 ```
 
-Restart Cursor after editing.
+Restart Cursor after editing the file directly. Changes via the GUI apply immediately.
 
 ---
 
 ### Windsurf
 
-Edit `~/.codeium/windsurf/mcp_config.json`:
+**Open the config:**
+- GUI: `Ctrl+,` (Windows/Linux) or `Cmd+,` (Mac) → **Cascade** → **Plugins (MCP servers)** → **Manage Plugins** → **View raw config**
+- Or edit the file directly: `~/.codeium/windsurf/mcp_config.json`
 
 **pip:**
 ```json
@@ -136,13 +140,17 @@ Edit `~/.codeium/windsurf/mcp_config.json`:
 }
 ```
 
-Restart Windsurf after editing.
+Changes apply on save — no restart needed.
 
 ---
 
 ### VS Code (GitHub Copilot)
 
-Requires VS Code 1.99+. Edit `.vscode/mcp.json` in your workspace root:
+Requires VS Code 1.99+.
+
+**Open the config:**
+- Command Palette: `Ctrl+Shift+P` (Windows/Linux) or `Cmd+Shift+P` (Mac) → **"Chat: Open Chat Customizations"**
+- Or edit the file directly: `.vscode/mcp.json` in your workspace root (create if it doesn't exist)
 
 **pip:**
 ```json
@@ -171,11 +179,17 @@ Requires VS Code 1.99+. Edit `.vscode/mcp.json` in your workspace root:
 }
 ```
 
+> MCP tools only work in **Copilot Agent mode** — switch to Agent mode in the chat panel.
+
 ---
 
 ### Zed
 
-Edit `~/.config/zed/settings.json`:
+**Open the config:**
+- `Ctrl+Alt+,` (Windows/Linux) or `Cmd+Alt+,` (Mac) — opens `settings.json` directly
+- Or: Command Palette → **"zed: open settings"**
+
+Add inside `~/.config/zed/settings.json`:
 
 **pip:**
 ```json
@@ -209,50 +223,45 @@ Edit `~/.config/zed/settings.json`:
 }
 ```
 
+Changes apply on save — no restart needed.
+
 ---
 
 ### Continue.dev
 
-Edit `~/.continue/config.json`:
+**Open the config:**
+- `Ctrl+L` (VS Code) or `Ctrl+J` (JetBrains) to open the sidebar → click **Agent selector** above the chat input → click the **gear icon**
+- Or edit the file directly: `~/.continue/config.yaml`
 
 **pip:**
-```json
-{
-  "mcpServers": [
-    {
-      "name": "neo",
-      "transport": {
-        "type": "stdio",
-        "command": "neo-mcp",
-        "env": { "NEO_SECRET_KEY": "sk-v1-YOUR_KEY" }
-      }
-    }
-  ]
-}
+```yaml
+mcpServers:
+  - name: neo
+    command: neo-mcp
+    env:
+      NEO_SECRET_KEY: sk-v1-YOUR_KEY
 ```
 
 **npm:**
-```json
-{
-  "mcpServers": [
-    {
-      "name": "neo",
-      "transport": {
-        "type": "stdio",
-        "command": "neo-mcp-daemon",
-        "args": ["--mcp"],
-        "env": { "NEO_SECRET_KEY": "sk-v1-YOUR_KEY" }
-      }
-    }
-  ]
-}
+```yaml
+mcpServers:
+  - name: neo
+    command: neo-mcp-daemon
+    args:
+      - --mcp
+    env:
+      NEO_SECRET_KEY: sk-v1-YOUR_KEY
 ```
+
+> MCP tools only work in **Agent mode** — switch to Agent in the mode selector.
 
 ---
 
 ### OpenAI Codex CLI
 
-Edit `~/.codex/config.json`:
+**Open the config:**
+- Run `codex mcp` to manage servers interactively via CLI
+- Or edit the file directly: `~/.codex/config.json`
 
 **pip:**
 ```json
