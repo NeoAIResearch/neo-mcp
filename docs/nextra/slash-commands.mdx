@@ -1,0 +1,108 @@
+# Slash Commands
+
+<div className="neo-mcp-doc">
+
+The `neo-mcp` package ships two slash commands for Claude Code: `/neo` routes AI/ML tasks to Neo automatically, and `/neo-setup` walks you through installation and configuration.
+
+## Install the skills
+
+<DocTabs defaultValue="npm">
+<DocTabBar>
+  <DocTabTrigger value="npm">npm (automatic)</DocTabTrigger>
+  <DocTabTrigger value="pip">pip (one command)</DocTabTrigger>
+</DocTabBar>
+
+<DocTabPanel value="npm">
+
+Skills install automatically when you install the npm package — no extra steps.
+
+```bash
+npm install -g neo-mcp
+```
+
+Then open a **new Claude Code session**. Type `/` to see `/neo` and `/neo-setup` in the command palette.
+
+</DocTabPanel>
+
+<DocTabPanel value="pip">
+
+pip has no postinstall hook, so copy the skill file once after installing:
+
+```bash
+pip install neo-mcp
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/heyneo/neo-mcp/main/skills/claude-code/SKILL.md \
+  -o ~/.claude/skills/neo.md
+```
+
+Then open a **new Claude Code session**.
+
+</DocTabPanel>
+</DocTabs>
+
+## Commands
+
+### `/neo` — Submit a task
+
+Type `/neo` followed by your task description. Claude calls `neo_submit_task` immediately and starts the polling loop — no tool calls visible to you, no confirmation prompts.
+
+```
+/neo Train a fraud detection model on data/fraud.csv, optimise for recall
+/neo Build a RAG pipeline over the docs/ folder using LangChain
+/neo Fine-tune a sentiment classifier, target F1 > 0.85
+```
+
+You can also just describe the task naturally without `/neo` — Claude reads the skill description at session start and routes AI/ML requests to Neo automatically.
+
+**What happens next:**
+
+```
+neo_submit_task   →  returns thread_id immediately
+      ↓
+neo_task_status   →  Claude polls until COMPLETED or WAITING_FOR_FEEDBACK
+      ↓
+neo_send_feedback →  if Neo has a question, Claude relays it and sends your reply
+      ↓
+neo_get_messages  →  Claude reads the full output and summarises it for you
+```
+
+Files are written directly to your local workspace as Neo produces them — you don't need to wait for the task to finish to see partial output.
+
+### `/neo-setup` — Installation wizard
+
+Type `/neo-setup` and Claude walks you through:
+
+1. Installing `neo-mcp` (pip or npm)
+2. Registering with your editor (Claude Code, Cursor, Windsurf, VS Code, Zed, Continue, Codex CLI)
+3. Verifying the connection (`claude mcp list`)
+4. Troubleshooting if something is wrong
+
+Useful when onboarding a new machine or helping a teammate set up Neo for the first time.
+
+## Verify the skills are loaded
+
+```bash
+ls ~/.claude/skills/
+# neo.md  neo-setup.md
+```
+
+Or type `/` in a Claude Code chat — both commands should appear in the palette.
+
+## Update skills without reinstalling
+
+Skills are re-read on every new session. To update to the latest version:
+
+```bash
+# npm — reinstall updates skills automatically
+npm install -g neo-mcp@latest
+
+# pip — re-run the curl command
+curl -fsSL https://raw.githubusercontent.com/heyneo/neo-mcp/main/skills/claude-code/SKILL.md \
+  -o ~/.claude/skills/neo.md
+```
+
+Then open a new session.
+
+</div>

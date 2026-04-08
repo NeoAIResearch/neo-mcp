@@ -1,0 +1,462 @@
+# Framework Integrations
+
+<div className="neo-mcp-doc">
+
+Use Neo's tools directly inside your own agent or application — no editor required. Every integration connects to the same hosted MCP endpoint:
+
+```
+https://mcpserver.heyneo.com/mcp
+Authorization: Bearer sk-v1-YOUR_KEY
+```
+
+Get your key at <a href="https://heyneo.so/dashboard?section=settings#access-keys" className="neo-mcp-link">API keys in the Neo dashboard</a>.
+
+## Choose your framework
+
+<DocTabs defaultValue="vercel">
+<DocTabBar>
+  <DocTabTrigger value="vercel">Vercel AI SDK</DocTabTrigger>
+  <DocTabTrigger value="langchain">LangChain</DocTabTrigger>
+  <DocTabTrigger value="openai-agents">OpenAI Agents</DocTabTrigger>
+</DocTabBar>
+
+<DocTabPanel value="vercel">
+
+For Next.js, serverless functions, and any app using the <a href="https://sdk.vercel.ai" className="neo-mcp-link">Vercel AI SDK</a>.
+
+**Install:**
+```bash
+npm install ai @ai-sdk/openai @modelcontextprotocol/sdk
+```
+
+**Option A — MCP client (recommended)**
+
+Loads all 8 Neo tools automatically. No manual schema definitions.
+
+```typescript
+// lib/neo.ts
+import { experimental_createMCPClient as createMCPClient } from 'ai';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+
+export async function createNeoClient() {
+  return createMCPClient({
+    transport: new StreamableHTTPClientTransport(
+      new URL('https://mcpserver.heyneo.com/mcp'),
+      {
+        requestInit: {
+          headers: { Authorization: `Bearer ${process.env.NEO_SECRET_KEY}` },
+        },
+      }
+    ),
+  });
+}
+```
+
+```typescript
+// app/api/chat/route.ts
+import { streamText } from 'ai';
+import { openai } from '@ai-sdk/openai';
+import { createNeoClient } from '@/lib/neo';
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  const neoClient = await createNeoClient();
+  const neoTools = await neoClient.tools();
+
+  const result = streamText({
+    model: openai('gpt-4o'),
+    tools: neoTools,
+    messages,
+    system:
+      'You have access to Neo, a local AI/ML execution backend. ' +
+      'Use neo_submit_task for any ML/AI work. ' +
+      'Poll with neo_task_status until COMPLETED, then call neo_get_messages.',
+    onFinish: async () => { await neoClient.close(); },
+  });
+
+  return result.toDataStreamResponse();
+}
+```
+
+**Option B — Inline tool definitions**
+
+No MCP client dependency. Copy the tool objects directly into your project.
+
+```typescript
+import { tool } from 'ai';
+import { z } from 'zod';
+
+const NEO = 'https://mcpserver.heyneo.com/mcp';
+
+async function callNeo(name: string, args: Record<string, unknown>) {
+  const res = await fetch(NEO, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.NEO_SECRET_KEY}`,
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+  });
+  const data = await res.json();
+  return data.result?.content?.[0]?.text ?? JSON.stringify(data);
+}
+
+export const neoTools = {
+  neo_submit_task: tool({
+    description:
+      'Submit an AI/ML task to Neo. Returns {thread_id} immediately. ' +
+      'Use for training models, RAG pipelines, AI agents, data preprocessing.',
+    parameters: z.object({
+      message: z.string().describe('Full task description with goal, file paths, constraints'),
+      workspace: z.string().describe('Absolute path to the project root (git root)'),
+    }),
+    execute: async (args) => callNeo('neo_submit_task', args),
+  }),
+  neo_task_status: tool({
+    description: 'Check task status: RUNNING / COMPLETED / WAITING_FOR_FEEDBACK / PAUSED / TERMINATED.',
+    parameters: z.object({ thread_id: z.string() }),
+    execute: async (args) => callNeo('neo_task_status', args),
+  }),
+  neo_get_messages: tool({
+    description: 'Read full task output. Only call when status is COMPLETED.',
+    parameters: z.object({ thread_id: z.string(), limit: z.number().default(50) }),
+    execute: async (args) => callNeo('neo_get_messages', args),
+  }),
+  neo_send_feedback: tool({
+    description: 'Reply when Neo is WAITING_FOR_FEEDBACK.',
+    parameters: z.object({ thread_id: z.string(), message: z.string() }),
+    execute: async (args) => callNeo('neo_send_feedback', args),
+  }),
+  neo_list_tasks: tool({
+    description: 'List all running and recent tasks.',
+    parameters: z.object({}),
+    execute: async () => callNeo('neo_list_tasks', {}),
+  }),
+  neo_pause_task: tool({
+    description: 'Pause a running task.',
+    parameters: z.object({ thread_id: z.string() }),
+    execute: async (args) => callNeo('neo_pause_task', args),
+  }),
+  neo_resume_task: tool({
+    description: 'Resume a paused task.',
+    parameters: z.object({ thread_id: z.string() }),
+    execute: async (args) => callNeo('neo_resume_task', args),
+  }),
+  neo_stop_task: tool({
+    description: 'Permanently stop a task. Irreversible.',
+    parameters: z.object({ thread_id: z.string() }),
+    execute: async (args) => callNeo('neo_stop_task', args),
+  }),
+};
+```
+
+</DocTabPanel>
+
+<DocTabPanel value="langchain">
+
+For <a href="https://python.langchain.com" className="neo-mcp-link">LangChain</a> agents, LangGraph workflows, and LCEL pipelines.
+
+**Install:**
+```bash
+pip install langchain-mcp-adapters langgraph langchain-openai
+export NEO_SECRET_KEY=sk-v1-...
+export OPENAI_API_KEY=...
+```
+
+**Option A — MCP toolset (recommended)**
+
+Loads all 8 Neo tools automatically.
+
+```python
+import asyncio, os
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.prebuilt import create_react_agent
+from langchain_openai import ChatOpenAI
+
+async def main():
+    async with MultiServerMCPClient({
+        "neo": {
+            "url": "https://mcpserver.heyneo.com/mcp",
+            "transport": "streamable_http",
+            "headers": {"Authorization": f"Bearer {os.environ['NEO_SECRET_KEY']}"},
+        }
+    }) as client:
+        agent = create_react_agent(
+            ChatOpenAI(model="gpt-4o"),
+            client.get_tools(),
+            prompt=(
+                "Use neo_submit_task for any ML/AI work. "
+                "Poll with neo_task_status until COMPLETED, then call neo_get_messages. "
+                "Always pass workspace as the project root, never a subdirectory."
+            ),
+        )
+        result = await agent.ainvoke({
+            "messages": [("human", "Train a churn model on churn.csv")]
+        })
+        print(result["messages"][-1].content)
+
+asyncio.run(main())
+```
+
+**Option B — StructuredTool definitions**
+
+No MCP dependency. Define tools as `StructuredTool` objects and pass them to any LangChain agent.
+
+```python
+import os, httpx
+from langchain_core.tools import StructuredTool
+from pydantic import BaseModel, Field
+from typing import Optional
+
+NEO = "https://mcpserver.heyneo.com/mcp"
+
+def _call(name: str, args: dict) -> str:
+    r = httpx.post(NEO, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ['NEO_SECRET_KEY']}",
+    }, json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": name, "arguments": args}}, timeout=60)
+    content = r.json().get("result", {}).get("content", [])
+    return content[0].get("text", "") if content else ""
+
+class SubmitInput(BaseModel):
+    message: str = Field(description="Full task description")
+    workspace: str = Field(description="Absolute project root path")
+
+class ThreadInput(BaseModel):
+    thread_id: str
+
+class FeedbackInput(BaseModel):
+    thread_id: str
+    message: str
+
+class MessagesInput(BaseModel):
+    thread_id: str
+    limit: Optional[int] = 50
+
+neo_submit_task = StructuredTool.from_function(
+    func=lambda message, workspace: _call("neo_submit_task", {"message": message, "workspace": workspace}),
+    name="neo_submit_task",
+    description="Submit an AI/ML task. Returns thread_id immediately.",
+    args_schema=SubmitInput,
+)
+neo_task_status = StructuredTool.from_function(
+    func=lambda thread_id: _call("neo_task_status", {"thread_id": thread_id}),
+    name="neo_task_status",
+    description="Check status: RUNNING / COMPLETED / WAITING_FOR_FEEDBACK / PAUSED / TERMINATED.",
+    args_schema=ThreadInput,
+)
+neo_get_messages = StructuredTool.from_function(
+    func=lambda thread_id, limit=50: _call("neo_get_messages", {"thread_id": thread_id, "limit": limit}),
+    name="neo_get_messages",
+    description="Read full output. Only call when COMPLETED.",
+    args_schema=MessagesInput,
+)
+neo_send_feedback = StructuredTool.from_function(
+    func=lambda thread_id, message: _call("neo_send_feedback", {"thread_id": thread_id, "message": message}),
+    name="neo_send_feedback",
+    description="Reply when Neo is WAITING_FOR_FEEDBACK.",
+    args_schema=FeedbackInput,
+)
+
+NEO_TOOLS = [neo_submit_task, neo_task_status, neo_get_messages, neo_send_feedback]
+
+# Use with any LangChain agent
+from langgraph.prebuilt import create_react_agent
+from langchain_openai import ChatOpenAI
+
+agent = create_react_agent(ChatOpenAI(model="gpt-4o"), NEO_TOOLS)
+```
+
+</DocTabPanel>
+
+<DocTabPanel value="openai-agents">
+
+For agents built with the <a href="https://openai.github.io/openai-agents-python/" className="neo-mcp-link">OpenAI Agents SDK</a>.
+
+**Install:**
+```bash
+pip install openai-agents
+export NEO_SECRET_KEY=sk-v1-...
+```
+
+**Option A — MCPServerHTTP (recommended)**
+
+Loads all 8 Neo tools automatically.
+
+```python
+import asyncio, os
+from agents import Agent, MCPServerHTTP, Runner
+
+neo_mcp = MCPServerHTTP(
+    url="https://mcpserver.heyneo.com/mcp",
+    headers={"Authorization": f"Bearer {os.environ['NEO_SECRET_KEY']}"},
+)
+
+agent = Agent(
+    name="Neo ML Agent",
+    model="gpt-4o",
+    instructions=(
+        "Use neo_submit_task for any ML/AI work — training models, RAG pipelines, "
+        "data preprocessing, building agents. Files are written directly to the user's machine. "
+        "Workflow: submit → poll status → send feedback if asked → get messages when COMPLETED. "
+        "Always pass workspace as the project root, never a subdirectory."
+    ),
+    mcp_servers=[neo_mcp],
+)
+
+async def main():
+    result = await Runner.run(
+        agent,
+        input="Train a churn prediction model on churn.csv, optimise for recall",
+    )
+    print(result.final_output)
+
+asyncio.run(main())
+```
+
+**Option B — `@function_tool` definitions**
+
+No MCP dependency. Define the tools as decorated functions.
+
+```python
+import os, httpx
+from agents import Agent, Runner, function_tool
+
+NEO = "https://mcpserver.heyneo.com/mcp"
+
+def _call(name: str, args: dict) -> str:
+    r = httpx.post(NEO, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ['NEO_SECRET_KEY']}",
+    }, json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": name, "arguments": args}}, timeout=60)
+    content = r.json().get("result", {}).get("content", [])
+    return content[0].get("text", "") if content else ""
+
+@function_tool
+def neo_submit_task(message: str, workspace: str) -> str:
+    """Submit an AI/ML task to Neo. Returns thread_id immediately.
+
+    Args:
+        message: Full task description with goal, file paths, and constraints.
+        workspace: Absolute path to the project root (git root). Never a subdirectory.
+    """
+    return _call("neo_submit_task", {"message": message, "workspace": workspace})
+
+@function_tool
+def neo_task_status(thread_id: str) -> str:
+    """Check task status: RUNNING / COMPLETED / WAITING_FOR_FEEDBACK / PAUSED / TERMINATED.
+
+    Call once per turn. Do NOT poll in a tight loop.
+
+    Args:
+        thread_id: Thread ID from neo_submit_task.
+    """
+    return _call("neo_task_status", {"thread_id": thread_id})
+
+@function_tool
+def neo_get_messages(thread_id: str) -> str:
+    """Read full task output. Only call when neo_task_status returns COMPLETED.
+
+    Args:
+        thread_id: Thread ID from neo_submit_task.
+    """
+    return _call("neo_get_messages", {"thread_id": thread_id, "limit": 50})
+
+@function_tool
+def neo_send_feedback(thread_id: str, message: str) -> str:
+    """Reply when Neo is WAITING_FOR_FEEDBACK. Then call neo_task_status to confirm resume.
+
+    Args:
+        thread_id: Thread ID of the waiting task.
+        message: Your reply to Neo's question.
+    """
+    return _call("neo_send_feedback", {"thread_id": thread_id, "message": message})
+
+@function_tool
+def neo_list_tasks() -> str:
+    """List all running and recent tasks. Use after reopening a session."""
+    return _call("neo_list_tasks", {})
+
+agent = Agent(
+    name="Neo ML Agent",
+    model="gpt-4o",
+    instructions="Route all ML/AI tasks to Neo via neo_submit_task.",
+    tools=[neo_submit_task, neo_task_status, neo_get_messages, neo_send_feedback, neo_list_tasks],
+)
+```
+
+**Multi-agent pattern**
+
+Hand off ML tasks to a dedicated Neo sub-agent from an orchestrator.
+
+```python
+from agents import Agent, MCPServerHTTP, Runner
+
+neo_mcp = MCPServerHTTP(
+    url="https://mcpserver.heyneo.com/mcp",
+    headers={"Authorization": f"Bearer {os.environ['NEO_SECRET_KEY']}"},
+)
+
+ml_specialist = Agent(
+    name="ML Specialist",
+    model="gpt-4o",
+    instructions="Run all ML tasks via neo_submit_task and track them to completion.",
+    mcp_servers=[neo_mcp],
+)
+
+orchestrator = Agent(
+    name="Orchestrator",
+    model="gpt-4o",
+    instructions="Delegate any ML/AI task to the ML Specialist. Handle everything else yourself.",
+    agents=[ml_specialist],
+)
+```
+
+</DocTabPanel>
+</DocTabs>
+
+## Workflow all frameworks follow
+
+| Step | Tool | When |
+| --- | --- | --- |
+| 1 | `neo_submit_task` | Start any ML/AI task — returns `thread_id` immediately |
+| 2 | `neo_task_status` | Poll once per turn until `COMPLETED` or `WAITING_FOR_FEEDBACK` |
+| 3 | `neo_send_feedback` | Reply if Neo has a question, then go back to step 2 |
+| 4 | `neo_get_messages` | Read full output once `COMPLETED` |
+
+## Recommended system prompt
+
+Paste this into your agent's `system` / `instructions` / `prompt` field:
+
+```
+You have access to Neo, a local AI/ML execution backend.
+Files are written directly to the user's machine — never to a remote server.
+
+Use neo_submit_task for any AI/ML work:
+- Training or fine-tuning ML models
+- Building RAG pipelines or vector search systems
+- Building AI agents or multi-agent systems
+- ML data preprocessing and feature engineering
+
+Workflow:
+1. Call neo_submit_task — returns thread_id immediately
+2. Call neo_task_status until COMPLETED or WAITING_FOR_FEEDBACK
+3. If WAITING_FOR_FEEDBACK, call neo_send_feedback, then check status again
+4. Call neo_get_messages for full output once COMPLETED
+
+Never run ML workloads inline — always delegate to neo_submit_task.
+Always pass workspace as the absolute project root, never a subdirectory.
+```
+
+<div className="neo-mcp-table-gap" style={{ minHeight: '2.75rem', height: '2.75rem' }} aria-hidden="true" />
+
+<div className="neo-mcp-typical-flow">
+  <p>
+    Task execution requires a daemon on the user's machine — either the <strong>Neo VS Code/Cursor extension</strong> (zero setup) or <strong><code>npx --yes neo-mcp-daemon /workspace &</code></strong> started automatically by your agent on first submission.
+  </p>
+</div>
+
+</div>

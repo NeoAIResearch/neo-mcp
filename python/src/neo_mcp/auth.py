@@ -15,6 +15,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from neo_mcp.paths import STANDALONE_UUID_FILE
+
 
 def derive_deployment_id(secret_key: str) -> str:
     """Derive deterministic UUID from API key (compatibility mode)."""
@@ -41,15 +43,14 @@ def get_or_create_deployment_id(secret_key: str) -> str:
     if mode in {"key-derived", "key", "deterministic"} and secret_key:
         return derive_deployment_id(secret_key)
 
-    daemon_dir = Path.home() / ".neo" / "daemon"
-    standalone_file = daemon_dir / "standalone_deployment_id"
+    standalone_file = STANDALONE_UUID_FILE
 
     if standalone_file.exists():
         uid = standalone_file.read_text().strip()
         if uid:
             return uid
 
-    daemon_dir.mkdir(parents=True, exist_ok=True)
+    standalone_file.parent.mkdir(parents=True, exist_ok=True)
     uid = str(uuid.uuid4())
     try:
         standalone_file.write_text(uid)

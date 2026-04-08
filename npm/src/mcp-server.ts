@@ -1,9 +1,10 @@
 /**
  * neo-mcp MCP server — stdio transport.
  *
- * Exposes 7 tools identical to the Python neo-mcp package:
+ * Exposes 8 tools identical to the Python neo-mcp package:
  *   neo_submit_task, neo_task_status, neo_get_messages,
- *   neo_send_feedback, neo_pause_task, neo_resume_task, neo_stop_task
+ *   neo_send_feedback, neo_pause_task, neo_resume_task, neo_stop_task,
+ *   neo_list_tasks
  *
  * Also starts the Neo daemon polling loop in the background so tasks
  * actually execute locally — mirrors the Python server's BackendPoller.
@@ -17,11 +18,9 @@
  *     -- npx neo-mcp-daemon --mcp
  */
 
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio';
 import { z } from 'zod';
 import { getAuthToken } from './auth';
-import { getOrCreateDeploymentId, loadThreadWorkspaces, registerThreadWorkspace, runDaemon } from './daemon';
+import { getOrCreateDeploymentId, loadThreadWorkspaces, loadThreadWorkspacesWithMeta, registerThreadWorkspace, runDaemon, setThreadStatus } from './daemon';
 import {
   controlThread, getMessages, getTaskStatus,
   sendFeedback, stopThread, submitTask,
@@ -53,6 +52,10 @@ export async function runMcpServer(opts: {
     process.exit(1);
   }
 
+  // Dynamic import lets CJS load the ESM-only @modelcontextprotocol/sdk (v1.6+).
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp');
+  const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio');
+
   const deploymentId = opts.deploymentId ?? getOrCreateDeploymentId();
   const workspace = opts.workspace;
 
@@ -61,7 +64,7 @@ export async function runMcpServer(opts: {
   runDaemon({ workspace, deploymentId, signal: abort.signal }).catch(() => { /* exits on shutdown */ });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const server: any = new McpServer({ name: 'neo-mcp-server', version: '1.1.2' });
+  const server: any = new McpServer({ name: 'neo-mcp-server', version: '1.1.19' });
 
   // ----------------------------------------------------------------
   // neo_submit_task
@@ -109,9 +112,13 @@ export async function runMcpServer(opts: {
         // for a new thread_id, so writing here ensures it uses the right path.
         const threadId = result['thread_id'] as string | undefined;
         if (threadId) {
+          // Mark RUNNING before any poll commands arrive — mirrors Python _submit_task.
+          setThreadStatus(threadId, 'RUNNING');
           registerThreadWorkspace(threadId, effectiveWs);
         }
-        return ok(result);
+        // Normalize response to match Python _submit_task exactly:
+        // return {"thread_id": thread_id, "status": "submitted", "workspace": ws}
+        return ok({ thread_id: threadId, status: 'submitted', workspace: effectiveWs });
       } catch (e) {
         return toolErr(e);
       }
@@ -316,6 +323,9 @@ export async function runMcpServer(opts: {
     async ({ thread_id }: { thread_id: string }) => {
       try {
         await stopThread(token, thread_id);
+        // Mark TERMINATED so the daemon rejects any in-flight commands for this thread —
+        // mirrors Python _stop_task calling poller.set_thread_status(thread_id, 'TERMINATED').
+        setThreadStatus(thread_id, 'TERMINATED');
         return ok({ status: 'stopped', thread_id });
       } catch (e) {
         return toolErr(e);
@@ -348,24 +358,30 @@ export async function runMcpServer(opts: {
     },
     async () => {
       try {
-        const workspaces = loadThreadWorkspaces();
-        const entries = Object.entries(workspaces);
+        const meta = loadThreadWorkspacesWithMeta();
+        const entries = Object.entries(meta);
         if (entries.length === 0) return ok({ tasks: [], count: 0 });
 
         const tasks = await Promise.all(
-          entries.map(async ([threadId, workspace]) => {
+          entries.map(async ([threadId, { workspace, updated_at }]) => {
             let status = 'UNKNOWN';
             try {
               const data = await getTaskStatus(token, threadId);
               status = (data['status'] as string) ?? 'UNKNOWN';
             } catch { /* unreachable thread — leave as UNKNOWN */ }
-            return { thread_id: threadId, workspace, status };
+            return { thread_id: threadId, workspace, status, updated_at };
           }),
         );
 
-        // Sort RUNNING first, then by thread_id (newest IDs tend to be lexicographically last)
-        const order: Record<string, number> = { RUNNING: 0, WAITING_FOR_FEEDBACK: 1, PAUSED: 2, COMPLETED: 3, FAILED: 4, TERMINATED: 5, UNKNOWN: 6 };
-        tasks.sort((a, b) => (order[a.status] ?? 6) - (order[b.status] ?? 6));
+        // Sort newest-first by updated_at — mirrors Python _list_tasks() sort.
+        // updated_at may be an ISO string (written by Python daemon) or a Unix
+        // timestamp in seconds (written by npm daemon); normalise to ms for comparison.
+        function toMs(v: string | number): number {
+          if (typeof v === 'number') return v * 1_000;
+          const ms = Date.parse(v);
+          return isNaN(ms) ? 0 : ms;
+        }
+        tasks.sort((a, b) => toMs(b.updated_at) - toMs(a.updated_at));
 
         return ok({ tasks, count: tasks.length });
       } catch (e) {

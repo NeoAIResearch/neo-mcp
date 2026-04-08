@@ -144,6 +144,7 @@ class JobManager:
         stdout_path = JOBS_LOG_DIR / f"{job.job_id}.stdout.log"
         stderr_path = JOBS_LOG_DIR / f"{job.job_id}.stderr.log"
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
@@ -177,6 +178,12 @@ class JobManager:
 
             job.exit_code = await proc.wait()
         except asyncio.CancelledError:
+            # Kill the subprocess so the asyncio event loop doesn't wait for it.
+            if proc is not None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
             job.exit_code = -1
         except Exception as exc:  # noqa: BLE001
             logger.error("Job %s crashed: %s", job.job_id, exc)
