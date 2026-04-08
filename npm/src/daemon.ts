@@ -9,15 +9,63 @@ import { randomUUID } from 'crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 import { deriveDeploymentId, getAuthToken } from './auth.js';
-import { NEO_API_URL } from './config.js';
+import { NEO_API_URL, POLL_MAX_INTERVAL, POLL_MAX_MESSAGES } from './config.js';
 import { Command, dispatch } from './executor.js';
 import {
   DAEMON_DIR, DAEMON_LOG, NPM_PID_FILE, STANDALONE_UUID_FILE,
   WORKSPACES_FILE, pidFileForDeployment,
 } from './paths.js';
 
-const MAX_THREAD_WORKSPACES = Number(process.env['NEO_THREAD_WORKSPACES_MAX'] ?? 500);
-const THREAD_WORKSPACES_TTL_MS = Number(process.env['NEO_THREAD_WORKSPACES_TTL_SECONDS'] ?? 7 * 24 * 60 * 60) * 1000;
+// Read at call time so tests can override via env var after module load.
+function getMaxThreadWorkspaces(): number { return Number(process.env['NEO_THREAD_WORKSPACES_MAX'] ?? 500); }
+function getThreadWorkspacesTtlMs(): number { return Number(process.env['NEO_THREAD_WORKSPACES_TTL_SECONDS'] ?? 7 * 24 * 60 * 60) * 1000; }
+
+// ---------------------------------------------------------------------------
+// Command concurrency semaphore — mirrors Python BackendPoller._cmd_semaphore
+// Limits parallel command handlers so a large poll batch doesn't spawn
+// unbounded tasks or overwhelm the local filesystem.
+// ---------------------------------------------------------------------------
+
+const _MAX_CONCURRENT_COMMANDS = 32;
+
+class _Semaphore {
+  private _count: number;
+  private readonly _queue: Array<() => void> = [];
+  constructor(count: number) { this._count = count; }
+  async acquire(): Promise<void> {
+    if (this._count > 0) { this._count--; return; }
+    await new Promise<void>(resolve => this._queue.push(resolve));
+  }
+  release(): void {
+    if (this._queue.length > 0) { this._queue.shift()!(); }
+    else { this._count++; }
+  }
+}
+
+const _cmdSemaphore = new _Semaphore(_MAX_CONCURRENT_COMMANDS);
+
+// ---------------------------------------------------------------------------
+// Thread status gate — mirrors Python BackendPoller._thread_statuses
+// ---------------------------------------------------------------------------
+
+const _ACCEPTED_STATUSES = new Set(['RUNNING', 'PAUSED']);
+const _threadStatuses = new Map<string, string>();
+
+/**
+ * Record a thread's lifecycle status so the command gate can allow/reject it.
+ * Called by the MCP server on submit (RUNNING) and stop (TERMINATED).
+ * Mirrors Python BackendPoller.set_thread_status().
+ */
+export function setThreadStatus(threadId: string, status: string): void {
+  _threadStatuses.set(threadId, status);
+}
+
+/** Returns false when the thread is known to be terminated/failed — new commands should be rejected. */
+function shouldAccept(threadId: string): boolean {
+  const status = _threadStatuses.get(threadId);
+  if (status === undefined) return true; // unknown → allow (backwards compat, mirrors Python)
+  return _ACCEPTED_STATUSES.has(status);
+}
 
 function writeSandboxLog(deploymentId: string): void {
   mkdirSync(DAEMON_DIR, { recursive: true });
@@ -63,6 +111,28 @@ export function getOrCreateDeploymentId(): string {
   return uid;
 }
 
+/**
+ * Load thread→workspace mappings with timestamps from the persisted file.
+ * Mirrors Python _list_tasks() which reads raw JSON to get updated_at for sorting.
+ */
+export function loadThreadWorkspacesWithMeta(): Record<string, { workspace: string; updated_at: string | number }> {
+  try {
+    const data = JSON.parse(readFileSync(WORKSPACES_FILE, 'utf8')) as Record<string, unknown>;
+    const out: Record<string, { workspace: string; updated_at: string | number }> = {};
+    for (const [tid, value] of Object.entries(data)) {
+      if (!value || typeof value !== 'object') continue;
+      const workspace = (value as { workspace?: unknown }).workspace;
+      const updated_at = (value as { updated_at?: unknown }).updated_at;
+      if (typeof workspace !== 'string') continue;
+      const ts = typeof updated_at === 'string' || typeof updated_at === 'number' ? updated_at : '';
+      out[tid] = { workspace, updated_at: ts };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 export function loadThreadWorkspaces(): Record<string, string> {
   try {
     const data = JSON.parse(readFileSync(WORKSPACES_FILE, 'utf8')) as Record<string, unknown>;
@@ -79,15 +149,28 @@ export function loadThreadWorkspaces(): Record<string, string> {
   }
 }
 
+// Module-level workspace cache shared by registerThreadWorkspace() and runDaemon().
+// Eliminates the concurrent-registration race: two simultaneous task submissions
+// used to both read an empty file, then overwrite each other — losing one entry.
+// Now registration mutates this dict directly; no file read-modify-write needed.
+const _sharedThreadWorkspaces: Record<string, string> = {};
+let _sharedWorkspacesLoaded = false;
+
+function _ensureSharedWorkspacesLoaded(): void {
+  if (_sharedWorkspacesLoaded) return;
+  _sharedWorkspacesLoaded = true;
+  Object.assign(_sharedThreadWorkspaces, loadThreadWorkspaces());
+}
+
 export function registerThreadWorkspace(threadId: string, workspace: string): void {
-  const existing = loadThreadWorkspaces();
-  existing[threadId] = workspace;
-  saveThreadWorkspaces(existing);
+  _ensureSharedWorkspacesLoaded();
+  _sharedThreadWorkspaces[threadId] = workspace;
+  saveThreadWorkspaces(_sharedThreadWorkspaces);
 }
 
 export function saveThreadWorkspaces(workspaces: Record<string, string>): void {
   const now = Date.now();
-  const minTs = now - THREAD_WORKSPACES_TTL_MS;
+  const minTs = now - getThreadWorkspacesTtlMs();
   let previous: Record<string, { workspace: string; updated_at: number }> = {};
   try {
     const raw = JSON.parse(readFileSync(WORKSPACES_FILE, 'utf8')) as Record<string, unknown>;
@@ -95,8 +178,16 @@ export function saveThreadWorkspaces(workspaces: Record<string, string>): void {
       if (!value || typeof value !== 'object') continue;
       const workspace = (value as { workspace?: unknown }).workspace;
       const updated = (value as { updated_at?: unknown }).updated_at;
-      if (typeof workspace === 'string' && typeof updated === 'number') {
-        previous[tid] = { workspace, updated_at: updated };
+      // Accept Unix-seconds numbers (npm format) or ISO8601 strings (Python format)
+      let updatedMs: number | undefined;
+      if (typeof updated === 'number') {
+        updatedMs = updated * 1000;
+      } else if (typeof updated === 'string' && updated.length > 0) {
+        const parsed = Date.parse(updated);
+        if (!isNaN(parsed)) updatedMs = parsed;
+      }
+      if (typeof workspace === 'string' && updatedMs !== undefined) {
+        previous[tid] = { workspace, updated_at: updatedMs / 1000 };
       }
     }
   } catch {
@@ -108,8 +199,9 @@ export function saveThreadWorkspaces(workspaces: Record<string, string>): void {
     return { tid, workspace, updatedAt: prevTs };
   });
   entries = entries.filter((e) => e.updatedAt >= minTs && !!e.workspace);
-  if (entries.length > MAX_THREAD_WORKSPACES) {
-    entries = entries.slice(entries.length - MAX_THREAD_WORKSPACES);
+  const maxWorkspaces = getMaxThreadWorkspaces();
+  if (entries.length > maxWorkspaces) {
+    entries = entries.slice(entries.length - maxWorkspaces);
   }
   mkdirSync(DAEMON_DIR, { recursive: true });
   const payload = Object.fromEntries(
@@ -130,23 +222,29 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
+/** Thrown by pollBackend when the API key is rejected — caller should stop the daemon. */
+export class AuthError extends Error {
+  constructor(message: string) { super(message); this.name = 'AuthError'; }
+}
+
 export async function pollBackend(depId: string, token: string, waitTime = 5): Promise<Command[]> {
+  let res: Response;
   try {
-    const res = await fetchWithTimeout(
-      `${NEO_API_URL}/v2/poll/${depId}?max_messages=20&wait_time=${waitTime}`,
+    res = await fetchWithTimeout(
+      `${NEO_API_URL}/v2/poll/${depId}?max_messages=${POLL_MAX_MESSAGES}&wait_time=${waitTime}`,
       { headers: { 'Authorization': `Bearer ${token}` } },
       Math.max(waitTime * 2, 10) * 1_000, // timeout = 2× wait_time, minimum 10s
     );
-    if (res.status === 401) {
-      console.error(`Auth rejected for deployment ${depId} (401).`);
-      return [];
-    }
-    if (res.status === 404 || !res.ok) return [];
-    const data = await res.json() as Command[] | { messages?: Command[] };
-    return Array.isArray(data) ? data : (data.messages ?? []);
   } catch {
     return [];
   }
+  if (res.status === 401) {
+    // Throw so runDaemon can stop — mirrors Python BackendPoller UNAUTHORIZED handling.
+    throw new AuthError(`Auth rejected for deployment ${depId} (401). Check NEO_SECRET_KEY.`);
+  }
+  if (res.status === 404 || !res.ok) return [];
+  const data = await res.json() as Command[] | { messages?: Command[] };
+  return Array.isArray(data) ? data : (data.messages ?? []);
 }
 
 // Retry sendResponse up to 3 times — silent failure was the root cause of stalled file creation.
@@ -191,13 +289,16 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
   writePidFiles(depId);
   writeSandboxLog(depId);
 
-  console.log('Neo daemon ready');
-  console.log(`  deployment_id : ${depId}`);
-  console.log(`  workspace     : ${workspace}`);
-  console.log(`  backend       : ${NEO_API_URL}`);
-  console.log(`  pid           : ${process.pid}`);
+  console.error('Neo daemon ready');
+  console.error(`  deployment_id : ${depId}`);
+  console.error(`  workspace     : ${workspace}`);
+  console.error(`  backend       : ${NEO_API_URL}`);
+  console.error(`  pid           : ${process.pid}`);
 
-  const threadWorkspaces = loadThreadWorkspaces();
+  // Use the module-level shared dict so registrations made by the MCP server
+  // (in the same process) are immediately visible here without any file reload.
+  _ensureSharedWorkspacesLoaded();
+  const threadWorkspaces = _sharedThreadWorkspaces;
   let backoffMs = 1_000;
   let running = true;
 
@@ -213,7 +314,18 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
     // backend queues the next command. wait_time=5 is fine when idle (reduces poll traffic).
     const recentlyActive = (Date.now() - lastCommandTime) < 60_000;
     const waitTime = recentlyActive ? 1 : 5;
-    const commands = await pollBackend(depId, token, waitTime);
+    let commands: Command[];
+    try {
+      commands = await pollBackend(depId, token, waitTime);
+    } catch (e) {
+      if (e instanceof AuthError) {
+        // Mirrors Python BackendPoller UNAUTHORIZED handling — stop the daemon.
+        console.error(`[daemon] ${e.message} Stopping daemon.`);
+        stop();
+        return;
+      }
+      commands = [];
+    }
 
     if (commands.length === 0) {
       if (recentlyActive) {
@@ -221,7 +333,7 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
         await sleep(100);
       } else {
         await sleep(backoffMs);
-        backoffMs = Math.min(Math.floor(backoffMs * 1.5), 3_000);
+        backoffMs = Math.min(Math.floor(backoffMs * 1.5), POLL_MAX_INTERVAL);
       }
       continue;
     }
@@ -261,21 +373,38 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
         // Still nothing — log a warning so the user can diagnose misrouted files.
         // Do NOT persist the fallback: if the registration arrives later we want
         // the next command to pick up the real workspace, not a cached default.
-        console.warn(`[daemon] workspace not registered for thread ${tid} — using default: ${workspace}`);
+        console.error(`[daemon] workspace not registered for thread ${tid} — using default: ${workspace}`);
       }
       const resolvedWs = ws ?? workspace;
 
-      const result = await dispatch(cmd, resolvedWs) as unknown as Record<string, unknown>;
+      // Thread status gate — mirrors Python BackendPoller._should_accept().
+      // Reject commands for TERMINATED/FAILED threads to avoid executing stale
+      // commands that arrive after neo_stop_task was called.
+      if (tid && !shouldAccept(tid)) {
+        const currentStatus = _threadStatuses.get(tid) ?? 'UNKNOWN';
+        console.error(`[daemon] Rejecting command for ${currentStatus} thread ${tid}`);
+        const errorResp: Record<string, unknown> = {
+          request_id: cmd.request_id,
+          status: 'error',
+          error: `Thread is ${currentStatus} — not accepting commands`,
+          thread_id: tid,
+        };
+        if (cmd.response_queue_name) errorResp['response_queue_name'] = cmd.response_queue_name;
+        await sendResponse(depId, token, errorResp);
+        return;
+      }
+
+      // Semaphore: limit concurrent handlers — mirrors Python _cmd_semaphore(32)
+      await _cmdSemaphore.acquire();
+      let result: Record<string, unknown>;
+      try {
+        result = await dispatch(cmd, resolvedWs) as unknown as Record<string, unknown>;
+      } finally {
+        _cmdSemaphore.release();
+      }
 
       if (tid) {
         result['thread_id'] = tid;
-        // Only persist the mapping when it came from an explicit registration
-        // (not the fallback default) so a late-arriving registration can still
-        // override a previously saved default.
-        if (ws && !threadWorkspaces[tid]) {
-          threadWorkspaces[tid] = ws;
-          saveThreadWorkspaces(threadWorkspaces);
-        }
       }
       if (cmd.response_queue_name) {
         result['response_queue_name'] = cmd.response_queue_name;

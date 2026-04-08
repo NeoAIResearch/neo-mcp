@@ -67,6 +67,22 @@ Edit `~/.cursor/mcp.json` (create if it doesn't exist):
 
 Requires `pip install neo-mcp` first. Restart Cursor after editing.
 
+**Alternative — npm daemon (Node.js required, more reliable for file-heavy tasks):**
+
+```json
+{
+  "mcpServers": {
+    "neo": {
+      "command": "npx",
+      "args": ["--yes", "neo-mcp-daemon", "--mcp"],
+      "env": {
+        "NEO_SECRET_KEY": "sk-v1-YOUR_KEY"
+      }
+    }
+  }
+}
+```
+
 ---
 
 ## Windsurf
@@ -87,6 +103,22 @@ Edit `~/.codeium/windsurf/mcp_config.json`:
 ```
 
 Requires `pip install neo-mcp` first. Restart Windsurf after editing.
+
+**Alternative — npm daemon (Node.js required, more reliable for file-heavy tasks):**
+
+```json
+{
+  "mcpServers": {
+    "neo": {
+      "command": "npx",
+      "args": ["--yes", "neo-mcp-daemon", "--mcp"],
+      "env": {
+        "NEO_SECRET_KEY": "sk-v1-YOUR_KEY"
+      }
+    }
+  }
+}
+```
 
 ---
 
@@ -267,4 +299,5 @@ neo-mcp setup --secret-key sk-v1-... --editor claude --scope project
 | Tools don't appear after restart | Config path wrong or JSON syntax error | Validate the JSON and check the file location for your editor |
 | `DAEMON_NOT_RUNNING` on task submit | No daemon active | Agent will offer to start it automatically — click yes. Or run manually: `NEO_SECRET_KEY=sk-v1-... npx --yes neo-mcp-daemon /your/workspace &` |
 | Task submitted but no files written locally | Daemon not running | Agent will offer to start it — click yes |
+| Status stuck on RUNNING | `sendResponse` network failure (pre-0.4.29 pip / pre-1.1.19 npm) | Upgrade: `pip install --upgrade neo-mcp` or `npm install -g neo-mcp@latest` |
 | Status stuck on RUNNING | Step waiting for daemon | Call `neo_task_status` to see which step is blocked |

@@ -35,16 +35,21 @@ function parseArgs(): { workspace?: string; deploymentId?: string; mcp: boolean 
 
 const { workspace, deploymentId, mcp } = parseArgs();
 
+// NEO_WORKSPACE_DIR env var mirrors Python: os.environ.get("NEO_WORKSPACE_DIR", os.getcwd())
+const envWorkspaceDir = process.env['NEO_WORKSPACE_DIR'];
+
 if (mcp) {
   // MCP server mode: expose Neo tools to Claude Code and run daemon in background.
   // Usage: claude mcp add --scope user neo -e NEO_SECRET_KEY=sk-v1-... -- npx neo-mcp-daemon --mcp
-  runMcpServer({ workspace: resolve(workspace ?? process.cwd()), deploymentId }).catch((e: unknown) => {
+  const effectiveWorkspace = resolve(workspace ?? envWorkspaceDir ?? process.cwd());
+  runMcpServer({ workspace: effectiveWorkspace, deploymentId }).catch((e: unknown) => {
     process.stderr.write(`Fatal MCP server error: ${e}\n`);
     process.exit(1);
   });
 } else {
   // Daemon-only mode (default): poll Neo backend and execute tasks locally.
-  runDaemon({ workspace, deploymentId }).catch((e: unknown) => {
+  const effectiveWorkspace = workspace ?? envWorkspaceDir;
+  runDaemon({ workspace: effectiveWorkspace, deploymentId }).catch((e: unknown) => {
     console.error('Fatal daemon error:', e);
     process.exit(1);
   });

@@ -62,7 +62,9 @@ interface JobWithMeta extends Job {
 }
 
 const _jobs = new Map<string, JobWithMeta>();
-const _JOB_TTL_MS = 24 * 60 * 60 * 1_000; // 24 hours
+const _JOB_TTL_MS = 24 * 60 * 60 * 1_000;    // 24 hours — mirrors Python JOB_TTL
+const _JOB_MAX_RUNTIME_MS = 30 * 60 * 1_000;  // 30 minutes — mirrors Python JOB_MAX_RUNTIME
+const _MAX_LOG_BYTES = 10 * 1024 * 1024;       // 10 MB per stream — mirrors Python MAX_LOG_BYTES
 let _cleanupCounter = 0;
 
 function cleanupOldJobs(): void {
@@ -141,10 +143,14 @@ function fieldString(cmd: Command, key: string): string | undefined {
 }
 
 function fieldBoolean(cmd: Command, key: string, fallback: boolean): boolean {
+  const _FALSY_STRINGS = new Set(['false', '0', 'no']);
   const direct = (cmd as unknown as Record<string, unknown>)[key];
   if (typeof direct === 'boolean') return direct;
+  // Mirrors Python: coerce string "false"/"0"/"no" to false — backend may send strings
+  if (typeof direct === 'string') return !_FALSY_STRINGS.has(direct.toLowerCase());
   const nested = cmd.payload?.[key];
   if (typeof nested === 'boolean') return nested;
+  if (typeof nested === 'string') return !_FALSY_STRINGS.has(nested.toLowerCase());
   return fallback;
 }
 
@@ -164,7 +170,7 @@ function hCreateSession(cmd: Command): ActionResult {
   };
 }
 
-function remapToWorkspace(absPath: string, workspace: string, workdir: string): string {
+export function remapToWorkspace(absPath: string, workspace: string, workdir: string): string {
   let relative: string | null = null;
 
   // Try workdir as the container root (e.g. workdir=/app/project, path=/app/project/src/main.py)
@@ -200,6 +206,31 @@ function remapToWorkspace(absPath: string, workspace: string, workdir: string): 
   return relative ? join(workspace, relative) : workspace;
 }
 
+/**
+ * Replace known container-root paths in a shell command string with the local
+ * workspace equivalent — mirrors Python ActionHandlers._remap_command_paths().
+ *
+ * The Neo backend constructs shell commands using its own container paths
+ * (e.g. `ls /app/project/foo`).  Without remapping, those paths don't exist on
+ * the host and the command fails.  Roots are tried longest-first so
+ * /app/project is matched before /app.
+ */
+export function remapCommandPaths(command: string, workspace: string): string {
+  const roots = ['/app/project', '/workspace', '/project', '/app'];
+  let result = command;
+  for (const root of roots) {
+    const escapedRoot = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Match root + optional path continuation (stop at shell metacharacters / whitespace)
+    const re = new RegExp(escapedRoot + '(/[^\\s\'"`;|&<>(){}\\[\\]\\\\]*)?', 'g');
+    result = result.replace(re, (match) => {
+      const trailingSlash = match.endsWith('/');
+      const remapped = remapToWorkspace(trailingSlash ? match.slice(0, -1) : match, workspace, '');
+      return trailingSlash && !remapped.endsWith('/') ? remapped + '/' : remapped;
+    });
+  }
+  return result;
+}
+
 function hWriteCode(cmd: Command, workspace: string): ActionResult {
   const filename = fieldString(cmd, 'filename');
   const code = fieldString(cmd, 'code') ?? (typeof cmd.code === 'string' ? cmd.code : undefined);
@@ -216,7 +247,7 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
     // Otherwise it's a backend container path (e.g. /app/project/src/main.py) — remap.
     const direct = safeResolve(workspace, filename);
     full = direct ?? remapToWorkspace(resolved, workspace, workdir);
-    console.log(`[write_code] remapped ${filename} → ${full}`);
+    console.error(`[write_code] remapped ${filename} → ${full}`);
   } else {
     // Relative filename: if workdir is absolute (backend container path like /app/project/test_2/demo),
     // remap it to the local workspace to preserve subdirectory structure.
@@ -228,7 +259,7 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
       : workspace;
     const candidate = safeResolve(base, filename) ?? safeResolve(workspace, filename);
     if (!candidate) {
-      console.warn(`[write_code] BLOCKED path=${filename} (outside workspace/tmp)`);
+      console.error(`[write_code] BLOCKED path=${filename} (outside workspace/tmp)`);
       return { request_id: cmd.request_id, status: 'error', error: `Path escapes allowed directories: ${filename}` };
     }
     full = candidate;
@@ -236,11 +267,12 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
 
   mkdirSync(dirname(full), { recursive: true });
   writeFileSync(full, code, 'utf8');
-  console.log(`[write_code] wrote ${full}`);
+  console.error(`[write_code] wrote ${full}`);
   return {
     request_id: cmd.request_id,
     status: 'success',
-    data: { file_path: full, workdir: workdir || workspace },
+    // workdir: empty string when not provided — mirrors Python: "workdir": workdir or ""
+    data: { file_path: full, workdir: workdir || '' },
   };
 }
 
@@ -253,7 +285,7 @@ function hGetFile(cmd: Command, workspace: string): ActionResult {
   let full = safeResolve(workspace, fp);
   if (!full && isAbsolute(fp)) {
     full = remapToWorkspace(resolve(fp), workspace, '');
-    console.log(`[get_file] remapped ${fp} → ${full}`);
+    console.error(`[get_file] remapped ${fp} → ${full}`);
   }
   if (!full || !existsSync(full) || !statSync(full).isFile()) {
     return { request_id: cmd.request_id, status: 'error', error: `File not found: ${fp}` };
@@ -272,18 +304,43 @@ async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionRe
     return { request_id: cmd.request_id, status: 'error', error: 'command is required' };
   }
 
+  // Pre-flight: if the backend sent a /tmp script path, verify it exists locally
+  // before spawning. The backend must send write_code first; if it didn't (e.g.
+  // a race or ordering bug), fail fast with a clear error rather than a cryptic
+  // shell error — mirrors Python action_handlers._run_subprocess lines 210-222.
+  const scriptMatch = command.match(/(?:bash|sh)\s+(\/tmp\/bash_exec_[a-f0-9]+\.sh)/);
+  if (scriptMatch) {
+    const scriptPath = scriptMatch[1];
+    if (!existsSync(scriptPath)) {
+      console.error(`[run_subprocess] Script not found locally: ${scriptPath}`);
+      return {
+        request_id: cmd.request_id,
+        status: 'error',
+        error: `Script not found: ${scriptPath}. Backend must send 'write_code' before 'run_subprocess'.`,
+      };
+    }
+  }
+
   const detach = fieldBoolean(cmd, 'detach', true);
   const cmdWorkdir = fieldString(cmd, 'workdir');
   // Ignore absolute workdir from backend container — always run in local workspace.
   const cwd = cmdWorkdir && !isAbsolute(cmdWorkdir) ? join(workspace, cmdWorkdir) : workspace;
   const safeCwd = safeResolve(workspace, cwd) ?? workspace;
 
+  // Remap container paths in the command string so shell commands like
+  // `ls /app/project/foo` work on the host filesystem — mirrors Python
+  // ActionHandlers._remap_command_paths().
+  const remappedCommand = remapCommandPaths(command, workspace);
+  if (remappedCommand !== command) {
+    console.error(`[run_subprocess] remapped paths: ${command.slice(0, 80)} → ${remappedCommand.slice(0, 80)}`);
+  }
+
   // Ensure workspace exists before spawning — cwd must exist or spawn throws ENOENT
   mkdirSync(safeCwd, { recursive: true });
-  console.log(`[run_subprocess] cwd=${safeCwd} cmd=${command.slice(0, 120)} detach=${detach}`);
+  console.error(`[run_subprocess] cwd=${safeCwd} cmd=${remappedCommand.slice(0, 120)} detach=${detach}`);
 
   if (!detach) {
-    const proc = spawn(command, { shell: true, cwd: safeCwd });
+    const proc = spawn(remappedCommand, { shell: true, cwd: safeCwd });
     let stdout = '';
     let stderr = '';
     proc.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
@@ -311,15 +368,36 @@ async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionRe
   }
 
   const jobId = randomUUID();
-  const proc = spawn(command, { shell: true, cwd: safeCwd });
+  const proc = spawn(remappedCommand, { shell: true, cwd: safeCwd });
   const job: JobWithMeta = { proc, stdout: '', stderr: '', exitCode: null, startedAt: Date.now() };
   _jobs.set(jobId, job);
 
-  proc.stdout?.on('data', (chunk: Buffer) => { job.stdout += chunk.toString(); });
+  // Stream output with per-stream size cap — mirrors Python JobManager MAX_LOG_BYTES.
+  // Truncates the oldest 20% when the cap is exceeded, keeping the most recent output.
+  function appendCapped(field: 'stdout' | 'stderr', text: string): void {
+    job[field] += text;
+    if (job[field].length > _MAX_LOG_BYTES) {
+      job[field] = job[field].slice(-Math.floor(_MAX_LOG_BYTES * 0.8));
+    }
+  }
+  proc.stdout?.on('data', (chunk: Buffer) => appendCapped('stdout', chunk.toString()));
   proc.stdout?.on('error', () => { /* ignore stream errors */ });
-  proc.stderr?.on('data', (chunk: Buffer) => { job.stderr += chunk.toString(); });
+  proc.stderr?.on('data', (chunk: Buffer) => appendCapped('stderr', chunk.toString()));
   proc.stderr?.on('error', () => { /* ignore stream errors */ });
-  proc.on('close', (code: number | null) => { job.exitCode = code ?? -1; });
+
+  // Kill hung jobs after 30 minutes — mirrors Python JOB_MAX_RUNTIME / asyncio.timeout().
+  const killTimer = setTimeout(() => {
+    if (job.exitCode === null) {
+      console.error(`[run_subprocess] Job ${jobId} exceeded max runtime — killing`);
+      job.stderr += `\n[Killed: exceeded ${_JOB_MAX_RUNTIME_MS / 60_000}min max runtime]`;
+      try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+  }, _JOB_MAX_RUNTIME_MS);
+
+  proc.on('close', (code: number | null) => {
+    clearTimeout(killTimer);
+    job.exitCode = code ?? -1;
+  });
 
   // Periodic cleanup every 200 jobs to prevent unbounded memory growth
   if (++_cleanupCounter % 200 === 0) cleanupOldJobs();
@@ -357,9 +435,14 @@ function hTerminateJob(cmd: Command): ActionResult {
   if (!job) {
     return { request_id: cmd.request_id, status: 'error', error: `Job not found: ${job_id ?? ''}` };
   }
+  if (job.exitCode !== null) {
+    // Already completed — matches Python terminate_job early-return for completed jobs.
+    return { request_id: cmd.request_id, status: 'success', data: { job_id, terminated: true } };
+  }
   try { job.proc.kill('SIGTERM'); } catch { /* already exited */ }
-  job.exitCode = -15; // SIGTERM
   job.stderr += '\n[terminated by daemon]';
+  // Schedule SIGKILL after 5 s in case SIGTERM is ignored — mirrors Python _force_kill().
+  setTimeout(() => { try { job.proc.kill('SIGKILL'); } catch { /* already gone */ } }, 5_000);
   return {
     request_id: cmd.request_id,
     status: 'success',
@@ -381,7 +464,7 @@ function hListFiles(cmd: Command, workspace: string): ActionResult {
       target = direct;
     } else {
       target = remapToWorkspace(resolve(directory), workspace, '');
-      console.log(`[list_files] remapped ${directory} → ${target}`);
+      console.error(`[list_files] remapped ${directory} → ${target}`);
     }
   } else {
     target = safeResolve(workspace, directory) ?? workspace;
@@ -432,7 +515,7 @@ function hListFiles(cmd: Command, workspace: string): ActionResult {
 // ---------------------------------------------------------------------------
 
 export async function dispatch(cmd: Command, workspace: string): Promise<ActionResult> {
-  console.log(`[dispatch] action=${cmd.action} request_id=${cmd.request_id}`);
+  console.error(`[dispatch] action=${cmd.action} request_id=${cmd.request_id}`);
   try {
     switch (cmd.action) {
       case 'create_session':  return hCreateSession(cmd);

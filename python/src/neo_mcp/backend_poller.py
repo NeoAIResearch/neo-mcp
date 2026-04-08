@@ -197,16 +197,11 @@ class BackendPoller:
             await self._safe_send(error_resp)
             return
 
-        # Update thread workspace mapping only if not already set — the backend
-        # sends its internal container path (e.g. /app/project) which is wrong
-        # for local execution.  register_thread_workspace() sets the correct
-        # local path before any commands arrive; don't clobber it.
-        if thread_id and command.get("workspace") and thread_id not in self._thread_workspaces:
-            self._thread_workspaces[thread_id] = command["workspace"]
-            self._save_thread_workspaces()
-
-        # If this thread still has no registered workspace, reload from disk —
+        # If this thread has no registered workspace, reload from disk —
         # covers the case where a daemon restart lost in-memory state.
+        # NOTE: never fall back to command["workspace"] — that is the backend's
+        # container path (e.g. /app/project), not the local path. Using it would
+        # pass _is_allowed_path checks and write files to /app/project directly.
         workspace_source = "memory"
         if thread_id and thread_id not in self._thread_workspaces:
             fresh = BackendPoller._load_thread_workspaces()
@@ -280,10 +275,48 @@ class BackendPoller:
             logger.warning("Could not write daemon log: %s", exc)
 
     def _save_thread_workspaces(self) -> None:
+        _THREAD_WORKSPACE_TTL_DAYS: float = float(os.environ.get("NEO_THREAD_WORKSPACES_TTL_SECONDS", 7 * 24 * 60 * 60)) / 86400
+        _THREAD_WORKSPACE_MAX: int = int(os.environ.get("NEO_THREAD_WORKSPACES_MAX", 500))
         try:
+            now = datetime.now(timezone.utc)
+            cutoff = now.timestamp() - _THREAD_WORKSPACE_TTL_DAYS * 86400
+
+            # Load existing timestamps so we preserve original updated_at (don't bump on every save)
+            existing_ts: dict[str, float] = {}
+            if THREAD_WORKSPACES_FILE.exists():
+                try:
+                    raw_existing = json.loads(THREAD_WORKSPACES_FILE.read_text())
+                    for tid, val in raw_existing.items():
+                        if isinstance(val, dict):
+                            ua = val.get("updated_at")
+                            if isinstance(ua, (int, float)):
+                                existing_ts[tid] = float(ua)
+                            elif isinstance(ua, str):
+                                try:
+                                    existing_ts[tid] = datetime.fromisoformat(ua).timestamp()
+                                except ValueError:
+                                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+
+            entries: list[tuple[str, str, float]] = []
+            for tid, ws in self._thread_workspaces.items():
+                if not ws:
+                    continue
+                # Keep original timestamp if workspace unchanged; else use now
+                ts = existing_ts.get(tid, now.timestamp())
+                if existing_ts.get(tid) and self._thread_workspaces.get(tid) != ws:
+                    ts = now.timestamp()
+                entries.append((tid, ws, ts))
+
+            # Apply TTL filter + max-entries cap (keep newest) — mirrors npm saveThreadWorkspaces
+            entries = [(tid, ws, ts) for tid, ws, ts in entries if ts >= cutoff]
+            if len(entries) > _THREAD_WORKSPACE_MAX:
+                entries = sorted(entries, key=lambda e: e[2])[-_THREAD_WORKSPACE_MAX:]
+
             data = {
-                tid: {"workspace": ws, "updated_at": datetime.now(timezone.utc).isoformat()}
-                for tid, ws in self._thread_workspaces.items()
+                tid: {"workspace": ws, "updated_at": int(ts)}
+                for tid, ws, ts in entries
             }
             # Atomic write: write to a temp file then rename so a crash mid-write
             # never leaves a corrupted file (matches npm daemon's renameSync pattern).

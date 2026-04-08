@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 7 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — via stdio transport.
+A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 8 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — via stdio transport.
 
-Current pip version: **0.4.28**. Current npm version: **1.1.17**.
+Current pip version: **0.4.29**. Current npm version: **1.1.19**.
 
 ## Project structure
 
@@ -16,13 +16,14 @@ Each concern lives in its own top-level folder.
 neo-mcp/
 ├── python/                         # pip-installable MCP server (neo-mcp package)
 │   ├── src/neo_mcp/
-│   │   ├── server.py               # MCP server — all 7 tools, single file
+│   │   ├── server.py               # MCP server — all 8 tools, single file
 │   │   ├── oauth.py                # OAuth 2.0 PKCE authorization server (HTTP mode)
 │   │   ├── setup.py                # setup wizard (neo-mcp setup)
 │   │   ├── daemon.py               # Python daemon (fallback — primary is npm daemon)
 │   │   └── login.py                # browser OAuth flow (neo-mcp login)
 │   ├── tests/
-│   │   ├── test_concurrent_workspaces.py  # primary unit suite (60 tests, no key needed)
+│   │   ├── test_system.py                 # primary unit suite (127 tests, no key needed)
+│   │   ├── test_auth.py                   # deployment ID policy tests
 │   │   ├── test_server.py                 # legacy tests (stale — references old API)
 │   │   └── test_connection.py             # connectivity smoke test (needs key)
 │   ├── scripts/start-daemon.sh     # standalone daemon launcher (bash)
@@ -226,27 +227,41 @@ Auth on every request: `Authorization: Bearer $NEO_SECRET_KEY`
 
 ## Test suite
 
-Primary test file: `python/tests/test_concurrent_workspaces.py` (60 tests, no API key required).
+**Python** — `python/tests/test_system.py` (127 tests, no API key required):
 
 ```bash
-python3 -m pytest python/tests/test_concurrent_workspaces.py -v
+python3 -m pytest python/tests/test_system.py -v
 ```
 
-Coverage:
+**npm** — `npm/tests/system.test.ts` (139 tests, no API key required):
+
+```bash
+cd npm && npx vitest run tests/system.test.ts
+```
+
+Python coverage (16 test classes):
 
 | Class | What it tests |
 |---|---|
 | `TestWriteCode` | relative/absolute/workdir paths, subdir creation, overwrite, unicode, traversal blocked, missing fields |
-| `TestGetFileSecurity` | reads inside workspace, absolute path blocked/remapped, relative traversal blocked, missing file/field |
+| `TestGetFile` | reads inside workspace, absolute path blocked/remapped, relative traversal blocked, missing file/field, roundtrip |
+| `TestRunSubprocess` | detach, blocking stdout/stderr, nonzero exit, preflight check, terminate |
+| `TestJobManager` | create, logs, completion polling, cleanup eviction, terminate running/unknown/completed |
+| `TestListFiles` | basic listing, hidden files on/off, skip_dirs, max_depth, missing directory, file count, container path |
+| `TestCreateSession` | explicit id, payload id, auto UUID |
+| `TestDispatch` | unknown/empty/missing action, request_id echoed, all 7 actions routable |
 | `TestRemapToWorkspace` | all 4 container roots, deduplication, exact root match, nested paths, workdir hint, unknown root fallback |
-| `TestListFiles` | basic listing, hidden files on/off, max_depth, missing directory, file count |
-| `TestCreateSession` | with/without session_id, payload form |
-| `TestUnknownAction` | unknown action, empty action, missing action |
-| `TestConcurrentWorkspaceIsolation` | 3 threads × separate workspaces, concurrent `asyncio.gather`, 15 files across 3 threads, unknown thread fallback |
-| `TestJobCleanup` | old completed removed, recent kept, running never evicted, empty registry, mixed, logs return None after cleanup |
-| `TestWorkspaceRegistration` | default fallback, per-thread lookup, isolation, runtime registration, None thread_id |
+| `TestRemapCommandPaths` | ls/cat/python commands, multiple paths, non-container unchanged, cd-chained |
+| `TestPathSecurity` | workspace/tmp allowed, /etc blocked, parent/sibling blocked |
+| `TestSymlinkEscape` | write via symlink, absolute through symlink, get_file via symlink |
+| `TestWorkspaceIsolation` | 3 threads × separate workspaces, concurrent asyncio.gather, container paths |
+| `TestSafeSend` | first attempt, 2nd/3rd retry, all-3-fail no-raise, no-extra-calls |
+| `TestThreadStatusGate` | TERMINATED/FAILED/STOPPED reject, RUNNING/PAUSED/unknown accept |
+| `TestPollerWorkspaceRegistration` | in-memory update, overwrite, multiple threads isolated |
+| `TestDeploymentId` | creates file, stable, not key-derived, env override, key-derived, different keys |
 
-When adding new features to `action_handlers.py`, `job_manager.py`, or `backend_poller.py` — add tests to this file.
+When adding new features to `action_handlers.py`, `job_manager.py`, or `backend_poller.py` — add tests to `test_system.py`.
+When adding new features to `executor.ts` or `daemon.ts` — add tests to `npm/tests/system.test.ts`.
 
 ## Known constraints
 

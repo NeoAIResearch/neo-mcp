@@ -38,13 +38,25 @@ export async function submitTask(
   message: string,
   workspace: string,
 ): Promise<Record<string, unknown>> {
-  const res = await fetchWithTimeout(`${NEO_API_URL}/v2/thread/init-chat-direct`, {
-    method: 'POST',
-    headers: authHeaders(token),
-    body: JSON.stringify({ message, deployment_id: deploymentId, deployment_type: 'vscode', workspace }),
-  });
-  if (!res.ok) throw new Error(handleError(res.status));
-  return res.json() as Promise<Record<string, unknown>>;
+  // Retry once on network/stale-connection errors — mirrors Python init_chat which retries once
+  // on RemoteProtocolError (httpx raises this when a keep-alive connection is already closed).
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetchWithTimeout(`${NEO_API_URL}/v2/thread/init-chat-direct`, {
+        method: 'POST',
+        headers: authHeaders(token),
+        body: JSON.stringify({ message, deployment_id: deploymentId, deployment_type: 'vscode', workspace }),
+      });
+      if (!res.ok) throw new Error(handleError(res.status));
+      return res.json() as Promise<Record<string, unknown>>;
+    } catch (e) {
+      // Only retry on network errors (TypeError), not on HTTP errors from the server.
+      if (e instanceof TypeError && attempt < 2) { lastErr = e; continue; }
+      throw e;
+    }
+  }
+  throw lastErr;
 }
 
 export async function getTaskStatus(token: string, threadId: string): Promise<Record<string, unknown>> {
@@ -71,10 +83,11 @@ export async function getMessages(
 }
 
 export async function sendFeedback(token: string, threadId: string, message: string): Promise<void> {
+  // Backend expects { "input": message } — mirrors Python send_feedback: json={"input": message}
   const res = await fetchWithTimeout(`${NEO_API_URL}/v2/thread/feedback/${threadId}`, {
     method: 'POST',
     headers: authHeaders(token),
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ input: message }),
   });
   if (!res.ok) throw new Error(handleError(res.status));
 }
@@ -93,7 +106,8 @@ export async function controlThread(
 }
 
 export async function stopThread(token: string, threadId: string): Promise<void> {
-  const res = await fetchWithTimeout(`${NEO_API_URL}/v2/thread/cleanup-direct/${threadId}`, {
+  // ?delete_remote_artifacts=false mirrors Python stop_thread — don't purge backend artifacts.
+  const res = await fetchWithTimeout(`${NEO_API_URL}/v2/thread/cleanup-direct/${threadId}?delete_remote_artifacts=false`, {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${token}` },
   });
