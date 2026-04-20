@@ -353,8 +353,13 @@ class ActionHandlers:
             if self._is_allowed_path(candidate, ws_resolved):
                 target = candidate
             else:
-                # Backend container path (e.g. /app/project) — remap to local workspace
-                target = self._remap_to_workspace(candidate, ws_resolved, strip_project_wrapper=True)
+                # Backend container path (e.g. /app/project or /app/<wrapper>) — remap to
+                # local workspace.  is_workdir=True so a single-segment wrapper like
+                # /app/myproj_0001 maps to workspace root rather than a wrapper subfolder.
+                target = self._remap_to_workspace(
+                    candidate, ws_resolved,
+                    strip_project_wrapper=True, is_workdir=True,
+                )
                 logger.info("list_files: remapped %s → %s", directory, target)
         else:
             target = (ws_resolved / directory).resolve()
@@ -444,9 +449,10 @@ class ActionHandlers:
     ) -> Path:
         """Remap a backend container path (e.g. /app/project/src/main.py) to the local workspace.
 
-        strip_project_wrapper=True: strips the first segment after /app/project/ (the
-        project name on the backend) so files land in the workspace root regardless of
-        the local folder name.  Use this for write_code, get_file, list_files.
+        strip_project_wrapper=True: strips the first segment after any known container
+        root (/app/project, /app, /workspace, /project) — that segment is always the
+        backend's project-name wrapper (e.g. "agent_session_manager_0930"), not part of
+        the file tree.  Use this for write_code, get_file, list_files.
 
         is_workdir=True: treat a single segment as the project root (maps to workspace).
         is_workdir=False (default): a single segment is kept as a filename component.
@@ -455,7 +461,7 @@ class ActionHandlers:
         folder name.  Used by _remap_command_paths where segments may be real subdirs.
         """
         relative: Optional[Path] = None
-        used_app_project_root = False
+        stripable_root = False
 
         if workdir_hint and os.path.isabs(workdir_hint):
             try:
@@ -466,7 +472,7 @@ class ActionHandlers:
         if relative is None:
             try:
                 relative = path.relative_to(Path("/app/project"))
-                used_app_project_root = True
+                stripable_root = True
             except ValueError:
                 pass
 
@@ -474,6 +480,7 @@ class ActionHandlers:
             for root in [Path("/app"), Path("/workspace"), Path("/project")]:
                 try:
                     relative = path.relative_to(root)
+                    stripable_root = True
                     break
                 except ValueError:
                     continue
@@ -482,23 +489,22 @@ class ActionHandlers:
             return workspace / path.name
 
         parts = relative.parts
-        if parts and strip_project_wrapper and used_app_project_root:
-            # Strip the project-name wrapper (first segment after /app/project/).
-            # The backend always wraps files under /app/project/{project-name}/,
+        if parts and strip_project_wrapper and stripable_root:
+            # Strip the project-name wrapper (first segment after the container root).
+            # The backend always wraps files under <container_root>/<project-name>/,
             # so the first segment is the project name, not part of the file tree.
             #
             # For filenames (is_workdir=False): only strip when there are 2+ parts
-            # (1-segment paths like /app/project/model.py are filename-at-root, keep them).
+            # (1-segment paths like /app/model.py are filename-at-root, keep them).
             # For workdirs (is_workdir=True): always strip — even a single segment
-            # like /app/project/test_2 means "project root" → workspace.
+            # like /app/test_2 means "project root" → workspace.
             should_strip = is_workdir or len(parts) >= 2
             if should_strip:
                 ws_name = workspace.parts[-1] if workspace.parts else ""
-                if parts[0] != ws_name:
-                    logger.debug(
-                        "Stripping project wrapper %r from path (local workspace is %r)",
-                        parts[0], ws_name,
-                    )
+                logger.info(
+                    "Stripping project wrapper %r from %s (local workspace=%r)",
+                    parts[0], path, ws_name,
+                )
                 relative = Path(*parts[1:]) if len(parts) > 1 else Path(".")
         elif parts and workspace.parts and workspace.parts[-1] == parts[0]:
             # Legacy dedup: strip only when workspace name matches the first segment.

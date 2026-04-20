@@ -289,7 +289,8 @@ describe('remapToWorkspace', () => {
       .toBe('/home/user/project/model.py');
   });
 
-  it('stripProjectWrapper: /app and /workspace roots are not stripped', () => {
+  it('stripProjectWrapper: single-segment under /app, /workspace, /project is filename — kept', () => {
+    // 1-segment paths are filenames-at-root, not wrappers — preserve them.
     expect(remapToWorkspace('/app/model.py', '/home/user/myapp', '', true))
       .toBe('/home/user/myapp/model.py');
     expect(remapToWorkspace('/workspace/train.py', '/home/user/myapp', '', true))
@@ -299,6 +300,55 @@ describe('remapToWorkspace', () => {
   it('stripProjectWrapper: exact /app/project root maps to workspace', () => {
     expect(remapToWorkspace('/app/project', '/home/user/myapp', '', true))
       .toBe('/home/user/myapp');
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression: backend sends /app/<wrapper>/... (NOT /app/project/<wrapper>/...).
+  // Wrapper must be stripped from any known container root, not just /app/project.
+  // -----------------------------------------------------------------------
+
+  it('stripProjectWrapper: /app/<wrapper>/file.py strips wrapper (regression)', () => {
+    // Headline regression — direct from the user's daemon log:
+    //   /app/multiagent_showcase_setup_0931/agents/research_agent.py
+    expect(remapToWorkspace('/app/multiagent_showcase_setup_0931/agents/research_agent.py',
+      '/home/user/myapp', '', true))
+      .toBe('/home/user/myapp/agents/research_agent.py');
+  });
+
+  it('stripProjectWrapper: /app/<wrapper>/<pkg>/__init__.py preserves package dir', () => {
+    // /app/rag_preparation_tool_0933/ragprep/__init__.py — wrapper stripped, ragprep kept
+    expect(remapToWorkspace('/app/rag_preparation_tool_0933/ragprep/__init__.py',
+      '/home/user/myapp', '', true))
+      .toBe('/home/user/myapp/ragprep/__init__.py');
+  });
+
+  it('stripProjectWrapper: /workspace/<wrapper>/file.py strips wrapper', () => {
+    expect(remapToWorkspace('/workspace/myproj_0001/src/main.py', '/home/user/myapp', '', true))
+      .toBe('/home/user/myapp/src/main.py');
+  });
+
+  it('stripProjectWrapper: /project/<wrapper>/file.py strips wrapper', () => {
+    expect(remapToWorkspace('/project/myproj_0001/src/main.py', '/home/user/myapp', '', true))
+      .toBe('/home/user/myapp/src/main.py');
+  });
+
+  it('stripProjectWrapper+isWorkdir: /app/<wrapper> single-segment maps to workspace', () => {
+    expect(remapToWorkspace('/app/myproj_0001', '/home/user/myapp', '', true, true))
+      .toBe('/home/user/myapp');
+  });
+
+  it('stripProjectWrapper+isWorkdir: /app/<wrapper>/sub strips wrapper, keeps sub', () => {
+    expect(remapToWorkspace('/app/myproj_0001/sub', '/home/user/myapp', '', true, true))
+      .toBe('/home/user/myapp/sub');
+  });
+
+  it('legacy dedup unaffected: stripProjectWrapper=false keeps original behavior', () => {
+    // remapCommandPaths uses stripProjectWrapper=false — first segment kept unless it
+    // matches workspace name (legacy dedup). Verify generalization didn't leak in.
+    expect(remapToWorkspace('/app/foo/bar.py', '/home/user/myapp', ''))
+      .toBe('/home/user/myapp/foo/bar.py');
+    expect(remapToWorkspace('/app/myapp/bar.py', '/home/user/myapp', ''))
+      .toBe('/home/user/myapp/bar.py');  // legacy dedup: ws name == first seg
   });
 });
 

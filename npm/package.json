@@ -1,6 +1,6 @@
 {
   "name": "neo-mcp",
-  "version": "1.1.20",
+  "version": "1.1.21",
   "description": "Neo MCP server and local execution daemon — runs AI/ML tasks locally, no Python required",
   "main": "dist/index.js",
   "bin": {

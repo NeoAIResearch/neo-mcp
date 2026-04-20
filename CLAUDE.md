@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 8 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — via stdio transport.
 
-Current pip version: **0.4.31**. Current npm version: **1.1.20**.
+Current pip version: **0.4.32**. Current npm version: **1.1.21**.
 
 ## Project structure
 

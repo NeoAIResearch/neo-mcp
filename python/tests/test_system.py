@@ -231,6 +231,43 @@ class TestWriteCode(unittest.TestCase):
         self.assertTrue(Path(self.td, "model.py").exists())
         self.assertFalse(Path(self.td, ws_name, "model.py").exists())
 
+    def test_app_root_wrapper_stripped(self):
+        # Regression: backend sends /app/<wrapper>/file.py (NOT /app/project/<wrapper>/...).
+        # Wrapper must be stripped so file lands at workspace root, not in a wrapper subfolder.
+        # This is the exact pattern from the user's daemon log:
+        #   /app/multiagent_showcase_setup_0931/agents/research_agent.py
+        wrapper = "multiagent_showcase_setup_0931"
+        r = arun(self.h.handle_command(
+            self.cmd(filename=f"/app/{wrapper}/agents/research_agent.py", code="# r")
+        ))
+        self.assertEqual(r["status"], "success")
+        self.assertTrue(Path(self.td, "agents", "research_agent.py").exists(),
+                        "file must land at workspace/agents/, no wrapper subfolder")
+        self.assertFalse(Path(self.td, wrapper).exists(),
+                         f"must NOT create wrapper folder '{wrapper}' in workspace")
+
+    def test_app_root_wrapper_with_nested_package(self):
+        # Real-world case from daemon log:
+        #   /app/rag_preparation_tool_0933/ragprep/__init__.py
+        # Wrapper = rag_preparation_tool_0933 (stripped); ragprep is a real package dir (kept).
+        wrapper = "rag_preparation_tool_0933"
+        r = arun(self.h.handle_command(
+            self.cmd(filename=f"/app/{wrapper}/ragprep/__init__.py", code="")
+        ))
+        self.assertEqual(r["status"], "success")
+        self.assertTrue(Path(self.td, "ragprep", "__init__.py").exists())
+        self.assertFalse(Path(self.td, wrapper).exists())
+
+    def test_app_root_workdir_with_subdir(self):
+        # workdir=/app/<wrapper>/sub + relative filename → file lands at workspace/sub/
+        wrapper = "myproj_0001"
+        r = arun(self.h.handle_command(
+            self.cmd(filename="train.py", code="# t", workdir=f"/app/{wrapper}/src")
+        ))
+        self.assertEqual(r["status"], "success")
+        self.assertTrue(Path(self.td, "src", "train.py").exists())
+        self.assertFalse(Path(self.td, wrapper).exists())
+
     # --- error cases ---
 
     def test_missing_filename_returns_error(self):
@@ -307,6 +344,16 @@ class TestGetFile(unittest.TestCase):
         r = arun(self.h.handle_command(self.cmd(file_path="/workspace/eval.py")))
         self.assertEqual(r["status"], "success")
         self.assertEqual(r["data"]["file_content"], "# eval")
+
+    def test_app_root_wrapper_remapped(self):
+        # Symmetric with write_code: backend sends /app/<wrapper>/file.py for get_file too.
+        # Wrapper must be stripped so the read finds the file in workspace root.
+        self.write("config.yaml", "key: value")
+        r = arun(self.h.handle_command(
+            self.cmd(file_path="/app/multiagent_showcase_setup_0931/config.yaml")
+        ))
+        self.assertEqual(r["status"], "success")
+        self.assertEqual(r["data"]["file_content"], "key: value")
 
     def test_missing_file_returns_error(self):
         r = arun(self.h.handle_command(self.cmd(file_path="nonexistent.py")))
@@ -616,6 +663,13 @@ class TestListFiles(unittest.TestCase):
         self.assertEqual(r["status"], "success")
         self.assertIn("README.md", r["data"]["stdout"])
 
+    def test_app_root_wrapper_directory_remapped(self):
+        # Backend may send directory=/app/<wrapper> for list_files. Wrapper must be
+        # stripped (is_workdir=True semantics) so the listing reflects workspace contents.
+        r = arun(self.h.handle_command(self.cmd(directory="/app/multiagent_showcase_setup_0931")))
+        self.assertEqual(r["status"], "success")
+        self.assertIn("README.md", r["data"]["stdout"])
+
     def test_dirs_appear_before_files(self):
         r = arun(self.h.handle_command(self.cmd()))
         lines = [l for l in r["data"]["stdout"].split("\n") if l]
@@ -797,8 +851,8 @@ class TestRemapToWorkspace(unittest.TestCase):
         result = self.remap_strip("/app/project/sub/model.py", workdir="/app/project/sub")
         self.assertEqual(result, str(self.ws / "model.py"))
 
-    def test_strip_wrapper_only_applies_to_app_project_root(self):
-        """/app and /workspace roots are not subject to wrapper stripping."""
+    def test_strip_wrapper_single_segment_at_app_root_kept(self):
+        """Single-segment under /app, /workspace, /project is the filename — not stripped."""
         self.assertEqual(self.remap_strip("/app/model.py"), str(self.ws / "model.py"))
         self.assertEqual(self.remap_strip("/workspace/train.py"), str(self.ws / "train.py"))
         self.assertEqual(self.remap_strip("/project/run.sh"), str(self.ws / "run.sh"))
@@ -806,6 +860,50 @@ class TestRemapToWorkspace(unittest.TestCase):
     def test_strip_wrapper_exact_app_project_root(self):
         """Exact /app/project with no file still maps to workspace."""
         self.assertEqual(self.remap_strip("/app/project"), str(self.ws))
+
+    # ------------------------------------------------------------------
+    # Regression: backend sends /app/<wrapper>/... (not /app/project/<wrapper>/...)
+    # The wrapper must be stripped from all known container roots, not just /app/project.
+    # ------------------------------------------------------------------
+
+    def test_strip_wrapper_app_root_with_wrapper(self):
+        """/app/<wrapper>/file.py — wrapper stripped (the headline regression)."""
+        result = self.remap_strip("/app/multiagent_showcase_setup_0931/agents/research_agent.py")
+        self.assertEqual(result, str(self.ws / "agents/research_agent.py"))
+
+    def test_strip_wrapper_app_root_nested_subdirs_preserved(self):
+        """/app/<wrapper>/<deep>/<sub>/file.py — only wrapper stripped, deep subdirs kept."""
+        result = self.remap_strip("/app/rag_preparation_tool_0933/ragprep/ingestor.py")
+        self.assertEqual(result, str(self.ws / "ragprep/ingestor.py"))
+
+    def test_strip_wrapper_workspace_root_with_wrapper(self):
+        """/workspace/<wrapper>/file.py — wrapper stripped (same generalization)."""
+        result = self.remap_strip("/workspace/myproj_0001/src/main.py")
+        self.assertEqual(result, str(self.ws / "src/main.py"))
+
+    def test_strip_wrapper_project_root_with_wrapper(self):
+        """/project/<wrapper>/file.py — wrapper stripped."""
+        result = self.remap_strip("/project/myproj_0001/src/main.py")
+        self.assertEqual(result, str(self.ws / "src/main.py"))
+
+    def test_strip_wrapper_app_root_workdir_single_segment(self):
+        """workdir=/app/<wrapper> (is_workdir=True) maps to workspace root."""
+        result = self.remap_strip_wd("/app/myproj_0001")
+        self.assertEqual(result, str(self.ws))
+
+    def test_strip_wrapper_app_root_workdir_subdir(self):
+        """workdir=/app/<wrapper>/sub → workspace/sub."""
+        result = self.remap_strip_wd("/app/myproj_0001/sub")
+        self.assertEqual(result, str(self.ws / "sub"))
+
+    def test_legacy_dedup_unaffected_by_app_root_change(self):
+        """When strip_project_wrapper=False (e.g. _remap_command_paths), /app/<seg>/file
+        keeps original behavior: legacy dedup only when first segment matches workspace name."""
+        # Workspace name doesn't match → first segment kept
+        self.assertEqual(self.remap("/app/foo/bar.py"), str(self.ws / "foo/bar.py"))
+        # Workspace name matches first segment → first segment stripped (legacy dedup)
+        ws_name = self.ws.name
+        self.assertEqual(self.remap(f"/app/{ws_name}/bar.py"), str(self.ws / "bar.py"))
 
 
 # ===========================================================================
