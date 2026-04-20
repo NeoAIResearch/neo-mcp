@@ -176,6 +176,50 @@ class TestWriteCode(unittest.TestCase):
         self.assertEqual(r["status"], "success")
         self.assertTrue(Path(self.td, "utils.py").exists())
 
+    def test_relative_workdir_single_segment_stripped(self):
+        # Core regression: backend sends workdir="multimodal_rag_0345" (relative, single segment).
+        # This is the project-name wrapper — must be stripped so file lands at workspace root.
+        r = arun(self.h.handle_command(
+            self.cmd(filename="model.py", code="# m", workdir="multimodal_rag_0345")
+        ))
+        self.assertEqual(r["status"], "success")
+        self.assertTrue(Path(self.td, "model.py").exists(), "file must land at workspace root")
+        self.assertFalse(Path(self.td, "multimodal_rag_0345", "model.py").exists(),
+                         "must NOT create a project-name subfolder")
+
+    def test_relative_workdir_with_subdir_preserves_subdir(self):
+        # Multi-segment relative workdir: first segment is project name, rest is real subdir.
+        # e.g. "multimodal_rag_0345/src" → base = workspace/src
+        r = arun(self.h.handle_command(
+            self.cmd(filename="train.py", code="# t", workdir="multimodal_rag_0345/src")
+        ))
+        self.assertEqual(r["status"], "success")
+        self.assertTrue(Path(self.td, "src", "train.py").exists(),
+                        "subdir after project wrapper must be preserved")
+        self.assertFalse(Path(self.td, "multimodal_rag_0345").exists(),
+                         "project-name folder must not be created")
+
+    def test_container_relative_filename_normalized(self):
+        # Backend sometimes sends "app/project/myproj/model.py" (no leading '/').
+        # Must be treated as /app/project/myproj/model.py and remapped to workspace root.
+        r = arun(self.h.handle_command(
+            self.cmd(filename="app/project/myproj/model.py", code="# m")
+        ))
+        self.assertEqual(r["status"], "success")
+        self.assertTrue(Path(self.td, "model.py").exists(),
+                        "container-relative filename must land at workspace root")
+        self.assertFalse(Path(self.td, "app").exists(),
+                         "must NOT create 'app/' subfolder in workspace")
+
+    def test_container_relative_filename_app_only(self):
+        # "app/model.py" (no leading '/') → treated as /app/model.py → remapped to workspace/model.py
+        r = arun(self.h.handle_command(
+            self.cmd(filename="app/model.py", code="# a")
+        ))
+        self.assertEqual(r["status"], "success")
+        self.assertFalse(Path(self.td, "app").exists(),
+                         "must NOT create 'app/' subfolder in workspace")
+
     def test_dedup_workspace_name_in_path(self):
         # workspace is self.td (last component e.g. neo-test-XXXX)
         ws_name = Path(self.td).name

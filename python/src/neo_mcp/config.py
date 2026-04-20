@@ -18,3 +18,8 @@ POLL_BACKOFF_FACTOR: float = 1.5  # multiplier per consecutive error
 # Request timeout for poll calls (must exceed POLL_WAIT_TIME)
 POLL_TIMEOUT: float = 12.0        # seconds
 REQUEST_TIMEOUT: float = 30.0     # seconds for all other requests
+
+# Auto-pause: threads still RUNNING or WAITING_FOR_FEEDBACK after this many hours
+# are automatically paused. Set NEO_TASK_TIMEOUT_HOURS=0 to disable.
+TASK_TIMEOUT_HOURS: float = float(os.environ.get("NEO_TASK_TIMEOUT_HOURS", "6"))
+TASK_TIMEOUT_CHECK_INTERVAL: float = 300.0  # seconds between checks (5 min)

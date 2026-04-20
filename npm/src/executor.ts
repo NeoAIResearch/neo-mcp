@@ -259,12 +259,24 @@ export function remapCommandPaths(command: string, workspace: string): string {
 }
 
 function hWriteCode(cmd: Command, workspace: string): ActionResult {
-  const filename = fieldString(cmd, 'filename');
+  let filename = fieldString(cmd, 'filename');
   const code = fieldString(cmd, 'code') ?? (typeof cmd.code === 'string' ? cmd.code : undefined);
   if (!filename || code === undefined) {
     return { request_id: cmd.request_id, status: 'error', error: 'filename and code are required' };
   }
   const workdir = fieldString(cmd, 'workdir') ?? '';
+
+  console.error(`[write_code] filename=${filename} workdir=${workdir} workspace=${workspace}`);
+
+  // Normalize container-relative filenames to absolute paths so they go through
+  // the standard remap logic below. Backend sometimes omits the leading '/'
+  // (e.g. "app/project/myproj/model.py") which would otherwise land verbatim
+  // under the workspace (workspace/app/project/myproj/model.py).
+  const CONTAINER_REL_PREFIXES = ['app/project/', 'app/', 'workspace/', 'project/'];
+  if (!isAbsolute(filename) && CONTAINER_REL_PREFIXES.some(p => filename!.startsWith(p))) {
+    console.error(`[write_code] normalized container-relative filename "${filename}" → "/${filename}"`);
+    filename = '/' + filename;
+  }
 
   let full: string;
 
@@ -279,10 +291,19 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
     // Relative filename: if workdir is absolute (backend container path like /app/project/test_2/demo),
     // remap it to the local workspace to preserve subdirectory structure.
     // e.g. workdir=/app/project/test_2/demo → base=<workspace>/demo (project wrapper stripped)
+    //
+    // If workdir is relative (e.g. "multimodal_rag_0345" or "multimodal_rag_0345/src"),
+    // strip the first segment — it is always the project-name wrapper, same as the first
+    // segment after /app/project/ in absolute paths.
     const base = workdir
       ? isAbsolute(workdir)
         ? remapToWorkspace(resolve(workdir), workspace, '', true, true)
-        : join(workspace, workdir)
+        : (() => {
+            const slashIdx = workdir.indexOf('/');
+            const rest = slashIdx >= 0 ? workdir.slice(slashIdx + 1) : '';
+            if (rest) console.error(`[write_code] relative workdir: stripped project wrapper "${workdir.slice(0, slashIdx)}" → base subdir "${rest}"`);
+            return rest ? join(workspace, rest) : workspace;
+          })()
       : workspace;
     const candidate = safeResolve(base, filename) ?? safeResolve(workspace, filename);
     if (!candidate) {
@@ -304,9 +325,15 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
 }
 
 function hGetFile(cmd: Command, workspace: string): ActionResult {
-  const fp = fieldString(cmd, 'file_path');
+  let fp = fieldString(cmd, 'file_path');
   if (!fp) {
     return { request_id: cmd.request_id, status: 'error', error: 'file_path is required' };
+  }
+  // Normalize container-relative paths (same logic as hWriteCode).
+  const CONTAINER_REL_PREFIXES = ['app/project/', 'app/', 'workspace/', 'project/'];
+  if (!isAbsolute(fp) && CONTAINER_REL_PREFIXES.some(p => fp!.startsWith(p))) {
+    console.error(`[get_file] normalized container-relative path "${fp}" → "/${fp}"`);
+    fp = '/' + fp;
   }
   // Try direct resolution first; if outside workspace (backend container path), remap it.
   let full = safeResolve(workspace, fp);

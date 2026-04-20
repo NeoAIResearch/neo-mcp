@@ -120,6 +120,17 @@ class ActionHandlers:
         workspace = self._workspace_for(thread_id)
         ws_resolved = Path(workspace).resolve()
 
+        logger.info("write_code: filename=%r workdir=%r workspace=%s", filename, workdir, ws_resolved)
+
+        # Normalize container-relative filenames to absolute paths so they go through
+        # the standard remap logic below. Backend sometimes sends paths without a leading
+        # '/' (e.g. "app/project/myproj/model.py") which would otherwise land verbatim
+        # under the workspace (e.g. workspace/app/project/myproj/model.py).
+        _CONTAINER_REL_PREFIXES = ("app/project/", "app/", "workspace/", "project/")
+        if not os.path.isabs(filename) and any(filename.startswith(p) for p in _CONTAINER_REL_PREFIXES):
+            logger.info("Normalized container-relative filename %r → /%s", filename, filename)
+            filename = "/" + filename
+
         if os.path.isabs(filename):
             candidate = Path(filename).resolve()
             if self._is_allowed_path(candidate, ws_resolved):
@@ -135,8 +146,18 @@ class ActionHandlers:
                 # Remap it to the local workspace — project wrapper is stripped.
                 # e.g. /app/project/test_2/demo → <workspace>/demo
                 base = self._remap_to_workspace(Path(workdir).resolve(), ws_resolved, strip_project_wrapper=True, is_workdir=True)
+            elif workdir:
+                # Relative workdir: first segment is always the project-name wrapper
+                # (e.g. "multimodal_rag_0345" or "multimodal_rag_0345/src").
+                # Strip the first segment — mirrors how absolute /app/project/{name}/...
+                # paths are handled with strip_project_wrapper=True.
+                wd_parts = Path(workdir).parts
+                rest = Path(*wd_parts[1:]) if len(wd_parts) > 1 else None
+                base = ws_resolved / rest if rest else ws_resolved
+                if rest:
+                    logger.info("Relative workdir: stripped project wrapper %r → base=%s", wd_parts[0], base)
             else:
-                base = ws_resolved / workdir if workdir else ws_resolved
+                base = ws_resolved
             candidate = (base / filename).resolve()
             if not self._is_allowed_path(candidate, ws_resolved):
                 logger.warning("Path traversal blocked: %s", filename)
@@ -164,6 +185,13 @@ class ActionHandlers:
         workspace = self._workspace_for(thread_id)
 
         ws_resolved = Path(workspace).resolve()
+
+        # Normalize container-relative paths (same logic as _write_code).
+        _CONTAINER_REL_PREFIXES = ("app/project/", "app/", "workspace/", "project/")
+        if not os.path.isabs(file_path_raw) and any(file_path_raw.startswith(p) for p in _CONTAINER_REL_PREFIXES):
+            logger.info("get_file: normalized container-relative path %r → /%s", file_path_raw, file_path_raw)
+            file_path_raw = "/" + file_path_raw
+
         if os.path.isabs(file_path_raw):
             candidate = Path(file_path_raw).resolve()
             if self._is_allowed_path(candidate, ws_resolved):

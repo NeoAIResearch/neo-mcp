@@ -64,7 +64,7 @@ export async function runMcpServer(opts: {
   runDaemon({ workspace, deploymentId, signal: abort.signal }).catch(() => { /* exits on shutdown */ });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const server: any = new McpServer({ name: 'neo-mcp-server', version: '1.1.19' });
+  const server: any = new McpServer({ name: 'neo-mcp-server', version: '1.1.20' });
 
   // ----------------------------------------------------------------
   // neo_submit_task
