@@ -249,6 +249,57 @@ describe('remapToWorkspace', () => {
     expect(remapToWorkspace('/some/unknown/root/file.py', ws, ''))
       .toBe('/home/user/project/file.py');
   });
+
+  // -----------------------------------------------------------------------
+  // stripProjectWrapper=true — fix for mismatched project names
+  // -----------------------------------------------------------------------
+
+  it('stripProjectWrapper: matching workspace name still strips correctly', () => {
+    expect(remapToWorkspace('/app/project/project/model.py', '/home/user/project', '', true))
+      .toBe('/home/user/project/model.py');
+  });
+
+  it('stripProjectWrapper: mismatched project name is stripped', () => {
+    expect(remapToWorkspace('/app/project/test_2/model.py', '/home/user/myapp', '', true))
+      .toBe('/home/user/myapp/model.py');
+  });
+
+  it('stripProjectWrapper: nested path — wrapper stripped, subdirs preserved', () => {
+    expect(remapToWorkspace('/app/project/test_2/src/utils.py', '/home/user/myapp', '', true))
+      .toBe('/home/user/myapp/src/utils.py');
+  });
+
+  it('stripProjectWrapper: filename-at-container-root kept (1 segment not stripped)', () => {
+    expect(remapToWorkspace('/app/project/model.py', '/home/user/myapp', '', true, false))
+      .toBe('/home/user/myapp/model.py');
+  });
+
+  it('stripProjectWrapper+isWorkdir: single-segment workdir maps to workspace root', () => {
+    expect(remapToWorkspace('/app/project/test_2', '/home/user/myapp', '', true, true))
+      .toBe('/home/user/myapp');
+  });
+
+  it('stripProjectWrapper+isWorkdir: workdir with subdir — wrapper stripped, subdir kept', () => {
+    expect(remapToWorkspace('/app/project/test_2/demo', '/home/user/myapp', '', true, true))
+      .toBe('/home/user/myapp/demo');
+  });
+
+  it('stripProjectWrapper: workdir hint takes priority before stripping', () => {
+    expect(remapToWorkspace('/app/project/sub/model.py', ws, '/app/project/sub', true))
+      .toBe('/home/user/project/model.py');
+  });
+
+  it('stripProjectWrapper: /app and /workspace roots are not stripped', () => {
+    expect(remapToWorkspace('/app/model.py', '/home/user/myapp', '', true))
+      .toBe('/home/user/myapp/model.py');
+    expect(remapToWorkspace('/workspace/train.py', '/home/user/myapp', '', true))
+      .toBe('/home/user/myapp/train.py');
+  });
+
+  it('stripProjectWrapper: exact /app/project root maps to workspace', () => {
+    expect(remapToWorkspace('/app/project', '/home/user/myapp', '', true))
+      .toBe('/home/user/myapp');
+  });
 });
 
 // ===========================================================================
@@ -341,8 +392,10 @@ describe('write_code', () => {
   });
 
   it('remaps /app/project container path', async () => {
+    // /app/project/{project-name}/{file}: first segment is the project wrapper and is
+    // stripped. "src" here is the project name on the backend; file lands at workspace root.
     await dispatch(makeCmd({ action: 'write_code', filename: '/app/project/src/main.py', code: '# gen' }), ws);
-    expect(existsSync(join(ws, 'src/main.py'))).toBe(true);
+    expect(existsSync(join(ws, 'main.py'))).toBe(true);
   });
 
   it('remaps /app container path', async () => {
@@ -372,10 +425,19 @@ describe('write_code', () => {
     }
   });
 
-  it('relative filename with absolute container workdir lands under workspace subdir', async () => {
+  it('relative filename with absolute container workdir strips project wrapper', async () => {
+    // workdir=/app/project/sub: "sub" is the project name on the backend — stripped.
+    // File lands at workspace root, not workspace/sub/.
     const r = await dispatch(makeCmd({ action: 'write_code', filename: 'app.py', code: '# app', workdir: '/app/project/sub' }), ws);
     expect(r.status).toBe('success');
-    expect(existsSync(join(ws, 'sub/app.py'))).toBe(true);
+    expect(existsSync(join(ws, 'app.py'))).toBe(true);
+  });
+
+  it('relative filename with absolute container workdir having subdir preserves subdir', async () => {
+    // workdir=/app/project/myproj/demo: "myproj" stripped, "demo" preserved.
+    const r = await dispatch(makeCmd({ action: 'write_code', filename: 'app.py', code: '# app', workdir: '/app/project/myproj/demo' }), ws);
+    expect(r.status).toBe('success');
+    expect(existsSync(join(ws, 'demo/app.py'))).toBe(true);
   });
 
   it('workdir echoed in response when provided', async () => {
