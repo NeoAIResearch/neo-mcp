@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 from .action_handlers import ActionHandlers
 from .backend_client import BackendClient
-from .config import POLL_BACKOFF_FACTOR, POLL_BASE_INTERVAL, POLL_MAX_INTERVAL, POLL_WAIT_TIME
+from .config import POLL_BACKOFF_FACTOR, POLL_BASE_INTERVAL, POLL_MAX_INTERVAL, POLL_WAIT_TIME, TASK_TIMEOUT_HOURS, TASK_TIMEOUT_CHECK_INTERVAL
 from .paths import DAEMON_DIR, DAEMON_LOG, THREAD_WORKSPACES_FILE
 
 logger = logging.getLogger(__name__)
@@ -68,8 +68,9 @@ class BackendPoller:
         self._running = True
         self._consecutive_errors = 0
         self._current_interval = POLL_BASE_INTERVAL
-        last_command_time: float = 0.0  # monotonic clock, 0 = never
-        last_cleanup_time: float = 0.0  # monotonic clock, 0 = never
+        last_command_time: float = 0.0    # monotonic clock, 0 = never
+        last_cleanup_time: float = 0.0    # monotonic clock, 0 = never
+        last_timeout_check: float = 0.0   # monotonic clock, 0 = never
         _CLEANUP_INTERVAL = 3600.0  # run cleanup_old_jobs every hour
 
         self._write_daemon_log()
@@ -115,6 +116,11 @@ class BackendPoller:
             if now_mono - last_cleanup_time >= _CLEANUP_INTERVAL:
                 self._handlers._job_manager.cleanup_old_jobs()
                 last_cleanup_time = now_mono
+
+            # Periodic stale-task auto-pause — every 5 minutes
+            if TASK_TIMEOUT_HOURS > 0 and now_mono - last_timeout_check >= TASK_TIMEOUT_CHECK_INTERVAL:
+                await self._check_and_pause_stale_tasks()
+                last_timeout_check = now_mono
 
             if self._running and not got_commands:
                 if recently_active:
@@ -265,6 +271,50 @@ class BackendPoller:
         if status is None:
             return True  # no status tracked yet — allow (backwards compat)
         return status in _ACCEPTED_STATUSES
+
+    async def _check_and_pause_stale_tasks(self) -> None:
+        """Auto-pause threads that have been RUNNING or WAITING_FOR_FEEDBACK too long."""
+        if not THREAD_WORKSPACES_FILE.exists():
+            return
+        try:
+            raw = json.loads(THREAD_WORKSPACES_FILE.read_text())
+        except Exception:  # noqa: BLE001
+            return
+
+        cutoff = datetime.now(timezone.utc).timestamp() - TASK_TIMEOUT_HOURS * 3600
+        stale: list[str] = []
+        for tid, val in raw.items():
+            if not isinstance(val, dict):
+                continue
+            ts = val.get("updated_at")
+            if isinstance(ts, (int, float)):
+                age_ts = float(ts)
+            elif isinstance(ts, str):
+                try:
+                    age_ts = datetime.fromisoformat(ts).timestamp()
+                except ValueError:
+                    continue
+            else:
+                continue
+            if age_ts < cutoff:
+                stale.append(tid)
+
+        for tid in stale:
+            try:
+                status_data = await self._client.get_thread_status(tid)
+                status = status_data.get("status", "")
+            except Exception:  # noqa: BLE001
+                continue
+            if status in ("RUNNING", "WAITING_FOR_FEEDBACK"):
+                try:
+                    await self._client.control_thread(tid, "PAUSE")
+                    self.set_thread_status(tid, "PAUSED")
+                    logger.warning(
+                        "Auto-paused stale task %s (was %s, age > %.0fh)",
+                        tid, status, TASK_TIMEOUT_HOURS,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Could not auto-pause stale task %s: %s", tid, exc)
 
     def _write_daemon_log(self) -> None:
         DAEMON_DIR.mkdir(parents=True, exist_ok=True)

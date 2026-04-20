@@ -440,6 +440,39 @@ describe('write_code', () => {
     expect(existsSync(join(ws, 'demo/app.py'))).toBe(true);
   });
 
+  it('relative workdir single segment stripped — file lands at workspace root, not in project-name subfolder', async () => {
+    // Core regression: backend sends workdir="multimodal_rag_0345" (relative single-segment).
+    // This is the project-name wrapper and must be stripped.
+    const r = await dispatch(makeCmd({ action: 'write_code', filename: 'model.py', code: '# m', workdir: 'multimodal_rag_0345' }), ws);
+    expect(r.status).toBe('success');
+    expect(existsSync(join(ws, 'model.py'))).toBe(true, 'file must land at workspace root');
+    expect(existsSync(join(ws, 'multimodal_rag_0345', 'model.py'))).toBe(false, 'must NOT create project-name subfolder');
+  });
+
+  it('relative workdir multi-segment strips first segment and preserves rest', async () => {
+    // "multimodal_rag_0345/src": first segment is project name (stripped), "src" is a real subdir.
+    const r = await dispatch(makeCmd({ action: 'write_code', filename: 'train.py', code: '# t', workdir: 'multimodal_rag_0345/src' }), ws);
+    expect(r.status).toBe('success');
+    expect(existsSync(join(ws, 'src', 'train.py'))).toBe(true, 'subdir after project wrapper must be preserved');
+    expect(existsSync(join(ws, 'multimodal_rag_0345'))).toBe(false, 'project-name folder must not be created');
+  });
+
+  it('container-relative filename app/project/ normalized — lands at workspace root, not in app/ subfolder', async () => {
+    // Backend sometimes sends "app/project/myproj/model.py" without a leading '/'.
+    // Must be treated as /app/project/myproj/model.py and remapped to workspace root.
+    const r = await dispatch(makeCmd({ action: 'write_code', filename: 'app/project/myproj/model.py', code: '# m' }), ws);
+    expect(r.status).toBe('success');
+    expect(existsSync(join(ws, 'model.py'))).toBe(true, 'file must land at workspace root');
+    expect(existsSync(join(ws, 'app'))).toBe(false, 'must NOT create app/ subfolder in workspace');
+  });
+
+  it('container-relative filename app/ normalized — lands at workspace root', async () => {
+    // "app/model.py" (no leading '/') → treated as /app/model.py → remapped to workspace/model.py
+    const r = await dispatch(makeCmd({ action: 'write_code', filename: 'app/model.py', code: '# a' }), ws);
+    expect(r.status).toBe('success');
+    expect(existsSync(join(ws, 'app'))).toBe(false, 'must NOT create app/ subfolder in workspace');
+  });
+
   it('workdir echoed in response when provided', async () => {
     const r = await dispatch(makeCmd({ action: 'write_code', filename: 'f.py', code: '# f', workdir: 'src' }), ws);
     expect(r.data?.['workdir']).toBe('src');
