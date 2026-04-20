@@ -180,7 +180,8 @@ class BackendPoller:
         response_queue = command.get("response_queue_name")
 
         logger.info(
-            "Command: action=%s request_id=%s thread_id=%s", action, request_id, thread_id
+            "Command: action=%s request_id=%s thread_id=%s deployment_id=%s",
+            action, request_id, thread_id, deployment_id,
         )
 
         # Thread status gate (mirrors shouldAcceptCommands())

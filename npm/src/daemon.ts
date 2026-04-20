@@ -166,6 +166,7 @@ export function registerThreadWorkspace(threadId: string, workspace: string): vo
   _ensureSharedWorkspacesLoaded();
   _sharedThreadWorkspaces[threadId] = workspace;
   saveThreadWorkspaces(_sharedThreadWorkspaces);
+  console.error(`[registerThreadWorkspace] tid=${threadId} workspace=${workspace}`);
 }
 
 export function saveThreadWorkspaces(workspaces: Record<string, string>): void {
@@ -395,6 +396,7 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
       }
 
       // Semaphore: limit concurrent handlers — mirrors Python _cmd_semaphore(32)
+      console.error(`[daemon] dispatching action=${cmd.action} tid=${tid ?? 'none'} dep=${depId}`);
       await _cmdSemaphore.acquire();
       let result: Record<string, unknown>;
       try {

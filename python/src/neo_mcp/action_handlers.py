@@ -127,14 +127,14 @@ class ActionHandlers:
             else:
                 # Backend sent its own container path (e.g. /app/project/src/main.py).
                 # Remap to the user's local workspace preserving relative structure.
-                file_path = self._remap_to_workspace(candidate, ws_resolved, workdir)
+                file_path = self._remap_to_workspace(candidate, ws_resolved, workdir, strip_project_wrapper=True)
                 logger.info("Remapped absolute path %s → %s", filename, file_path)
         else:
             if workdir and os.path.isabs(workdir):
                 # Backend supplied an absolute workdir (e.g. /app/project/test_2/demo).
-                # Remap it to the local workspace to preserve subdirectory structure.
-                # e.g. /app/project/test_2/demo → <workspace>/test_2/demo
-                base = self._remap_to_workspace(Path(workdir).resolve(), ws_resolved)
+                # Remap it to the local workspace — project wrapper is stripped.
+                # e.g. /app/project/test_2/demo → <workspace>/demo
+                base = self._remap_to_workspace(Path(workdir).resolve(), ws_resolved, strip_project_wrapper=True, is_workdir=True)
             else:
                 base = ws_resolved / workdir if workdir else ws_resolved
             candidate = (base / filename).resolve()
@@ -170,7 +170,7 @@ class ActionHandlers:
                 resolved = candidate
             else:
                 # Backend container path (e.g. /app/project/src/file.py) — remap to local workspace
-                resolved = self._remap_to_workspace(candidate, ws_resolved)
+                resolved = self._remap_to_workspace(candidate, ws_resolved, strip_project_wrapper=True)
         else:
             resolved = (ws_resolved / file_path_raw).resolve()
             if not self._is_allowed_path(resolved, ws_resolved):
@@ -326,7 +326,7 @@ class ActionHandlers:
                 target = candidate
             else:
                 # Backend container path (e.g. /app/project) — remap to local workspace
-                target = self._remap_to_workspace(candidate, ws_resolved)
+                target = self._remap_to_workspace(candidate, ws_resolved, strip_project_wrapper=True)
                 logger.info("list_files: remapped %s → %s", directory, target)
         else:
             target = (ws_resolved / directory).resolve()
@@ -405,13 +405,29 @@ class ActionHandlers:
             result = re.sub(pattern, _replace, result)
         return result
 
-    def _remap_to_workspace(self, path: Path, workspace: Path, workdir_hint: Optional[str] = None) -> Path:
+    def _remap_to_workspace(
+        self,
+        path: Path,
+        workspace: Path,
+        workdir_hint: Optional[str] = None,
+        *,
+        strip_project_wrapper: bool = False,
+        is_workdir: bool = False,
+    ) -> Path:
         """Remap a backend container path (e.g. /app/project/src/main.py) to the local workspace.
 
-        Also deduplicates when workspace is itself a subdirectory matching the first
-        segment of the relative path — prevents double-nesting like test_2/test_2/file.py.
+        strip_project_wrapper=True: strips the first segment after /app/project/ (the
+        project name on the backend) so files land in the workspace root regardless of
+        the local folder name.  Use this for write_code, get_file, list_files.
+
+        is_workdir=True: treat a single segment as the project root (maps to workspace).
+        is_workdir=False (default): a single segment is kept as a filename component.
+
+        Default (False for both): strips only when the first segment matches the workspace
+        folder name.  Used by _remap_command_paths where segments may be real subdirs.
         """
         relative: Optional[Path] = None
+        used_app_project_root = False
 
         if workdir_hint and os.path.isabs(workdir_hint):
             try:
@@ -420,7 +436,14 @@ class ActionHandlers:
                 pass
 
         if relative is None:
-            for root in [Path("/app/project"), Path("/app"), Path("/workspace"), Path("/project")]:
+            try:
+                relative = path.relative_to(Path("/app/project"))
+                used_app_project_root = True
+            except ValueError:
+                pass
+
+        if relative is None:
+            for root in [Path("/app"), Path("/workspace"), Path("/project")]:
                 try:
                     relative = path.relative_to(root)
                     break
@@ -430,11 +453,27 @@ class ActionHandlers:
         if relative is None:
             return workspace / path.name
 
-        # Deduplicate: if workspace ends with the first part of relative,
-        # the user's workspace IS that directory — don't nest it again.
-        # e.g. workspace=/project/test_2, relative=test_2/file.py → file.py
         parts = relative.parts
-        if parts and workspace.parts and workspace.parts[-1] == parts[0]:
+        if parts and strip_project_wrapper and used_app_project_root:
+            # Strip the project-name wrapper (first segment after /app/project/).
+            # The backend always wraps files under /app/project/{project-name}/,
+            # so the first segment is the project name, not part of the file tree.
+            #
+            # For filenames (is_workdir=False): only strip when there are 2+ parts
+            # (1-segment paths like /app/project/model.py are filename-at-root, keep them).
+            # For workdirs (is_workdir=True): always strip — even a single segment
+            # like /app/project/test_2 means "project root" → workspace.
+            should_strip = is_workdir or len(parts) >= 2
+            if should_strip:
+                ws_name = workspace.parts[-1] if workspace.parts else ""
+                if parts[0] != ws_name:
+                    logger.debug(
+                        "Stripping project wrapper %r from path (local workspace is %r)",
+                        parts[0], ws_name,
+                    )
+                relative = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+        elif parts and workspace.parts and workspace.parts[-1] == parts[0]:
+            # Legacy dedup: strip only when workspace name matches the first segment.
             relative = Path(*parts[1:]) if len(parts) > 1 else Path(".")
 
         if str(relative) == ".":

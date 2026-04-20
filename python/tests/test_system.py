@@ -148,9 +148,11 @@ class TestWriteCode(unittest.TestCase):
     # --- container path remapping ---
 
     def test_absolute_app_project_remapped(self):
+        # /app/project/{project-name}/{file}: first segment is the project wrapper and is
+        # stripped. "src" here is the project name on the backend; file lands at workspace root.
         r = arun(self.h.handle_command(self.cmd(filename="/app/project/src/main.py", code="# main")))
         self.assertEqual(r["status"], "success")
-        self.assertTrue(Path(self.td, "src/main.py").exists())
+        self.assertTrue(Path(self.td, "main.py").exists())
 
     def test_absolute_app_root_remapped(self):
         r = arun(self.h.handle_command(self.cmd(filename="/app/model.py", code="# model")))
@@ -702,6 +704,64 @@ class TestRemapToWorkspace(unittest.TestCase):
     def test_unknown_root_falls_back_to_filename(self):
         result = self.remap("/some/unknown/root/file.py")
         self.assertEqual(result, str(self.ws / "file.py"))
+
+    # ------------------------------------------------------------------
+    # strip_project_wrapper=True — the fix for mismatched project names
+    # ------------------------------------------------------------------
+
+    def remap_strip(self, path: str, workdir: str | None = None) -> str:
+        """Remap with strip_project_wrapper=True (filename context — is_workdir=False)."""
+        return str(self.h._remap_to_workspace(Path(path), self.ws, workdir, strip_project_wrapper=True))
+
+    def remap_strip_wd(self, path: str) -> str:
+        """Remap with strip_project_wrapper=True, is_workdir=True (workdir remap context)."""
+        return str(self.h._remap_to_workspace(Path(path), self.ws, None, strip_project_wrapper=True, is_workdir=True))
+
+    def test_strip_wrapper_matching_name_same_result(self):
+        """When workspace name matches the wrapper, stripping still gives the correct path."""
+        ws_name = self.ws.name
+        result = self.remap_strip(f"/app/project/{ws_name}/model.py")
+        self.assertEqual(result, str(self.ws / "model.py"))
+
+    def test_strip_wrapper_mismatched_name(self):
+        """Core fix: project wrapper is stripped even when workspace name differs."""
+        result = self.remap_strip("/app/project/test_2/model.py")
+        self.assertEqual(result, str(self.ws / "model.py"))
+
+    def test_strip_wrapper_nested_path(self):
+        """Deep path: wrapper stripped, subdirectory structure preserved."""
+        result = self.remap_strip("/app/project/test_2/src/utils.py")
+        self.assertEqual(result, str(self.ws / "src/utils.py"))
+
+    def test_strip_wrapper_filename_at_container_root_kept(self):
+        """Single-segment after /app/project/ is treated as a filename, not stripped."""
+        result = self.remap_strip("/app/project/model.py")
+        self.assertEqual(result, str(self.ws / "model.py"))
+
+    def test_strip_wrapper_workdir_single_segment_maps_to_workspace(self):
+        """workdir=/app/project/test_2 (is_workdir=True) maps to workspace root."""
+        result = self.remap_strip_wd("/app/project/test_2")
+        self.assertEqual(result, str(self.ws))
+
+    def test_strip_wrapper_workdir_subdir(self):
+        """workdir=/app/project/test_2/demo → workspace/demo."""
+        result = self.remap_strip_wd("/app/project/test_2/demo")
+        self.assertEqual(result, str(self.ws / "demo"))
+
+    def test_strip_wrapper_workdir_hint_takes_priority(self):
+        """workdir_hint is still applied before any stripping."""
+        result = self.remap_strip("/app/project/sub/model.py", workdir="/app/project/sub")
+        self.assertEqual(result, str(self.ws / "model.py"))
+
+    def test_strip_wrapper_only_applies_to_app_project_root(self):
+        """/app and /workspace roots are not subject to wrapper stripping."""
+        self.assertEqual(self.remap_strip("/app/model.py"), str(self.ws / "model.py"))
+        self.assertEqual(self.remap_strip("/workspace/train.py"), str(self.ws / "train.py"))
+        self.assertEqual(self.remap_strip("/project/run.sh"), str(self.ws / "run.sh"))
+
+    def test_strip_wrapper_exact_app_project_root(self):
+        """Exact /app/project with no file still maps to workspace."""
+        self.assertEqual(self.remap_strip("/app/project"), str(self.ws))
 
 
 # ===========================================================================

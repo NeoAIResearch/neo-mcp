@@ -170,18 +170,28 @@ function hCreateSession(cmd: Command): ActionResult {
   };
 }
 
-export function remapToWorkspace(absPath: string, workspace: string, workdir: string): string {
+export function remapToWorkspace(absPath: string, workspace: string, workdir: string, stripProjectWrapper = false, isWorkdir = false): string {
   let relative: string | null = null;
+  let usedAppProjectRoot = false;
 
-  // Try workdir as the container root (e.g. workdir=/app/project, path=/app/project/src/main.py)
+  // Try workdir as the container root (e.g. workdir=/app/project/myproj, path=.../myproj/src/main.py)
   if (workdir && isAbsolute(workdir)) {
     const wd = resolve(workdir);
     if (absPath.startsWith(wd + '/')) relative = absPath.slice(wd.length + 1);
   }
 
-  // Try known backend container roots
+  // Try /app/project first (tracked separately for stripProjectWrapper logic)
   if (relative === null) {
-    for (const root of ['/app/project', '/app', '/workspace', '/project']) {
+    if (absPath === '/app/project') { relative = ''; usedAppProjectRoot = true; }
+    else if (absPath.startsWith('/app/project/')) {
+      relative = absPath.slice('/app/project/'.length);
+      usedAppProjectRoot = true;
+    }
+  }
+
+  // Try remaining known backend container roots
+  if (relative === null) {
+    for (const root of ['/app', '/workspace', '/project']) {
       if (absPath === root) { relative = ''; break; }
       if (absPath.startsWith(root + '/')) {
         relative = absPath.slice(root.length + 1);
@@ -193,14 +203,31 @@ export function remapToWorkspace(absPath: string, workspace: string, workdir: st
   // Last resort: preserve just the filename
   if (relative === null) return join(workspace, absPath.split('/').pop() ?? absPath);
 
-  // Deduplicate: if workspace ends with the first path segment of relative,
-  // the user's workspace IS that directory — don't nest it again.
-  // e.g. workspace=/project/test_2, relative=test_2/file.py → file.py
-  const wsBase = workspace.endsWith('/') ? workspace.slice(0, -1) : workspace;
-  const slashIdx = relative.indexOf('/');
-  const firstSeg = slashIdx >= 0 ? relative.slice(0, slashIdx) : relative;
-  if (firstSeg && wsBase.endsWith('/' + firstSeg)) {
-    relative = slashIdx >= 0 ? relative.slice(slashIdx + 1) : '';
+  if (relative) {
+    const slashIdx = relative.indexOf('/');
+    const firstSeg = slashIdx >= 0 ? relative.slice(0, slashIdx) : relative;
+    const wsName = workspace.replace(/\/$/, '').split('/').pop() ?? '';
+
+    if (stripProjectWrapper && usedAppProjectRoot && firstSeg) {
+      // Strip the project-name wrapper (first segment after /app/project/).
+      // The backend always wraps files under /app/project/{project-name}/.
+      //
+      // For filenames (isWorkdir=false): only strip when 2+ segments exist —
+      // a single segment like /app/project/model.py is the filename itself, keep it.
+      // For workdirs (isWorkdir=true): always strip — a single segment like
+      // /app/project/test_2 is the project root directory, maps to workspace.
+      const shouldStrip = isWorkdir || slashIdx >= 0;
+      if (shouldStrip) {
+        if (firstSeg !== wsName) {
+          console.error(`[remap] stripping project wrapper "${firstSeg}" (local workspace name is "${wsName}")`);
+        }
+        relative = slashIdx >= 0 ? relative.slice(slashIdx + 1) : '';
+      }
+    } else if (firstSeg && wsName === firstSeg) {
+      // Legacy dedup: strip only when workspace name matches the first segment.
+      // Used by remapCommandPaths where segments may be real subdirectory names.
+      relative = slashIdx >= 0 ? relative.slice(slashIdx + 1) : '';
+    }
   }
 
   return relative ? join(workspace, relative) : workspace;
@@ -246,15 +273,15 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
     // If the path is already inside the local workspace or /tmp, use it as-is.
     // Otherwise it's a backend container path (e.g. /app/project/src/main.py) — remap.
     const direct = safeResolve(workspace, filename);
-    full = direct ?? remapToWorkspace(resolved, workspace, workdir);
+    full = direct ?? remapToWorkspace(resolved, workspace, workdir, true);
     console.error(`[write_code] remapped ${filename} → ${full}`);
   } else {
     // Relative filename: if workdir is absolute (backend container path like /app/project/test_2/demo),
     // remap it to the local workspace to preserve subdirectory structure.
-    // e.g. workdir=/app/project/test_2/demo → base=<workspace>/test_2/demo
+    // e.g. workdir=/app/project/test_2/demo → base=<workspace>/demo (project wrapper stripped)
     const base = workdir
       ? isAbsolute(workdir)
-        ? remapToWorkspace(resolve(workdir), workspace, '')
+        ? remapToWorkspace(resolve(workdir), workspace, '', true, true)
         : join(workspace, workdir)
       : workspace;
     const candidate = safeResolve(base, filename) ?? safeResolve(workspace, filename);
@@ -284,7 +311,7 @@ function hGetFile(cmd: Command, workspace: string): ActionResult {
   // Try direct resolution first; if outside workspace (backend container path), remap it.
   let full = safeResolve(workspace, fp);
   if (!full && isAbsolute(fp)) {
-    full = remapToWorkspace(resolve(fp), workspace, '');
+    full = remapToWorkspace(resolve(fp), workspace, '', true);
     console.error(`[get_file] remapped ${fp} → ${full}`);
   }
   if (!full || !existsSync(full) || !statSync(full).isFile()) {
@@ -463,7 +490,7 @@ function hListFiles(cmd: Command, workspace: string): ActionResult {
     if (direct) {
       target = direct;
     } else {
-      target = remapToWorkspace(resolve(directory), workspace, '');
+      target = remapToWorkspace(resolve(directory), workspace, '', true);
       console.error(`[list_files] remapped ${directory} → ${target}`);
     }
   } else {
@@ -515,7 +542,7 @@ function hListFiles(cmd: Command, workspace: string): ActionResult {
 // ---------------------------------------------------------------------------
 
 export async function dispatch(cmd: Command, workspace: string): Promise<ActionResult> {
-  console.error(`[dispatch] action=${cmd.action} request_id=${cmd.request_id}`);
+  console.error(`[dispatch] action=${cmd.action} request_id=${cmd.request_id} thread_id=${cmd.thread_id ?? 'none'}`);
   try {
     switch (cmd.action) {
       case 'create_session':  return hCreateSession(cmd);
