@@ -172,7 +172,7 @@ function hCreateSession(cmd: Command): ActionResult {
 
 export function remapToWorkspace(absPath: string, workspace: string, workdir: string, stripProjectWrapper = false, isWorkdir = false): string {
   let relative: string | null = null;
-  let usedAppProjectRoot = false;
+  let stripableRoot = false;
 
   // Try workdir as the container root (e.g. workdir=/app/project/myproj, path=.../myproj/src/main.py)
   if (workdir && isAbsolute(workdir)) {
@@ -180,21 +180,23 @@ export function remapToWorkspace(absPath: string, workspace: string, workdir: st
     if (absPath.startsWith(wd + '/')) relative = absPath.slice(wd.length + 1);
   }
 
-  // Try /app/project first (tracked separately for stripProjectWrapper logic)
+  // Try /app/project first (tracked separately to keep most-specific match precedence)
   if (relative === null) {
-    if (absPath === '/app/project') { relative = ''; usedAppProjectRoot = true; }
+    if (absPath === '/app/project') { relative = ''; stripableRoot = true; }
     else if (absPath.startsWith('/app/project/')) {
       relative = absPath.slice('/app/project/'.length);
-      usedAppProjectRoot = true;
+      stripableRoot = true;
     }
   }
 
-  // Try remaining known backend container roots
+  // Try remaining known backend container roots — these are also strip-eligible
+  // because the backend wraps files under <container_root>/<project_name>/.
   if (relative === null) {
     for (const root of ['/app', '/workspace', '/project']) {
-      if (absPath === root) { relative = ''; break; }
+      if (absPath === root) { relative = ''; stripableRoot = true; break; }
       if (absPath.startsWith(root + '/')) {
         relative = absPath.slice(root.length + 1);
+        stripableRoot = true;
         break;
       }
     }
@@ -208,19 +210,17 @@ export function remapToWorkspace(absPath: string, workspace: string, workdir: st
     const firstSeg = slashIdx >= 0 ? relative.slice(0, slashIdx) : relative;
     const wsName = workspace.replace(/\/$/, '').split('/').pop() ?? '';
 
-    if (stripProjectWrapper && usedAppProjectRoot && firstSeg) {
-      // Strip the project-name wrapper (first segment after /app/project/).
-      // The backend always wraps files under /app/project/{project-name}/.
+    if (stripProjectWrapper && stripableRoot && firstSeg) {
+      // Strip the project-name wrapper (first segment after the container root).
+      // The backend always wraps files under <container_root>/{project-name}/.
       //
       // For filenames (isWorkdir=false): only strip when 2+ segments exist —
-      // a single segment like /app/project/model.py is the filename itself, keep it.
+      // a single segment like /app/model.py is the filename itself, keep it.
       // For workdirs (isWorkdir=true): always strip — a single segment like
-      // /app/project/test_2 is the project root directory, maps to workspace.
+      // /app/test_2 is the project root directory, maps to workspace.
       const shouldStrip = isWorkdir || slashIdx >= 0;
       if (shouldStrip) {
-        if (firstSeg !== wsName) {
-          console.error(`[remap] stripping project wrapper "${firstSeg}" (local workspace name is "${wsName}")`);
-        }
+        console.error(`[remap] stripping project wrapper "${firstSeg}" from ${absPath} (local workspace name is "${wsName}")`);
         relative = slashIdx >= 0 ? relative.slice(slashIdx + 1) : '';
       }
     } else if (firstSeg && wsName === firstSeg) {
@@ -513,11 +513,13 @@ function hListFiles(cmd: Command, workspace: string): ActionResult {
   let target: string;
   if (isAbsolute(directory)) {
     // If outside workspace (backend container path like /app/project), remap to local workspace.
+    // isWorkdir=true so a single-segment wrapper like /app/myproj_0001 maps to workspace root
+    // rather than a wrapper subfolder that doesn't exist on disk.
     const direct = safeResolve(workspace, directory);
     if (direct) {
       target = direct;
     } else {
-      target = remapToWorkspace(resolve(directory), workspace, '', true);
+      target = remapToWorkspace(resolve(directory), workspace, '', true, true);
       console.error(`[list_files] remapped ${directory} → ${target}`);
     }
   } else {
