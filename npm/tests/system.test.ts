@@ -38,6 +38,7 @@ import {
   realResolve, safeResolve,
   remapToWorkspace, remapCommandPaths,
   dispatch, Command,
+  extractWrapper, stripWrapperPrefixes, _resetWrappersForTests,
 } from '../src/executor.js';
 import {
   deriveDeploymentId, getAuthToken,
@@ -415,6 +416,63 @@ describe('remapCommandPaths', () => {
   it('remaps container path in cat command', () => {
     expect(remapCommandPaths('cat /app/project/README.md', '/root/proj'))
       .toBe('cat /root/proj/README.md');
+  });
+});
+
+// ===========================================================================
+// PART 4b — relative wrapper strip (cross-script rewrites via thread slug)
+// ===========================================================================
+
+describe('relative wrapper strip', () => {
+  beforeEach(() => _resetWrappersForTests());
+
+  it('extractWrapper picks the slug from /app/<slug>/...', () => {
+    expect(extractWrapper('/app/movie_recommender_system_1703/data/x.txt'))
+      .toBe('movie_recommender_system_1703');
+    expect(extractWrapper('/app/project/foo/bar.py')).toBe('foo');
+  });
+
+  it('extractWrapper returns null for non-container / bare-root paths', () => {
+    expect(extractWrapper('/tmp/script.sh')).toBeNull();
+    expect(extractWrapper('/app/bare.py')).toBeNull();  // no wrapper after /app/
+  });
+
+  it('stripWrapperPrefixes rewrites mkdir prefix', () => {
+    expect(stripWrapperPrefixes('mkdir -p my_proj_0001/data', 'my_proj_0001'))
+      .toBe('mkdir -p data');
+  });
+
+  it('stripWrapperPrefixes replaces bare "<wrapper>" with "."', () => {
+    expect(stripWrapperPrefixes('cd my_proj_0001 && python main.py', 'my_proj_0001'))
+      .toBe('cd . && python main.py');
+  });
+
+  it('does NOT strip when wrapper is only a substring', () => {
+    expect(stripWrapperPrefixes('ls my_my_proj_0001/foo', 'my_proj_0001'))
+      .toBe('ls my_my_proj_0001/foo');
+  });
+
+  it('write_code then subsequent shell-script write rewrites slug', async () => {
+    const ws = makeWs();
+    try {
+      await dispatch(
+        makeCmd({ action: 'write_code', filename: '/app/my_proj_0001/data/seed.txt', code: 'seed', thread_id: 't-w1' }),
+        ws,
+      );
+      await dispatch(
+        makeCmd({
+          action: 'write_code',
+          filename: '.tmp/neo_exec.sh',
+          code: 'mkdir -p my_proj_0001/data && cd my_proj_0001 && ls',
+          thread_id: 't-w1',
+        }),
+        ws,
+      );
+      expect(readFileSync(join(ws, '.tmp/neo_exec.sh'), 'utf8'))
+        .toBe('mkdir -p data && cd . && ls');
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
   });
 });
 

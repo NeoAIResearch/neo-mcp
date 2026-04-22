@@ -53,9 +53,74 @@ class ActionHandlers:
         self._job_manager = job_manager
         self._default_workspace = default_workspace
         self._thread_workspaces = thread_workspaces  # shared mutable dict
+        # Per-thread Neo project slug (e.g. "movie_recommender_system_1703"), captured
+        # the first time we see an absolute container path for the thread. Used to
+        # rewrite *relative* wrapper references that Neo embeds inside shell scripts
+        # (`mkdir -p <slug>/data`) — those aren't caught by _remap_command_paths because
+        # there's no syntactic marker. Without this, scripts executed with cwd=<workspace>
+        # create <workspace>/<slug>/data instead of <workspace>/data.
+        self._thread_wrappers: dict[str, str] = {}
 
     def update_workspace(self, workspace: str) -> None:
         self._default_workspace = workspace
+
+    # ------------------------------------------------------------------
+    # Wrapper-slug tracking — for relative-path rewrites in scripts/commands
+    # ------------------------------------------------------------------
+
+    _CONTAINER_ROOTS = (Path("/app/project"), Path("/app"), Path("/workspace"), Path("/project"))
+
+    def _extract_wrapper(self, abs_path: Path) -> Optional[str]:
+        """Return Neo's project-name wrapper if abs_path is /<container-root>/<wrapper>/...
+
+        Examples:
+            /app/movie_recommender_system_1703/data/x.txt → "movie_recommender_system_1703"
+            /app/project/foo/bar.py                       → "foo"
+            /tmp/script.sh                                → None
+        """
+        for root in self._CONTAINER_ROOTS:
+            try:
+                rel = abs_path.relative_to(root)
+            except ValueError:
+                continue
+            parts = rel.parts
+            if len(parts) >= 2:  # need wrapper + something after
+                return parts[0]
+            return None
+        return None
+
+    def _record_wrapper(self, thread_id: Optional[str], abs_path: Path) -> None:
+        if not thread_id or thread_id in self._thread_wrappers:
+            return
+        slug = self._extract_wrapper(abs_path)
+        if slug:
+            self._thread_wrappers[thread_id] = slug
+            logger.info("Recorded Neo project wrapper for thread %s: %r", thread_id, slug)
+
+    def _strip_wrapper_prefixes(self, text: str, wrapper: str) -> str:
+        """Rewrite relative references to Neo's project wrapper in shell text.
+
+        Neo emits scripts with `mkdir -p <wrapper>/data` and commands like
+        `cd <wrapper> && python main.py`, assuming cwd = /app/<wrapper>/ in its
+        container. Our daemon runs with cwd = <workspace>, so those need to become
+        `mkdir -p data` / `cd .` to avoid nesting a <wrapper>/ folder inside the
+        user's workspace.
+        """
+        # Strip "<wrapper>/" (with anything following): the remainder is the real path.
+        # Negative lookbehind avoids mid-word matches (e.g. `my_<wrapper>/` stays).
+        text = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(wrapper)}/', '', text)
+        # Bare "<wrapper>" token (no trailing /): substitute "." so `cd <wrapper>` → `cd .`.
+        text = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(wrapper)}(?![A-Za-z0-9_])', '.', text)
+        return text
+
+    def _apply_wrapper_rewrite(self, text: str, thread_id: Optional[str]) -> str:
+        slug = self._thread_wrappers.get(thread_id) if thread_id else None
+        if not slug:
+            return text
+        rewritten = self._strip_wrapper_prefixes(text, slug)
+        if rewritten != text:
+            logger.info("Stripped wrapper %r from %d chars of shell text", slug, len(text))
+        return rewritten
 
     # ------------------------------------------------------------------
     # Public dispatch entry point
@@ -133,6 +198,9 @@ class ActionHandlers:
 
         if os.path.isabs(filename):
             candidate = Path(filename).resolve()
+            # Opportunistically learn Neo's project-slug for this thread so scripts
+            # written later can have their relative <slug>/ references rewritten.
+            self._record_wrapper(thread_id, candidate)
             if self._is_allowed_path(candidate, ws_resolved):
                 file_path = candidate
             else:
@@ -164,6 +232,13 @@ class ActionHandlers:
                 return {"request_id": request_id, "status": "error", "error": "Path traversal detected"}
             file_path = candidate
 
+        # Rewrite Neo's relative <slug>/ references inside shell scripts. Without this
+        # a script like `mkdir -p <slug>/data` creates <workspace>/<slug>/data when the
+        # daemon runs it with cwd=<workspace> — the slug was meant relative to Neo's
+        # container cwd (/app/<slug>/) and has no meaning on the host.
+        if file_path.suffix in (".sh", ".bash") or (isinstance(code, str) and code.startswith("#!")):
+            code = self._apply_wrapper_rewrite(code, thread_id)
+
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(code, encoding="utf-8")
         logger.info("File written: %s", file_path)
@@ -194,6 +269,7 @@ class ActionHandlers:
 
         if os.path.isabs(file_path_raw):
             candidate = Path(file_path_raw).resolve()
+            self._record_wrapper(thread_id, candidate)
             if self._is_allowed_path(candidate, ws_resolved):
                 resolved = candidate
             else:
@@ -259,6 +335,11 @@ class ActionHandlers:
         if remapped_cmd != command_str:
             logger.info("run_subprocess: remapped paths: %s → %s", command_str[:80], remapped_cmd[:80])
         command_str = remapped_cmd
+
+        # Strip relative wrapper references (`cd <slug>`, `mkdir <slug>/data`) for which
+        # _remap_command_paths can't help — they're syntactically indistinguishable from
+        # real subdirs. We use the slug captured from earlier absolute writes on this thread.
+        command_str = self._apply_wrapper_rewrite(command_str, thread_id)
 
         # Ensure workspace exists before spawning — mirrors npm mkdirSync(safeCwd).
         ws_path.mkdir(parents=True, exist_ok=True)

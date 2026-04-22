@@ -263,9 +263,62 @@ export function remapCommandPaths(command: string, workspace: string): string {
   return result;
 }
 
+// Per-thread Neo project slug (e.g. "movie_recommender_system_1703"), captured the
+// first time we see an absolute container path for the thread. Used to rewrite
+// *relative* wrapper references Neo embeds inside shell scripts (`mkdir -p <slug>/data`)
+// — those aren't caught by remapCommandPaths because there's no syntactic marker.
+const _threadWrappers = new Map<string, string>();
+
+const _CONTAINER_ROOTS = ['/app/project', '/app', '/workspace', '/project'];
+
+export function extractWrapper(absPath: string): string | null {
+  for (const root of _CONTAINER_ROOTS) {
+    if (absPath === root) return null;
+    if (absPath.startsWith(root + '/')) {
+      const rel = absPath.slice(root.length + 1);
+      const slashIdx = rel.indexOf('/');
+      return slashIdx > 0 ? rel.slice(0, slashIdx) : null; // need wrapper + something after
+    }
+  }
+  return null;
+}
+
+function recordWrapper(threadId: string | undefined, absPath: string): void {
+  if (!threadId || _threadWrappers.has(threadId)) return;
+  const slug = extractWrapper(absPath);
+  if (slug) {
+    _threadWrappers.set(threadId, slug);
+    console.error(`[wrapper] recorded Neo project wrapper for thread ${threadId}: ${slug}`);
+  }
+}
+
+export function stripWrapperPrefixes(text: string, wrapper: string): string {
+  const escaped = wrapper.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Strip "<wrapper>/" (with anything following); negative lookbehind to avoid mid-word matches.
+  text = text.replace(new RegExp(`(?<![A-Za-z0-9_])${escaped}/`, 'g'), '');
+  // Bare "<wrapper>" token: substitute "." so `cd <wrapper>` → `cd .`.
+  text = text.replace(new RegExp(`(?<![A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`, 'g'), '.');
+  return text;
+}
+
+function applyWrapperRewrite(text: string, threadId: string | undefined): string {
+  const slug = threadId ? _threadWrappers.get(threadId) : undefined;
+  if (!slug) return text;
+  const rewritten = stripWrapperPrefixes(text, slug);
+  if (rewritten !== text) {
+    console.error(`[wrapper] stripped ${slug} from ${text.length} chars of shell text`);
+  }
+  return rewritten;
+}
+
+// Test-only: reset per-thread wrapper state between assertions.
+export function _resetWrappersForTests(): void {
+  _threadWrappers.clear();
+}
+
 function hWriteCode(cmd: Command, workspace: string): ActionResult {
   let filename = fieldString(cmd, 'filename');
-  const code = fieldString(cmd, 'code') ?? (typeof cmd.code === 'string' ? cmd.code : undefined);
+  let code = fieldString(cmd, 'code') ?? (typeof cmd.code === 'string' ? cmd.code : undefined);
   if (!filename || code === undefined) {
     return { request_id: cmd.request_id, status: 'error', error: 'filename and code are required' };
   }
@@ -287,6 +340,9 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
 
   if (isAbsolute(filename)) {
     const resolved = resolve(filename);
+    // Opportunistically learn Neo's project-slug for this thread so scripts
+    // written later can have their relative <slug>/ references rewritten.
+    recordWrapper(cmd.thread_id, resolved);
     // If the path is already inside the local workspace or /tmp, use it as-is.
     // Otherwise it's a backend container path (e.g. /app/project/src/main.py) — remap.
     const direct = safeResolve(workspace, filename);
@@ -318,6 +374,14 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
     full = candidate;
   }
 
+  // Rewrite Neo's relative <slug>/ references inside shell scripts. Without this a
+  // script like `mkdir -p <slug>/data` creates <workspace>/<slug>/data when the daemon
+  // runs it with cwd=<workspace> — the slug was meant relative to Neo's container cwd
+  // (/app/<slug>/) and has no meaning on the host.
+  if (full.endsWith('.sh') || full.endsWith('.bash') || code.startsWith('#!')) {
+    code = applyWrapperRewrite(code, cmd.thread_id);
+  }
+
   mkdirSync(dirname(full), { recursive: true });
   writeFileSync(full, code, 'utf8');
   console.error(`[write_code] wrote ${full}`);
@@ -339,6 +403,9 @@ function hGetFile(cmd: Command, workspace: string): ActionResult {
   if (!isAbsolute(fp) && CONTAINER_REL_PREFIXES.some(p => fp!.startsWith(p))) {
     console.error(`[get_file] normalized container-relative path "${fp}" → "/${fp}"`);
     fp = '/' + fp;
+  }
+  if (isAbsolute(fp)) {
+    recordWrapper(cmd.thread_id, resolve(fp));
   }
   // Try direct resolution first; if outside workspace (backend container path), remap it.
   let full = safeResolve(workspace, fp);
@@ -389,10 +456,14 @@ async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionRe
   // Remap container paths in the command string so shell commands like
   // `ls /app/project/foo` work on the host filesystem — mirrors Python
   // ActionHandlers._remap_command_paths().
-  const remappedCommand = remapCommandPaths(command, workspace);
+  let remappedCommand = remapCommandPaths(command, workspace);
   if (remappedCommand !== command) {
     console.error(`[run_subprocess] remapped paths: ${command.slice(0, 80)} → ${remappedCommand.slice(0, 80)}`);
   }
+  // Strip relative wrapper references (`cd <slug>`, `mkdir <slug>/data`) for which
+  // remapCommandPaths can't help — they're syntactically indistinguishable from real
+  // subdirs. Uses the slug captured from earlier absolute writes on this thread.
+  remappedCommand = applyWrapperRewrite(remappedCommand, cmd.thread_id);
 
   // Ensure workspace exists before spawning — cwd must exist or spawn throws ENOENT
   mkdirSync(safeCwd, { recursive: true });

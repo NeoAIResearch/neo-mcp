@@ -1356,6 +1356,86 @@ class TestDeploymentId(unittest.TestCase):
         self.assertEqual(id1, id2)
 
 
+class TestRelativeWrapperStrip(unittest.IsolatedAsyncioTestCase):
+    """Strip Neo's relative <slug>/ references from scripts and commands.
+
+    Neo writes shell scripts whose bodies contain `mkdir -p <slug>/data` and commands
+    like `cd <slug> && python main.py`, assuming cwd=/app/<slug>/ on its container.
+    Our daemon runs with cwd=<workspace>, so the slug prefix must be stripped or we
+    get <workspace>/<slug>/data instead of <workspace>/data.
+    """
+
+    def setUp(self):
+        self.td = make_ws()
+        self.h, _ = make_handlers(workspace=self.td)
+        self.ws = Path(self.td)
+        self.tid = "t-wrap-1"
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_extract_wrapper_from_app_path(self):
+        self.assertEqual(
+            self.h._extract_wrapper(Path("/app/movie_recommender_system_1703/data/x.txt")),
+            "movie_recommender_system_1703",
+        )
+        self.assertEqual(
+            self.h._extract_wrapper(Path("/app/project/foo/bar.py")),
+            "foo",
+        )
+
+    def test_extract_wrapper_returns_none_for_non_container_paths(self):
+        self.assertIsNone(self.h._extract_wrapper(Path("/tmp/script.sh")))
+        self.assertIsNone(self.h._extract_wrapper(Path("/app/bare.py")))  # no wrapper after /app/
+
+    def test_record_wrapper_first_abs_write_captures_slug(self):
+        self.h._record_wrapper(self.tid, Path("/app/my_proj_0001/data/a.txt"))
+        self.assertEqual(self.h._thread_wrappers[self.tid], "my_proj_0001")
+
+    def test_record_wrapper_is_sticky_not_overwritten(self):
+        self.h._record_wrapper(self.tid, Path("/app/my_proj_0001/data/a.txt"))
+        self.h._record_wrapper(self.tid, Path("/app/different_proj_9999/data/b.txt"))
+        self.assertEqual(self.h._thread_wrappers[self.tid], "my_proj_0001")
+
+    def test_strip_prefix_in_mkdir(self):
+        result = self.h._strip_wrapper_prefixes("mkdir -p my_proj_0001/data", "my_proj_0001")
+        self.assertEqual(result, "mkdir -p data")
+
+    def test_strip_bare_wrapper_in_cd(self):
+        result = self.h._strip_wrapper_prefixes("cd my_proj_0001 && python main.py", "my_proj_0001")
+        self.assertEqual(result, "cd . && python main.py")
+
+    def test_no_strip_when_wrapper_is_substring(self):
+        # `my_my_proj_0001` is a different identifier — must NOT be stripped.
+        result = self.h._strip_wrapper_prefixes("ls my_my_proj_0001/foo", "my_proj_0001")
+        self.assertEqual(result, "ls my_my_proj_0001/foo")
+
+    def test_write_code_rewrites_shell_script(self):
+        import asyncio
+        # Prime the wrapper via an earlier absolute write.
+        asyncio.run(self.h._write_code({
+            "request_id": "r1", "thread_id": self.tid,
+            "filename": "/app/my_proj_0001/data/seed.txt", "code": "seed",
+        }))
+        # Now write a script whose body uses the relative wrapper.
+        asyncio.run(self.h._write_code({
+            "request_id": "r2", "thread_id": self.tid,
+            "filename": ".tmp/neo_exec.sh",
+            "code": "mkdir -p my_proj_0001/data && cd my_proj_0001 && ls",
+        }))
+        content = (self.ws / ".tmp" / "neo_exec.sh").read_text()
+        self.assertEqual(content, "mkdir -p data && cd . && ls")
+
+    def test_run_subprocess_strips_wrapper_from_command(self):
+        self.h._thread_wrappers[self.tid] = "movie_recommender_system_1703"
+        # Inspect the rewrite via the public helper since _run_subprocess spawns a job.
+        rewritten = self.h._apply_wrapper_rewrite(
+            "mkdir -p movie_recommender_system_1703/data",
+            self.tid,
+        )
+        self.assertEqual(rewritten, "mkdir -p data")
+
+
 class TestWorkspaceSelfGuard(unittest.TestCase):
     """Reject a workspace that equals the neo-mcp server source tree itself."""
 
