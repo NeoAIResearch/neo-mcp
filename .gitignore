@@ -19,6 +19,7 @@ neo-agent/releases/
 
 # Test artifacts
 test_run/
+test_workflow/
 filelister_*.py
 neo_test_*.py
 go_daemon_proof.txt

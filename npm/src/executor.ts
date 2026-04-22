@@ -251,7 +251,12 @@ export function remapCommandPaths(command: string, workspace: string): string {
     const re = new RegExp(escapedRoot + '(/[^\\s\'"`;|&<>(){}\\[\\]\\\\]*)?', 'g');
     result = result.replace(re, (match) => {
       const trailingSlash = match.endsWith('/');
-      const remapped = remapToWorkspace(trailingSlash ? match.slice(0, -1) : match, workspace, '');
+      // Mirror write_code's wrapper-stripping: Neo always wraps its files under
+      // <container_root>/<project-name>/, so `ls /app/<proj>/data/` must resolve
+      // to `<workspace>/data/` — not `<workspace>/<proj>/data/`. Without this,
+      // write_code lands at `<workspace>/data/x.txt` but Neo's verify subprocess
+      // looks at `<workspace>/<proj>/data/x.txt` (wrong) and retries forever.
+      const remapped = remapToWorkspace(trailingSlash ? match.slice(0, -1) : match, workspace, '', true);
       return trailingSlash && !remapped.endsWith('/') ? remapped + '/' : remapped;
     });
   }

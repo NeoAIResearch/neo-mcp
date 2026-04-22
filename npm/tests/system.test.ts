@@ -382,9 +382,19 @@ describe('remapCommandPaths', () => {
   });
 
   it('remaps multiple container paths in one command', () => {
-    const cmd = 'cp /app/project/src/a.py /app/project/dst/a.py';
+    // Neo always wraps under /app/<project-name>/ — the wrapper is stripped by
+    // remapCommandPaths (mirrors write_code) so `src` and `dst` land as subdirs.
+    const cmd = 'cp /app/myproj/src/a.py /app/myproj/dst/a.py';
     expect(remapCommandPaths(cmd, '/root/proj'))
       .toBe('cp /root/proj/src/a.py /root/proj/dst/a.py');
+  });
+
+  it('strips project wrapper for verify subprocess (regression)', () => {
+    // Regression: Neo verifies writes via `test -f /app/<proj>/data/x.txt`. The
+    // subprocess remap must match write_code's wrapper-stripping, else verify
+    // looks at <ws>/<proj>/data/x.txt (doesn't exist) and Neo loops forever.
+    expect(remapCommandPaths('test -f "/app/rag_pipeline/data/ml_docs.txt"', '/root/proj'))
+      .toBe('test -f "/root/proj/data/ml_docs.txt"');
   });
 
   it('deduplicates workspace name in command path', () => {

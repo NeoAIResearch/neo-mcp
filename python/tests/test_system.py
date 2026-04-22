@@ -939,9 +939,19 @@ class TestRemapCommandPaths(unittest.TestCase):
         self.assertEqual(self.remap("bash /project/run.sh"), f"bash {self.ws}/run.sh")
 
     def test_remaps_multiple_paths_in_command(self):
-        result = self.remap("cp /app/project/src/a.py /app/project/dst/a.py")
+        # Neo always wraps under /app/<project-name>/ — the wrapper is stripped by
+        # remapCommandPaths (mirrors write_code) so `src` and `dst` land as subdirs.
+        result = self.remap("cp /app/myproj/src/a.py /app/myproj/dst/a.py")
         self.assertIn(str(self.ws / "src/a.py"), result)
         self.assertIn(str(self.ws / "dst/a.py"), result)
+
+    def test_strips_project_wrapper_for_verify_subprocess(self):
+        # Regression: Neo verifies writes via `test -f /app/<proj>/data/x.txt`. The
+        # subprocess remap must match write_code's wrapper-stripping, else verify
+        # looks at <ws>/<proj>/data/x.txt (doesn't exist) and Neo loops forever.
+        result = self.remap('test -f "/app/rag_pipeline/data/ml_docs.txt"')
+        self.assertIn(str(self.ws / "data/ml_docs.txt"), result)
+        self.assertNotIn("rag_pipeline", result)
 
     def test_leaves_non_container_paths_unchanged(self):
         cmd = "echo hello && ls /tmp/logs"
@@ -1344,6 +1354,46 @@ class TestDeploymentId(unittest.TestCase):
         id1 = get_or_create_deployment_id("sk-v1-first")
         id2 = get_or_create_deployment_id("sk-v1-second")
         self.assertEqual(id1, id2)
+
+
+class TestWorkspaceSelfGuard(unittest.TestCase):
+    """Reject a workspace that equals the neo-mcp server source tree itself."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+
+    def test_plain_dir_is_allowed(self):
+        from neo_mcp.server import _workspace_is_mcp_self
+        self.assertFalse(_workspace_is_mcp_self(self._tmp))
+
+    def test_mcp_repo_is_rejected(self):
+        from neo_mcp.server import _workspace_is_mcp_self
+        marker = Path(self._tmp) / "python" / "src" / "neo_mcp" / "server.py"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("# stub")
+        self.assertTrue(_workspace_is_mcp_self(self._tmp))
+
+    def test_nonexistent_path_is_allowed(self):
+        from neo_mcp.server import _workspace_is_mcp_self
+        self.assertFalse(_workspace_is_mcp_self("/does/not/exist"))
+
+    def test_submit_task_returns_error_for_self_repo(self):
+        from neo_mcp.server import _submit_task
+        marker = Path(self._tmp) / "python" / "src" / "neo_mcp" / "server.py"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("# stub")
+
+        client = MagicMock()
+        client.init_chat = AsyncMock()
+        poller = MagicMock()
+
+        result = asyncio.run(
+            _submit_task(client, "dep-id", poller, self._tmp, {"message": "hi", "workspace": self._tmp})
+        )
+        self.assertIn("error", result)
+        self.assertIn("neo-mcp server's own source tree", result["error"])
+        client.init_chat.assert_not_called()
 
 
 def _restore(key: str, val: str | None) -> None:
