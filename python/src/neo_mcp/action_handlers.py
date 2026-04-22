@@ -429,7 +429,12 @@ class ActionHandlers:
                 trailing = path_str.endswith('/')
                 stripped = path_str.rstrip('/')
                 path = Path(stripped) if stripped else _root
-                remapped = self._remap_to_workspace(path, _ws)
+                # Mirror write_code's wrapper-stripping: Neo always wraps its files under
+                # <container_root>/<project-name>/, so `ls /app/<proj>/data/` must resolve
+                # to `<workspace>/data/` — not `<workspace>/<proj>/data/`. Without this,
+                # write_code lands at `<workspace>/data/x.txt` but Neo's verify subprocess
+                # looks at `<workspace>/<proj>/data/x.txt` (wrong) and retries forever.
+                remapped = self._remap_to_workspace(path, _ws, strip_project_wrapper=True)
                 result_str = str(remapped)
                 if trailing and not result_str.endswith('/'):
                     result_str += '/'

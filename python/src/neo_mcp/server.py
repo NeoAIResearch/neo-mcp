@@ -473,6 +473,21 @@ def build_server(
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+def _workspace_is_mcp_self(workspace: str) -> bool:
+    """True if workspace points at the neo-mcp server's own source tree.
+
+    AI agents (Claude Code, etc.) default to `git rev-parse --show-toplevel` which,
+    when the user is cd'd inside the neo-mcp repo, resolves to the repo root and
+    causes Neo to write project files directly into the MCP source. The distinctive
+    marker python/src/neo_mcp/server.py uniquely identifies this repo.
+    """
+    try:
+        marker = Path(workspace).resolve() / "python" / "src" / "neo_mcp" / "server.py"
+        return marker.is_file()
+    except OSError:
+        return False
+
+
 async def _submit_task(
     client: BackendClient,
     deployment_id: str,
@@ -482,6 +497,15 @@ async def _submit_task(
 ) -> dict:
     message = args["message"]
     ws = args.get("workspace") or default_workspace
+    if _workspace_is_mcp_self(ws):
+        return {
+            "error": (
+                f"Refusing workspace {ws!r} — this is the neo-mcp server's own source tree. "
+                f"Neo would write task files directly into the MCP source code. "
+                f"Pick a different workspace: create a project folder (e.g. "
+                f"{os.path.join(ws, 'my_project')}) and resubmit with that path."
+            )
+        }
     data = await client.init_chat(message=message, deployment_id=deployment_id, workspace=ws)
     thread_id = data.get("thread_id")
     if thread_id:
