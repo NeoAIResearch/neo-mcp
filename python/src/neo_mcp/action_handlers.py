@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from .integrations import IntegrationManager
 from .job_manager import JobManager
 
 logger = logging.getLogger(__name__)
@@ -49,10 +50,12 @@ class ActionHandlers:
         job_manager: JobManager,
         default_workspace: str,
         thread_workspaces: dict[str, str],
+        integrations: Optional[IntegrationManager] = None,
     ) -> None:
         self._job_manager = job_manager
         self._default_workspace = default_workspace
         self._thread_workspaces = thread_workspaces  # shared mutable dict
+        self._integrations = integrations if integrations is not None else IntegrationManager()
         # Per-thread Neo project slug (e.g. "movie_recommender_system_1703"), captured
         # the first time we see an absolute container path for the thread. Used to
         # rewrite *relative* wrapper references that Neo embeds inside shell scripts
@@ -97,27 +100,55 @@ class ActionHandlers:
             self._thread_wrappers[thread_id] = slug
             logger.info("Recorded Neo project wrapper for thread %s: %r", thread_id, slug)
 
-    def _strip_wrapper_prefixes(self, text: str, wrapper: str) -> str:
-        """Rewrite relative references to Neo's project wrapper in shell text.
+    def _strip_wrapper_prefixes(
+        self, text: str, wrapper: str, workspace: Optional[Path] = None,
+    ) -> str:
+        """Rewrite Neo's project-wrapper references in shell text to host paths.
 
-        Neo emits scripts with `mkdir -p <wrapper>/data` and commands like
-        `cd <wrapper> && python main.py`, assuming cwd = /app/<wrapper>/ in its
-        container. Our daemon runs with cwd = <workspace>, so those need to become
-        `mkdir -p data` / `cd .` to avoid nesting a <wrapper>/ folder inside the
-        user's workspace.
+        Neo assumes cwd = /app/<wrapper>/ in its container. On the host the daemon
+        runs with cwd = <workspace>, so:
+
+        - Absolute refs `/<container-root>/<wrapper>[/...]` must become `<workspace>[/...]`
+          (otherwise scripts walk the host's real /app/ — which on dev machines is
+          often polluted with unrelated directories from prior runs).
+        - Relative refs like `mkdir -p <wrapper>/data` or `cd <wrapper>` need to
+          lose the wrapper so they resolve against <workspace>.
+
+        The absolute-remap step only runs when `workspace` is supplied.
         """
-        # Strip "<wrapper>/" (with anything following): the remainder is the real path.
-        # Negative lookbehind avoids mid-word matches (e.g. `my_<wrapper>/` stays).
-        text = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(wrapper)}/', '', text)
-        # Bare "<wrapper>" token (no trailing /): substitute "." so `cd <wrapper>` → `cd .`.
-        text = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(wrapper)}(?![A-Za-z0-9_])', '.', text)
+        # Step 1: absolute-container-path remap. Replace /<root>/<wrapper>[/...] with
+        # the host workspace. Longest container roots first so /app/project beats /app.
+        if workspace is not None:
+            ws_str = str(workspace)
+            roots_sorted = sorted(
+                (str(r) for r in self._CONTAINER_ROOTS),
+                key=len,
+                reverse=True,
+            )
+            for root in roots_sorted:
+                # Match /root/wrapper as a full path segment. Trailing context must
+                # be a path separator, whitespace, quote, closing paren, or end of
+                # string — so `/app/my_proj_0001` and `/app/my_proj_0001/foo` both
+                # match but `/app/my_proj_0001_backup` does not.
+                text = re.sub(
+                    rf'{re.escape(root)}/{re.escape(wrapper)}(?=[/\s\'"\)]|$)',
+                    ws_str,
+                    text,
+                )
+        # Step 2: strip leading "<wrapper>/" relative references. Lookbehind now
+        # also excludes `/` — any `X/<wrapper>/` that survived step 1 is part of
+        # a path under an unknown root and should be left alone.
+        text = re.sub(rf'(?<![A-Za-z0-9_/]){re.escape(wrapper)}/', '', text)
+        # Step 3: bare "<wrapper>" token (no trailing /) → "." for `cd <wrapper>` style.
+        text = re.sub(rf'(?<![A-Za-z0-9_/]){re.escape(wrapper)}(?![A-Za-z0-9_])', '.', text)
         return text
 
     def _apply_wrapper_rewrite(self, text: str, thread_id: Optional[str]) -> str:
         slug = self._thread_wrappers.get(thread_id) if thread_id else None
         if not slug:
             return text
-        rewritten = self._strip_wrapper_prefixes(text, slug)
+        workspace = Path(self._workspace_for(thread_id)).resolve()
+        rewritten = self._strip_wrapper_prefixes(text, slug, workspace)
         if rewritten != text:
             logger.info("Stripped wrapper %r from %d chars of shell text", slug, len(text))
         return rewritten
@@ -344,6 +375,14 @@ class ActionHandlers:
         # Ensure workspace exists before spawning — mirrors npm mkdirSync(safeCwd).
         ws_path.mkdir(parents=True, exist_ok=True)
 
+        # Merge integration env (Anthropic/OpenRouter API keys, HF token, GitHub PAT, ...)
+        # into the child process env so Neo tasks inherit the user's credentials
+        # without having to re-supply them each run.
+        extra_env = self._integrations.env_for_subprocess()
+        child_env = os.environ.copy()
+        if extra_env:
+            child_env.update(extra_env)
+
         if not detach:
             # Blocking (synchronous) mode — mirrors npm executor.ts hRunSubprocess detach=false.
             # Run command to completion and return stdout/stderr immediately in the response.
@@ -352,6 +391,7 @@ class ActionHandlers:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=workspace,
+                env=child_env,
             )
             stdout_bytes, stderr_bytes = await proc.communicate()
             exit_code = proc.returncode or 0
@@ -371,7 +411,9 @@ class ActionHandlers:
                 **({"error": f"Command failed with exit code {exit_code}"} if exit_code != 0 else {}),
             }
 
-        job_id = await self._job_manager.create_job(command_str, workspace, thread_id or "unknown")
+        job_id = await self._job_manager.create_job(
+            command_str, workspace, thread_id or "unknown", extra_env=extra_env or None,
+        )
         logger.info("Subprocess started: job_id=%s cmd=%r", job_id, command_str[:80])
         return {
             "request_id": request_id,

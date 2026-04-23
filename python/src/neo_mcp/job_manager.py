@@ -57,9 +57,18 @@ class JobManager:
     # ------------------------------------------------------------------
 
     async def create_job(
-        self, cmd: str, working_directory: str, thread_id: str
+        self,
+        cmd: str,
+        working_directory: str,
+        thread_id: str,
+        extra_env: Optional[dict[str, str]] = None,
     ) -> str:
-        """Start a subprocess and return its job_id immediately."""
+        """Start a subprocess and return its job_id immediately.
+
+        ``extra_env`` is merged on top of ``os.environ`` in the child process
+        (last-write-wins) — used by ActionHandlers to inject credentials
+        from configured integrations (Anthropic, HF, GitHub PAT, etc.).
+        """
         job_id = str(uuid.uuid4())
         job = _Job(
             job_id=job_id,
@@ -70,7 +79,7 @@ class JobManager:
             started_at=datetime.now(timezone.utc),
         )
         self._jobs[job_id] = job
-        task = asyncio.create_task(self._run(job, cmd, working_directory))
+        task = asyncio.create_task(self._run(job, cmd, working_directory, extra_env))
         job._task = task
         logger.info("Job created: job_id=%s cmd=%r cwd=%s", job_id, cmd[:80], working_directory)
         return job_id
@@ -139,10 +148,20 @@ class JobManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _run(self, job: _Job, cmd: str, cwd: str) -> None:
+    async def _run(
+        self,
+        job: _Job,
+        cmd: str,
+        cwd: str,
+        extra_env: Optional[dict[str, str]] = None,
+    ) -> None:
         """Background asyncio task: run cmd, stream output to job buffers."""
         stdout_path = JOBS_LOG_DIR / f"{job.job_id}.stdout.log"
         stderr_path = JOBS_LOG_DIR / f"{job.job_id}.stderr.log"
+
+        env = os.environ.copy()
+        if extra_env:
+            env.update(extra_env)
 
         proc = None
         try:
@@ -151,7 +170,7 @@ class JobManager:
                 cwd=cwd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=os.environ.copy(),
+                env=env,
             )
             job.pid = proc.pid
 

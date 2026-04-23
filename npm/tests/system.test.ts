@@ -474,6 +474,76 @@ describe('relative wrapper strip', () => {
       rmSync(ws, { recursive: true, force: true });
     }
   });
+
+  // Regression for 0.4.34 / 1.1.23: `target = '/app/<wrapper>'` (no trailing /)
+  // was rewritten to `target = '/app/.'`, causing filelister scripts to walk
+  // the host's real /app/ directory. Step 1 of stripWrapperPrefixes must
+  // remap absolute <root>/<wrapper> paths to the workspace when workspace is
+  // supplied.
+  it('stripWrapperPrefixes remaps /app/<wrapper> with no trailing slash', () => {
+    expect(
+      stripWrapperPrefixes(
+        "target = '/app/minimal_sentiment_classifier_1004'",
+        'minimal_sentiment_classifier_1004',
+        '/tmp/host_ws',
+      ),
+    ).toBe("target = '/tmp/host_ws'");
+  });
+
+  it('stripWrapperPrefixes remaps /app/<wrapper>/subpath to workspace', () => {
+    expect(
+      stripWrapperPrefixes('ls /app/my_proj_0001/src/main.py', 'my_proj_0001', '/tmp/host_ws'),
+    ).toBe('ls /tmp/host_ws/src/main.py');
+  });
+
+  it('stripWrapperPrefixes handles all four container roots', () => {
+    for (const root of ['/app/project', '/app', '/workspace', '/project']) {
+      expect(
+        stripWrapperPrefixes(`cat ${root}/my_proj_0001/data.txt`, 'my_proj_0001', '/tmp/host_ws'),
+      ).toBe('cat /tmp/host_ws/data.txt');
+    }
+  });
+
+  it('stripWrapperPrefixes does NOT remap similar-named directories', () => {
+    expect(
+      stripWrapperPrefixes('cat /app/my_proj_0001_backup/x.txt', 'my_proj_0001', '/tmp/host_ws'),
+    ).toBe('cat /app/my_proj_0001_backup/x.txt');
+  });
+
+  it('stripWrapperPrefixes picks longest container root first', () => {
+    // /app/project must match before /app so there is no double-remap.
+    expect(
+      stripWrapperPrefixes('ls /app/project/my_proj_0001/foo', 'my_proj_0001', '/tmp/host_ws'),
+    ).toBe('ls /tmp/host_ws/foo');
+  });
+
+  it('stripWrapperPrefixes without workspace leaves absolute paths untouched', () => {
+    // Without workspace, step 1 is skipped. The tightened lookbehind in steps 2
+    // and 3 also excludes `/`, so `/app/<wrapper>` stays literal rather than
+    // being mangled to `/app/.` (the pre-fix bug that walked the host's /app/).
+    expect(
+      stripWrapperPrefixes("target = '/app/my_proj_0001'", 'my_proj_0001'),
+    ).toBe("target = '/app/my_proj_0001'");
+  });
+
+  it('stripWrapperPrefixes without workspace still strips relative refs', () => {
+    expect(
+      stripWrapperPrefixes('mkdir -p my_proj_0001/data', 'my_proj_0001'),
+    ).toBe('mkdir -p data');
+    expect(
+      stripWrapperPrefixes('cd my_proj_0001 && ls', 'my_proj_0001'),
+    ).toBe('cd . && ls');
+  });
+
+  it('stripWrapperPrefixes still strips relative references with workspace', () => {
+    expect(
+      stripWrapperPrefixes(
+        'mkdir -p my_proj_0001/data && cd my_proj_0001',
+        'my_proj_0001',
+        '/tmp/host_ws',
+      ),
+    ).toBe('mkdir -p data && cd .');
+  });
 });
 
 // ===========================================================================

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neo-mcp"
-version = "0.4.34"
+version = "0.4.40"
 description = "MCP server for the Neo AI/ML backend — submit tasks, poll status, read output"
 readme = "README.md"
 license = { text = "MIT" }
@@ -29,6 +29,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "keyring>=24.0",
+]
+keyring = [
+    "keyring>=24.0",
 ]
 
 [tool.pytest.ini_options]

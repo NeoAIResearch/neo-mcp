@@ -26,3 +26,14 @@ JOBS_FILE: Path = DAEMON_DIR / "neo-mcp-jobs.json"
 
 # Per-job log directory
 JOBS_LOG_DIR: Path = DAEMON_DIR / "neo-mcp-logs"
+
+# ---------------------------------------------------------------------------
+# Third-party integrations (GitHub, HuggingFace, Anthropic, OpenRouter, ...)
+# ---------------------------------------------------------------------------
+
+# Shared contract with the VS Code extension: metadata only, no secrets.
+INTEGRATIONS_METADATA_FILE: Path = NEO_DIR / "integrations.json"
+
+# Secrets that have no native credential file (LLM API keys) land here as
+# key=value .env files with mode 0o600.
+INTEGRATIONS_DIR: Path = NEO_DIR / "integrations"

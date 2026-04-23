@@ -63,8 +63,12 @@ export async function runMcpServer(opts: {
   const abort = new AbortController();
   runDaemon({ workspace, deploymentId, signal: abort.signal }).catch(() => { /* exits on shutdown */ });
 
+  // Version is read from package.json so it stays in sync across bumps —
+  // mirrors _package_version() in the Python server.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const _pkg = require('../package.json');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const server: any = new McpServer({ name: 'neo-mcp-server', version: '1.1.20' });
+  const server: any = new McpServer({ name: 'neo-mcp-server', version: _pkg.version });
 
   // ----------------------------------------------------------------
   // neo_submit_task
