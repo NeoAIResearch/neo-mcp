@@ -1435,6 +1435,84 @@ class TestRelativeWrapperStrip(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(rewritten, "mkdir -p data")
 
+    # Regression: pipx 0.4.34 on hosts with a real /app/ produced `/app/.` for
+    # `target = '/app/<wrapper>'` (no trailing /), causing scripts to walk the
+    # host's /app/ instead of the user's workspace. Step 1 of the strip must
+    # remap absolute <root>/<wrapper> paths to the workspace.
+    def test_strip_absolute_container_path_no_trailing_slash(self):
+        ws = Path("/tmp/host_ws")
+        text = "target = '/app/minimal_sentiment_classifier_1004'"
+        result = self.h._strip_wrapper_prefixes(
+            text, "minimal_sentiment_classifier_1004", ws,
+        )
+        self.assertEqual(result, "target = '/tmp/host_ws'")
+
+    def test_strip_absolute_container_path_with_subpath(self):
+        ws = Path("/tmp/host_ws")
+        text = "ls /app/my_proj_0001/src/main.py"
+        result = self.h._strip_wrapper_prefixes(text, "my_proj_0001", ws)
+        self.assertEqual(result, "ls /tmp/host_ws/src/main.py")
+
+    def test_strip_absolute_path_all_container_roots(self):
+        ws = Path("/tmp/host_ws")
+        for root in ("/app/project", "/app", "/workspace", "/project"):
+            text = f"cat {root}/my_proj_0001/data.txt"
+            result = self.h._strip_wrapper_prefixes(text, "my_proj_0001", ws)
+            self.assertEqual(
+                result, "cat /tmp/host_ws/data.txt",
+                f"failed for container root {root}",
+            )
+
+    def test_strip_absolute_does_not_match_similar_name(self):
+        # /app/my_proj_0001_backup must NOT be rewritten (different name).
+        ws = Path("/tmp/host_ws")
+        text = "cat /app/my_proj_0001_backup/x.txt"
+        result = self.h._strip_wrapper_prefixes(text, "my_proj_0001", ws)
+        self.assertEqual(result, "cat /app/my_proj_0001_backup/x.txt")
+
+    def test_strip_absolute_longest_root_wins(self):
+        # /app/project should match before /app, so no double-remap.
+        ws = Path("/tmp/host_ws")
+        text = "ls /app/project/my_proj_0001/foo"
+        result = self.h._strip_wrapper_prefixes(text, "my_proj_0001", ws)
+        self.assertEqual(result, "ls /tmp/host_ws/foo")
+
+    def test_strip_no_workspace_leaves_absolute_paths_untouched(self):
+        # Without workspace, step 1 is skipped. The tightened lookbehind in
+        # steps 2/3 also excludes `/`, so `/app/<wrapper>` is left alone rather
+        # than mangled to `/app/.` (which was the pre-fix bug). Callers that
+        # need absolute remap must pass workspace.
+        text = "target = '/app/my_proj_0001'"
+        result = self.h._strip_wrapper_prefixes(text, "my_proj_0001")
+        self.assertEqual(result, "target = '/app/my_proj_0001'")
+
+    def test_strip_no_workspace_still_rewrites_relative(self):
+        # Relative refs (no leading /) still get stripped/replaced without workspace.
+        self.assertEqual(
+            self.h._strip_wrapper_prefixes("mkdir -p my_proj_0001/data", "my_proj_0001"),
+            "mkdir -p data",
+        )
+        self.assertEqual(
+            self.h._strip_wrapper_prefixes("cd my_proj_0001 && ls", "my_proj_0001"),
+            "cd . && ls",
+        )
+
+    def test_strip_relative_still_works_with_workspace(self):
+        ws = Path("/tmp/host_ws")
+        text = "mkdir -p my_proj_0001/data && cd my_proj_0001"
+        result = self.h._strip_wrapper_prefixes(text, "my_proj_0001", ws)
+        self.assertEqual(result, "mkdir -p data && cd .")
+
+    def test_apply_wrapper_rewrite_uses_thread_workspace(self):
+        self.h._thread_wrappers[self.tid] = "my_proj_0001"
+        result = self.h._apply_wrapper_rewrite(
+            "target = '/app/my_proj_0001'", self.tid,
+        )
+        # _apply_wrapper_rewrite resolves the workspace, so symlink-free paths on
+        # Linux are unchanged but /tmp → /private/tmp on macOS.
+        ws_resolved = self.ws.resolve()
+        self.assertEqual(result, f"target = '{ws_resolved}'")
+
 
 class TestWorkspaceSelfGuard(unittest.TestCase):
     """Reject a workspace that equals the neo-mcp server source tree itself."""
@@ -1481,6 +1559,890 @@ def _restore(key: str, val: str | None) -> None:
         os.environ.pop(key, None)
     else:
         os.environ[key] = val
+
+
+# ---------------------------------------------------------------------------
+# Integrations (GitHub, HuggingFace, Anthropic, OpenRouter)
+# ---------------------------------------------------------------------------
+
+from neo_mcp.integrations import IntegrationManager, PROVIDERS, ValidationError
+import neo_mcp.integrations.manager as _int_manager_mod
+import neo_mcp.integrations.secret_store as _secret_store_mod
+from neo_mcp.integrations.secret_store import FileStore, KeyringStore, get_secret_store
+from neo_mcp.integrations._fsutil import atomic_write_secret, file_lock
+import neo_mcp.integrations.providers.anthropic as _prov_anthropic
+import neo_mcp.integrations.providers.openrouter as _prov_openrouter
+import neo_mcp.integrations.providers.huggingface as _prov_hf
+import neo_mcp.integrations.providers.github as _prov_github
+
+
+def _make_fake_keyring():
+    """In-memory keyring backend for tests — no OS integration needed.
+
+    Built as a factory so ``keyring.backend.KeyringBackend`` is imported only
+    when the test actually runs (keyring is an optional dep at runtime but
+    always installed for tests).
+    """
+    import keyring.backend
+    import keyring.errors
+
+    class _FakeKeyring(keyring.backend.KeyringBackend):
+        priority = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._store: dict[tuple[str, str], str] = {}
+
+        def set_password(self, service: str, username: str, password: str) -> None:
+            self._store[(service, username)] = password
+
+        def get_password(self, service: str, username: str) -> str | None:
+            return self._store.get((service, username))
+
+        def delete_password(self, service: str, username: str) -> None:
+            if (service, username) not in self._store:
+                raise keyring.errors.PasswordDeleteError(username)
+            del self._store[(service, username)]
+
+    return _FakeKeyring()
+
+
+class TestIntegrationRegistry(unittest.TestCase):
+    """Schema validation rules per provider."""
+
+    def test_all_four_providers_registered(self):
+        self.assertEqual(
+            sorted(PROVIDERS.keys()),
+            ["anthropic", "github", "huggingface", "openrouter"],
+        )
+
+    def test_github_validates_pat_prefix(self):
+        mgr = IntegrationManager(metadata_file=Path(make_ws()) / "meta.json")
+        with self.assertRaises(ValidationError):
+            mgr._validate(PROVIDERS["github"], {"pat": "not_a_github_pat"})
+        # A ghp_ prefixed PAT is accepted by validation (write_secret not called here).
+        mgr._validate(PROVIDERS["github"], {"pat": "ghp_abcDEF123_valid"})
+        mgr._validate(PROVIDERS["github"], {"pat": "github_pat_abc123_xyz"})
+
+    def test_anthropic_requires_sk_ant_prefix(self):
+        mgr = IntegrationManager(metadata_file=Path(make_ws()) / "meta.json")
+        with self.assertRaises(ValidationError):
+            mgr._validate(PROVIDERS["anthropic"], {"api_key": "sk-not-anthropic"})
+        mgr._validate(PROVIDERS["anthropic"], {"api_key": "sk-ant-abc123XYZ-_"})
+
+    def test_openrouter_requires_sk_or_prefix(self):
+        mgr = IntegrationManager(metadata_file=Path(make_ws()) / "meta.json")
+        with self.assertRaises(ValidationError):
+            mgr._validate(PROVIDERS["openrouter"], {"api_key": "sk-ant-xxxxx"})
+        mgr._validate(PROVIDERS["openrouter"], {"api_key": "sk-or-abc123_xyz"})
+
+    def test_huggingface_requires_hf_prefix(self):
+        mgr = IntegrationManager(metadata_file=Path(make_ws()) / "meta.json")
+        with self.assertRaises(ValidationError):
+            mgr._validate(PROVIDERS["huggingface"], {"token": "not_hf_prefixed"})
+        mgr._validate(PROVIDERS["huggingface"], {"token": "hf_abcDEF123"})
+        # Real HF tokens can contain underscores and dashes — regression guard
+        # against over-strict validation (caught in E2E run against a token
+        # like "hf_realistic_token_xyz789").
+        mgr._validate(PROVIDERS["huggingface"], {"token": "hf_some_token_with_under_scores"})
+        mgr._validate(PROVIDERS["huggingface"], {"token": "hf_some-token-with-dashes"})
+
+    def test_missing_required_field_raises(self):
+        mgr = IntegrationManager(metadata_file=Path(make_ws()) / "meta.json")
+        with self.assertRaises(ValidationError):
+            mgr._validate(PROVIDERS["anthropic"], {})  # missing api_key
+        with self.assertRaises(ValidationError):
+            mgr._validate(PROVIDERS["anthropic"], {"api_key": ""})
+
+
+class _IntegrationFixture(unittest.TestCase):
+    """Base class: redirects every provider's file path into a per-test tmpdir."""
+
+    def setUp(self):
+        self.td = Path(make_ws())
+        self.meta = self.td / "integrations.json"
+
+        self._orig_backend = os.environ.pop("NEO_INTEGRATIONS_BACKEND", None)
+        self._orig_int_dir = _secret_store_mod.INTEGRATIONS_DIR
+        self._orig_hf_token = _prov_hf.TOKEN_FILE
+        self._orig_gh_creds = _prov_github.CREDENTIALS_FILE
+
+        _secret_store_mod.INTEGRATIONS_DIR = self.td / "integrations"
+        _prov_hf.TOKEN_FILE = self.td / "cache_hf" / "token"
+        _prov_github.CREDENTIALS_FILE = self.td / "git-credentials"
+
+    def tearDown(self):
+        _secret_store_mod.INTEGRATIONS_DIR = self._orig_int_dir
+        _prov_hf.TOKEN_FILE = self._orig_hf_token
+        _prov_github.CREDENTIALS_FILE = self._orig_gh_creds
+        _restore("NEO_INTEGRATIONS_BACKEND", self._orig_backend)
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def secret_env_file(self, provider: str) -> Path:
+        return self.td / "integrations" / f"{provider}.env"
+
+
+class TestIntegrationManager(_IntegrationFixture):
+
+    def test_add_writes_metadata_and_secret_with_0600(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("anthropic", {"api_key": "sk-ant-testkey123"})
+
+        self.assertTrue(self.meta.exists())
+        secret_file = self.secret_env_file("anthropic")
+        self.assertTrue(secret_file.exists())
+        mode = secret_file.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+        body = secret_file.read_text()
+        self.assertIn("api_key=sk-ant-testkey123", body)
+
+    def test_list_returns_sorted_configured_providers(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("openrouter", {"api_key": "sk-or-xyz_abc"})
+        mgr.add("anthropic", {"api_key": "sk-ant-abc_xyz"})
+
+        items = mgr.list()
+        self.assertEqual([i["provider"] for i in items], ["anthropic", "openrouter"])
+        self.assertEqual(items[0]["method"], "api_key")
+        self.assertTrue(items[0]["added_at"])
+        self.assertIn("anthropic.env", items[0]["files"][0])
+
+    def test_remove_deletes_secret_and_metadata(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("anthropic", {"api_key": "sk-ant-toremove"})
+        secret_file = self.secret_env_file("anthropic")
+        self.assertTrue(secret_file.exists())
+
+        result = mgr.remove("anthropic")
+        self.assertFalse(secret_file.exists())
+        self.assertEqual(mgr.list(), [])
+        self.assertEqual(result["provider"], "anthropic")
+        self.assertTrue(result["removed_files"])
+
+    def test_env_for_subprocess_merges_all_providers(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("anthropic", {"api_key": "sk-ant-A"})
+        mgr.add("openrouter", {"api_key": "sk-or-B"})
+        mgr.add("huggingface", {"token": "hf_C"})
+
+        env = mgr.env_for_subprocess()
+        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "sk-ant-A")
+        self.assertEqual(env.get("OPENROUTER_API_KEY"), "sk-or-B")
+        self.assertEqual(env.get("HF_TOKEN"), "hf_C")
+        self.assertEqual(env.get("HUGGING_FACE_HUB_TOKEN"), "hf_C")
+
+    def test_env_ignores_unconfigured_providers(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        self.assertEqual(mgr.env_for_subprocess(), {})
+
+    def test_invalid_credentials_rejected_before_write(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        with self.assertRaises(ValidationError):
+            mgr.add("anthropic", {"api_key": "not-sk-ant"})
+        self.assertFalse(self.secret_env_file("anthropic").exists())
+        self.assertFalse(self.meta.exists())
+
+    def test_unknown_provider_rejected(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        with self.assertRaises(ValidationError):
+            mgr.add("snowflake", {"api_key": "whatever"})
+
+    def test_github_round_trip_writes_credentials_file(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("github", {"pat": "ghp_validToken123ABC"})
+
+        self.assertTrue(_prov_github.CREDENTIALS_FILE.exists())
+        secret_file = self.secret_env_file("github")
+        self.assertTrue(secret_file.exists())
+        self.assertIn("@github.com", _prov_github.CREDENTIALS_FILE.read_text())
+        self.assertEqual(
+            _prov_github.CREDENTIALS_FILE.stat().st_mode & 0o777, 0o600
+        )
+
+        env = mgr.env_for_subprocess()
+        self.assertEqual(env["GITHUB_TOKEN"], "ghp_validToken123ABC")
+        self.assertEqual(env["GH_TOKEN"], "ghp_validToken123ABC")
+
+        mgr.remove("github")
+        # Both files gone (github was the only entry in .git-credentials)
+        self.assertFalse(_prov_github.CREDENTIALS_FILE.exists())
+        self.assertFalse(secret_file.exists())
+
+    def test_github_preserves_other_credentials_on_remove(self):
+        # Pre-existing non-github entry in ~/.git-credentials must survive removal.
+        _prov_github.CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _prov_github.CREDENTIALS_FILE.write_text(
+            "https://user:pat@gitlab.com\n"
+        )
+
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("github", {"pat": "ghp_Token123"})
+        mgr.remove("github")
+
+        self.assertTrue(_prov_github.CREDENTIALS_FILE.exists())
+        content = _prov_github.CREDENTIALS_FILE.read_text()
+        self.assertIn("@gitlab.com", content)
+        self.assertNotIn("@github.com", content)
+
+    def test_huggingface_writes_to_cache_huggingface_token(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("huggingface", {"token": "hf_abcDEF"})
+        self.assertTrue(_prov_hf.TOKEN_FILE.exists())
+        self.assertEqual(_prov_hf.TOKEN_FILE.read_text(), "hf_abcDEF")
+        self.assertEqual(_prov_hf.TOKEN_FILE.stat().st_mode & 0o777, 0o600)
+
+    def test_corrupt_metadata_file_recovered(self):
+        self.meta.parent.mkdir(parents=True, exist_ok=True)
+        self.meta.write_text("not json at all")
+        mgr = IntegrationManager(metadata_file=self.meta)
+        # list() must not raise on corrupt metadata
+        self.assertEqual(mgr.list(), [])
+        # and add still works after recovery
+        mgr.add("anthropic", {"api_key": "sk-ant-recovered"})
+        self.assertEqual([i["provider"] for i in mgr.list()], ["anthropic"])
+
+
+class TestSecretStoreSelection(unittest.TestCase):
+    """NEO_INTEGRATIONS_BACKEND picks the right backend."""
+
+    def setUp(self):
+        self._orig = os.environ.pop("NEO_INTEGRATIONS_BACKEND", None)
+
+    def tearDown(self):
+        _restore("NEO_INTEGRATIONS_BACKEND", self._orig)
+
+    def test_default_is_file_backend(self):
+        self.assertIsInstance(get_secret_store(), FileStore)
+
+    def test_explicit_file_backend(self):
+        os.environ["NEO_INTEGRATIONS_BACKEND"] = "file"
+        self.assertIsInstance(get_secret_store(), FileStore)
+
+    def test_unknown_value_falls_back_to_file(self):
+        os.environ["NEO_INTEGRATIONS_BACKEND"] = "vault"
+        self.assertIsInstance(get_secret_store(), FileStore)
+
+    def test_keyring_raises_when_no_functional_backend(self):
+        import keyring
+        import keyring.backends.fail
+        orig = keyring.get_keyring()
+        keyring.set_keyring(keyring.backends.fail.Keyring())
+        os.environ["NEO_INTEGRATIONS_BACKEND"] = "keyring"
+        try:
+            with self.assertRaises(RuntimeError):
+                get_secret_store()
+        finally:
+            keyring.set_keyring(orig)
+
+
+class TestKeyringStoreRoundTrip(unittest.TestCase):
+    """End-to-end using an in-memory fake keyring backend."""
+
+    def setUp(self):
+        import keyring
+        self._orig_backend = keyring.get_keyring()
+        self._fake = _make_fake_keyring()
+        keyring.set_keyring(self._fake)
+
+        self._orig_env = os.environ.pop("NEO_INTEGRATIONS_BACKEND", None)
+        os.environ["NEO_INTEGRATIONS_BACKEND"] = "keyring"
+
+        self.td = Path(make_ws())
+        self.meta = self.td / "integrations.json"
+        self._orig_hf = _prov_hf.TOKEN_FILE
+        self._orig_gh = _prov_github.CREDENTIALS_FILE
+        _prov_hf.TOKEN_FILE = self.td / "hf_token"
+        _prov_github.CREDENTIALS_FILE = self.td / "git-credentials"
+
+    def tearDown(self):
+        import keyring
+        keyring.set_keyring(self._orig_backend)
+        _restore("NEO_INTEGRATIONS_BACKEND", self._orig_env)
+        _prov_hf.TOKEN_FILE = self._orig_hf
+        _prov_github.CREDENTIALS_FILE = self._orig_gh
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_anthropic_secret_goes_into_keyring_not_file(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("anthropic", {"api_key": "sk-ant-inKeyring"})
+
+        # Plaintext .env file was NOT written
+        plaintext = Path(self.td) / "integrations" / "anthropic.env"
+        self.assertFalse(plaintext.exists())
+
+        # But env injection still works
+        env = mgr.env_for_subprocess()
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-inKeyring")
+
+    def test_keyring_entry_removed_on_remove(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("anthropic", {"api_key": "sk-ant-toDelete"})
+        self.assertEqual(
+            self._fake.get_password("neo-mcp:anthropic", "api_key"),
+            "sk-ant-toDelete",
+        )
+        mgr.remove("anthropic")
+        self.assertIsNone(self._fake.get_password("neo-mcp:anthropic", "api_key"))
+
+    def test_huggingface_writes_keyring_and_native_file(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("huggingface", {"token": "hf_dualStore"})
+        self.assertEqual(
+            self._fake.get_password("neo-mcp:huggingface", "token"),
+            "hf_dualStore",
+        )
+        # Native file still written so huggingface-cli / transformers can read it
+        self.assertTrue(_prov_hf.TOKEN_FILE.exists())
+        self.assertEqual(_prov_hf.TOKEN_FILE.read_text(), "hf_dualStore")
+
+    def test_github_writes_keyring_and_git_credentials(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("github", {"pat": "ghp_keyringPAT", "username": "alice"})
+        self.assertEqual(
+            self._fake.get_password("neo-mcp:github", "pat"),
+            "ghp_keyringPAT",
+        )
+        content = _prov_github.CREDENTIALS_FILE.read_text()
+        self.assertIn("alice:ghp_keyringPAT@github.com", content)
+
+
+class TestIntegrationToolsDispatch(unittest.IsolatedAsyncioTestCase):
+    """Exercise the MCP tool helper functions in server.py directly.
+
+    Patches the default metadata path and secret_store's INTEGRATIONS_DIR
+    so tool handlers (which construct their own IntegrationManager / store
+    without args) land in a per-test tmpdir.
+    """
+
+    def setUp(self):
+        self.td = Path(make_ws())
+        self.meta = self.td / "integrations.json"
+
+        self._orig_meta = _int_manager_mod.INTEGRATIONS_METADATA_FILE
+        _int_manager_mod.INTEGRATIONS_METADATA_FILE = self.meta
+
+        self._orig_int_dir = _secret_store_mod.INTEGRATIONS_DIR
+        _secret_store_mod.INTEGRATIONS_DIR = self.td / "integrations"
+
+        self._orig_backend = os.environ.pop("NEO_INTEGRATIONS_BACKEND", None)
+
+    def tearDown(self):
+        _int_manager_mod.INTEGRATIONS_METADATA_FILE = self._orig_meta
+        _secret_store_mod.INTEGRATIONS_DIR = self._orig_int_dir
+        _restore("NEO_INTEGRATIONS_BACKEND", self._orig_backend)
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _anthropic_secret_path(self) -> Path:
+        return self.td / "integrations" / "anthropic.env"
+
+    def test_list_integrations_empty(self):
+        from neo_mcp.server import _list_integrations
+        result = _list_integrations()
+        self.assertEqual(result, {"count": 0, "integrations": []})
+
+    def test_add_then_list_roundtrip(self):
+        from neo_mcp.server import _add_integration, _list_integrations
+        _add_integration({"provider": "anthropic", "credentials": {"api_key": "sk-ant-rt"}})
+        listing = _list_integrations()
+        self.assertEqual(listing["count"], 1)
+        self.assertEqual(listing["integrations"][0]["provider"], "anthropic")
+
+    def test_add_missing_provider_raises(self):
+        from neo_mcp.server import _add_integration
+        with self.assertRaises(ValidationError):
+            _add_integration({"credentials": {"api_key": "sk-ant-xxx"}})
+
+    def test_add_rejects_non_dict_credentials(self):
+        from neo_mcp.server import _add_integration
+        with self.assertRaises(ValidationError):
+            _add_integration({"provider": "anthropic", "credentials": "sk-ant-x"})
+
+    def test_remove_returns_removed_files(self):
+        from neo_mcp.server import _add_integration, _remove_integration
+        _add_integration({"provider": "anthropic", "credentials": {"api_key": "sk-ant-rm"}})
+        self.assertTrue(self._anthropic_secret_path().exists())
+        result = _remove_integration({"provider": "anthropic"})
+        self.assertEqual(result["status"], "removed")
+        self.assertTrue(result["removed_files"])
+        self.assertFalse(self._anthropic_secret_path().exists())
+
+    async def test_test_integration_reports_ok_on_mocked_probe(self):
+        from neo_mcp.server import _add_integration, _test_integration
+        _add_integration({"provider": "anthropic", "credentials": {"api_key": "sk-ant-xx"}})
+
+        async def fake_ok() -> tuple[bool, str, int]:
+            return True, "ok", 42
+
+        with patch.object(_prov_anthropic, "test_connection", new=fake_ok):
+            result = await _test_integration({"provider": "anthropic"})
+        self.assertEqual(result, {"provider": "anthropic", "ok": True, "message": "ok", "latency_ms": 42})
+
+    async def test_test_integration_unconfigured_provider(self):
+        from neo_mcp.server import _test_integration
+        # Provider is known but no credentials stored → tester returns ok=False
+        result = await _test_integration({"provider": "anthropic"})
+        self.assertFalse(result["ok"])
+        self.assertIn("not configured", result["message"])
+
+    def test_add_response_includes_safety_message(self):
+        from neo_mcp.server import _add_integration
+        result = _add_integration({
+            "provider": "anthropic",
+            "credentials": {"api_key": "sk-ant-safetyTest"},
+        })
+        self.assertIn("safety", result)
+        self.assertIsInstance(result["safety"], str)
+        # Must reassure about key location + non-exfiltration
+        safety = result["safety"].lower()
+        self.assertIn("never leave your machine", safety)
+        self.assertIn("never sent to neo's backend", safety)
+        self.assertIn("anthropic", safety)
+
+    def test_add_response_instructs_agent_to_relay(self):
+        from neo_mcp.server import _add_integration
+        result = _add_integration({
+            "provider": "anthropic",
+            "credentials": {"api_key": "sk-ant-relay"},
+        })
+        self.assertIn("assistant_instruction", result)
+        self.assertIn("verbatim", result["assistant_instruction"].lower())
+
+    def test_add_response_reports_backend_and_location(self):
+        from neo_mcp.server import _add_integration
+        result = _add_integration({
+            "provider": "anthropic",
+            "credentials": {"api_key": "sk-ant-loc"},
+        })
+        self.assertEqual(result["storage_backend"], "file")
+        self.assertTrue(result["storage_location"].endswith("anthropic.env"))
+        # The location must be reflected in the safety message
+        self.assertIn(result["storage_location"], result["safety"])
+
+    def test_add_response_never_leaks_secret_value(self):
+        """The raw credential must never appear anywhere in the tool response."""
+        from neo_mcp.server import _add_integration
+        import json as _json
+        secret = "sk-ant-DO_NOT_LEAK_9f3c1b2a"
+        result = _add_integration({
+            "provider": "anthropic",
+            "credentials": {"api_key": secret},
+        })
+        # Serialize the whole payload (as MCP would) and scan for the secret
+        blob = _json.dumps(result)
+        self.assertNotIn(secret, blob)
+
+    def test_add_response_mentions_mode_0600_for_file_backend(self):
+        from neo_mcp.server import _add_integration
+        result = _add_integration({
+            "provider": "anthropic",
+            "credentials": {"api_key": "sk-ant-mode"},
+        })
+        self.assertIn("0o600", result["safety"])
+
+
+class TestProbeRedaction(unittest.IsolatedAsyncioTestCase):
+    """_http.probe must never echo a credential-shaped token into its message."""
+
+    async def test_response_body_with_credential_token_is_redacted(self):
+        from neo_mcp.integrations.providers._http import probe
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        leaky_body = '{"error":"your key sk-ant-LEAK_ME_123 is invalid"}'
+        fake_resp = MagicMock()
+        fake_resp.status_code = 400
+        fake_resp.text = leaky_body
+
+        class _FakeClient:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def request(self, *a, **kw): return fake_resp
+
+        with patch("neo_mcp.integrations.providers._http.httpx.AsyncClient",
+                   return_value=_FakeClient()):
+            ok, msg, _ = await probe("GET", "https://x", {})
+
+        self.assertFalse(ok)
+        self.assertNotIn("sk-ant-LEAK_ME_123", msg)
+        self.assertIn("redacted", msg.lower())
+
+    async def test_clean_response_body_not_redacted(self):
+        from neo_mcp.integrations.providers._http import probe
+        from unittest.mock import MagicMock, patch
+
+        fake_resp = MagicMock()
+        fake_resp.status_code = 401
+        fake_resp.text = '{"error":"invalid credential"}'
+
+        class _FakeClient:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def request(self, *a, **kw): return fake_resp
+
+        with patch("neo_mcp.integrations.providers._http.httpx.AsyncClient",
+                   return_value=_FakeClient()):
+            ok, msg, _ = await probe("GET", "https://x", {})
+
+        self.assertFalse(ok)
+        self.assertIn("invalid credential", msg)
+        self.assertNotIn("redacted", msg.lower())
+
+    async def test_exception_with_credential_token_is_redacted(self):
+        from neo_mcp.integrations.providers._http import probe
+        from unittest.mock import patch
+
+        class _BoomClient:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def request(self, *a, **kw):
+                raise RuntimeError("connection refused from https://user:ghp_LEAK@example.com")
+
+        with patch("neo_mcp.integrations.providers._http.httpx.AsyncClient",
+                   return_value=_BoomClient()):
+            ok, msg, _ = await probe("GET", "https://x", {})
+
+        self.assertFalse(ok)
+        self.assertNotIn("ghp_LEAK", msg)
+
+
+class TestKeyringPartialWriteRollback(unittest.TestCase):
+    """KeyringStore.write must roll back earlier successful fields if a later one errors."""
+
+    def setUp(self):
+        import keyring
+        self._orig = keyring.get_keyring()
+        self._fake = _make_fake_keyring()
+        keyring.set_keyring(self._fake)
+        self._orig_env = os.environ.pop("NEO_INTEGRATIONS_BACKEND", None)
+        os.environ["NEO_INTEGRATIONS_BACKEND"] = "keyring"
+
+    def tearDown(self):
+        import keyring
+        keyring.set_keyring(self._orig)
+        _restore("NEO_INTEGRATIONS_BACKEND", self._orig_env)
+
+    def test_second_field_failure_rolls_back_first(self):
+        import keyring.errors
+        store = KeyringStore()
+
+        # Patch set_password so the second call raises.
+        calls = {"n": 0}
+        original_set = self._fake.set_password
+
+        def flaky_set(service, username, password):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise keyring.errors.PasswordSetError("simulated keyring drop")
+            return original_set(service, username, password)
+
+        self._fake.set_password = flaky_set
+
+        with self.assertRaises(keyring.errors.PasswordSetError):
+            store.write("github", {"pat": "ghp_ROLLBACK_TEST", "username": "alice"})
+
+        # Restore set_password (tests shouldn't depend on patched state leaking)
+        self._fake.set_password = original_set
+
+        # Most important: the first field must have been rolled back.
+        self.assertIsNone(
+            self._fake.get_password("neo-mcp:github", "pat"),
+            "partial write of 'pat' was NOT rolled back after 'username' failed",
+        )
+        self.assertIsNone(
+            self._fake.get_password("neo-mcp:github", "username"),
+        )
+
+
+class TestSafetyMessageDualWriteProviders(unittest.TestCase):
+    """Safety message must truthfully name all on-disk locations, not just the
+    keyring entry. M-2 from the superpowers review."""
+
+    def setUp(self):
+        import keyring
+        self._orig = keyring.get_keyring()
+        keyring.set_keyring(_make_fake_keyring())
+        self._orig_env = os.environ.pop("NEO_INTEGRATIONS_BACKEND", None)
+        os.environ["NEO_INTEGRATIONS_BACKEND"] = "keyring"
+
+        self.td = Path(make_ws())
+        self.meta = self.td / "integrations.json"
+        self._orig_meta = _int_manager_mod.INTEGRATIONS_METADATA_FILE
+        _int_manager_mod.INTEGRATIONS_METADATA_FILE = self.meta
+
+        self._orig_hf = _prov_hf.TOKEN_FILE
+        self._orig_gh = _prov_github.CREDENTIALS_FILE
+        _prov_hf.TOKEN_FILE = self.td / "hf_token"
+        _prov_github.CREDENTIALS_FILE = self.td / "git-credentials"
+
+    def tearDown(self):
+        import keyring
+        keyring.set_keyring(self._orig)
+        _restore("NEO_INTEGRATIONS_BACKEND", self._orig_env)
+        _int_manager_mod.INTEGRATIONS_METADATA_FILE = self._orig_meta
+        _prov_hf.TOKEN_FILE = self._orig_hf
+        _prov_github.CREDENTIALS_FILE = self._orig_gh
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_huggingface_keyring_mode_safety_mentions_native_file(self):
+        from neo_mcp.server import _add_integration
+        result = _add_integration({
+            "provider": "huggingface",
+            "credentials": {"token": "hf_DUAL_WRITE_xyz"},
+        })
+        safety = result["safety"]
+        # Must mention BOTH the keyring and the native plaintext file
+        self.assertIn("keyring", safety.lower())
+        self.assertIn("encrypted at rest", safety.lower())
+        self.assertIn(str(_prov_hf.TOKEN_FILE), safety)
+        self.assertIn("0o600", safety)
+
+    def test_github_keyring_mode_safety_mentions_git_credentials(self):
+        from neo_mcp.server import _add_integration
+        result = _add_integration({
+            "provider": "github",
+            "credentials": {"pat": "ghp_DUAL_WRITE_abc"},
+        })
+        safety = result["safety"]
+        self.assertIn("keyring", safety.lower())
+        self.assertIn(str(_prov_github.CREDENTIALS_FILE), safety)
+
+    def test_pure_keyring_provider_does_not_claim_file_location(self):
+        """Anthropic/openrouter have no native file — safety must not invent one."""
+        from neo_mcp.server import _add_integration
+        result = _add_integration({
+            "provider": "anthropic",
+            "credentials": {"api_key": "sk-ant-PURE_keyring"},
+        })
+        safety = result["safety"]
+        # Only keyring mentioned, no "second copy" clause
+        self.assertIn("keyring", safety.lower())
+        self.assertNotIn("second copy", safety.lower())
+        self.assertNotIn("/tmp/", safety)  # no stray filesystem paths
+
+
+class TestAtomicWriteSecret(unittest.TestCase):
+    """atomic_write_secret must land at 0o600 with no readable window."""
+
+    def setUp(self):
+        self.td = Path(make_ws())
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_final_mode_is_0600(self):
+        target = self.td / "secret.env"
+        atomic_write_secret(target, "api_key=abc\n")
+        self.assertTrue(target.exists())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(target.read_text(), "api_key=abc\n")
+
+    def test_replaces_existing_file_atomically(self):
+        target = self.td / "secret.env"
+        target.write_text("api_key=old\n")
+        target.chmod(0o644)  # deliberately wrong starting mode
+        atomic_write_secret(target, "api_key=new\n")
+        self.assertEqual(target.read_text(), "api_key=new\n")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_creates_parent_dir(self):
+        target = self.td / "deep" / "nested" / "secret.env"
+        atomic_write_secret(target, "x=1\n")
+        self.assertTrue(target.exists())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_cleans_up_tempfile_on_error(self):
+        target = self.td / "secret.env"
+        with patch("neo_mcp.integrations._fsutil.os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                atomic_write_secret(target, "leaked=1\n")
+        # No tempfile left behind — check dir has zero files
+        leftover = list(self.td.iterdir())
+        self.assertEqual(leftover, [], f"tempfile leaked: {leftover}")
+        self.assertFalse(target.exists())
+
+    def test_no_intermediate_wrong_mode(self):
+        """The destination path never exists with a mode other than 0o600.
+
+        We can't race-test the kernel directly but we can confirm the
+        implementation never calls write_text directly on the target path
+        (which would leak via umask). Instead it uses a tempfile.mkstemp
+        which is 0o600 on creation, then os.replace which preserves mode.
+        """
+        import neo_mcp.integrations._fsutil as fsu
+        # The module should NOT import Path.write_text-style primitives as
+        # the write path — verify by reading the source.
+        source = Path(fsu.__file__).read_text()
+        self.assertNotIn(".write_text(", source)
+        self.assertIn("os.replace", source)
+        self.assertIn("mkstemp", source)
+
+
+class TestFileLock(unittest.TestCase):
+    """file_lock serializes concurrent writers via fcntl.flock."""
+
+    def setUp(self):
+        self.td = Path(make_ws())
+        self.lock = self.td / "m.lock"
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_lock_releases_after_block(self):
+        with file_lock(self.lock):
+            pass
+        # Can acquire again without blocking
+        with file_lock(self.lock):
+            pass
+
+    def test_lock_released_on_exception(self):
+        with self.assertRaises(RuntimeError):
+            with file_lock(self.lock):
+                raise RuntimeError("boom")
+        # Lock is released — acquiring again works
+        with file_lock(self.lock):
+            pass
+
+    def test_concurrent_threads_serialize(self):
+        import threading
+        import time
+        order: list[str] = []
+        barrier = threading.Barrier(2)
+
+        def worker(name: str, hold_ms: int) -> None:
+            barrier.wait()
+            with file_lock(self.lock):
+                order.append(f"{name}-enter")
+                time.sleep(hold_ms / 1000.0)
+                order.append(f"{name}-exit")
+
+        t1 = threading.Thread(target=worker, args=("A", 80))
+        t2 = threading.Thread(target=worker, args=("B", 80))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        # Each thread's enter/exit must be adjacent — no interleaving
+        self.assertEqual(len(order), 4)
+        self.assertEqual(order[0][-5:], "enter")
+        self.assertEqual(order[1][-4:], "exit")
+        self.assertEqual(order[0][0], order[1][0])  # A-enter/A-exit or B-enter/B-exit
+        self.assertEqual(order[2][-5:], "enter")
+        self.assertEqual(order[3][-4:], "exit")
+
+
+class TestConcurrentAddPreservesAllEntries(_IntegrationFixture):
+    """Concurrent neo_add_integration calls must not lose entries under the lock."""
+
+    def test_four_providers_added_concurrently_all_survive(self):
+        import threading
+        mgr = IntegrationManager(metadata_file=self.meta)
+
+        credentials = {
+            "anthropic":   {"api_key": "sk-ant-ABCxyz_thread1"},
+            "openrouter":  {"api_key": "sk-or-XYZabc_thread2"},
+            "github":      {"pat": "ghp_threadThreeTokenABC"},
+            "huggingface": {"token": "hf_threadFourTokenXYZ"},
+        }
+
+        errors: list[Exception] = []
+        def add_worker(provider: str, creds: dict) -> None:
+            try:
+                mgr.add(provider, creds)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=add_worker, args=(p, c))
+            for p, c in credentials.items()
+        ]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        self.assertEqual(errors, [], f"concurrent add raised: {errors}")
+
+        # All four entries must be present in metadata
+        listing = mgr.list()
+        got = sorted(i["provider"] for i in listing)
+        self.assertEqual(got, sorted(credentials.keys()))
+
+
+class TestAddIntegrationSafetyKeyring(unittest.TestCase):
+    """Safety message wording changes when the OS keyring backend is in use."""
+
+    def setUp(self):
+        import keyring
+        self._orig_backend = keyring.get_keyring()
+        keyring.set_keyring(_make_fake_keyring())
+
+        self._orig_env = os.environ.pop("NEO_INTEGRATIONS_BACKEND", None)
+        os.environ["NEO_INTEGRATIONS_BACKEND"] = "keyring"
+
+        self.td = Path(make_ws())
+        self.meta = self.td / "integrations.json"
+        self._orig_meta = _int_manager_mod.INTEGRATIONS_METADATA_FILE
+        _int_manager_mod.INTEGRATIONS_METADATA_FILE = self.meta
+
+    def tearDown(self):
+        import keyring
+        keyring.set_keyring(self._orig_backend)
+        _restore("NEO_INTEGRATIONS_BACKEND", self._orig_env)
+        _int_manager_mod.INTEGRATIONS_METADATA_FILE = self._orig_meta
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_safety_message_mentions_keyring_and_encrypted_at_rest(self):
+        from neo_mcp.server import _add_integration
+        result = _add_integration({
+            "provider": "openrouter",
+            "credentials": {"api_key": "sk-or-keyring"},
+        })
+        safety = result["safety"].lower()
+        self.assertIn("keyring", safety)
+        self.assertIn("encrypted at rest", safety)
+        self.assertIn("never leave your machine", safety)
+        # Location should reference the keyring service, not a file path
+        self.assertTrue(result["storage_location"].startswith("neo-mcp:"))
+        self.assertTrue(result["storage_backend"].startswith("keyring"))
+
+
+class TestRunSubprocessEnvInjection(unittest.IsolatedAsyncioTestCase):
+    """run_subprocess must inherit env vars from configured integrations."""
+
+    def setUp(self):
+        self.td = Path(make_ws())
+        self.meta = self.td / "integrations.json"
+        self._orig_meta = _int_manager_mod.INTEGRATIONS_METADATA_FILE
+        _int_manager_mod.INTEGRATIONS_METADATA_FILE = self.meta
+
+        self._orig_int_dir = _secret_store_mod.INTEGRATIONS_DIR
+        _secret_store_mod.INTEGRATIONS_DIR = self.td / "integrations"
+        self._orig_backend = os.environ.pop("NEO_INTEGRATIONS_BACKEND", None)
+
+    def tearDown(self):
+        _int_manager_mod.INTEGRATIONS_METADATA_FILE = self._orig_meta
+        _secret_store_mod.INTEGRATIONS_DIR = self._orig_int_dir
+        _restore("NEO_INTEGRATIONS_BACKEND", self._orig_backend)
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    async def test_blocking_subprocess_sees_integration_env(self):
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("anthropic", {"api_key": "sk-ant-LEAK_CANARY_9f3c"})
+
+        ws = str(self.td / "ws")
+        os.makedirs(ws, exist_ok=True)
+        handlers = ActionHandlers(
+            job_manager=JobManager(),
+            default_workspace=ws,
+            thread_workspaces={},
+            integrations=mgr,
+        )
+
+        result = await handlers.handle_command({
+            "action": "run_subprocess",
+            "request_id": "env-1",
+            "command": 'printf "%s" "$ANTHROPIC_API_KEY"',
+            "detach": False,
+        })
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["data"]["stdout"], "sk-ant-LEAK_CANARY_9f3c")
 
 
 if __name__ == "__main__":

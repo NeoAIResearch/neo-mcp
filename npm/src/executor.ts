@@ -292,19 +292,45 @@ function recordWrapper(threadId: string | undefined, absPath: string): void {
   }
 }
 
-export function stripWrapperPrefixes(text: string, wrapper: string): string {
+export function stripWrapperPrefixes(
+  text: string,
+  wrapper: string,
+  workspace?: string,
+): string {
   const escaped = wrapper.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // Strip "<wrapper>/" (with anything following); negative lookbehind to avoid mid-word matches.
-  text = text.replace(new RegExp(`(?<![A-Za-z0-9_])${escaped}/`, 'g'), '');
-  // Bare "<wrapper>" token: substitute "." so `cd <wrapper>` → `cd .`.
-  text = text.replace(new RegExp(`(?<![A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`, 'g'), '.');
+  // Step 1: absolute-container-path remap. Replace /<root>/<wrapper>[/...] with
+  // the host workspace. Longest container roots first so /app/project beats /app.
+  // Without this, Neo-generated scripts containing `target = '/app/<wrapper>'`
+  // would walk the host's real /app/ (often polluted with unrelated dirs on
+  // dev machines) instead of the user's actual workspace.
+  if (workspace) {
+    const rootsSorted = [..._CONTAINER_ROOTS].sort((a, b) => b.length - a.length);
+    for (const root of rootsSorted) {
+      const rootEsc = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      // Boundary: path separator, whitespace, quote, closing paren, or end-of-string.
+      text = text.replace(
+        new RegExp(`${rootEsc}/${escaped}(?=[/\\s'"\\)]|$)`, 'g'),
+        workspace,
+      );
+    }
+  }
+  // Step 2: strip leading "<wrapper>/" relative references. Lookbehind excludes
+  // `/` — any X/<wrapper>/ that survived step 1 is under an unknown root and
+  // should be left alone.
+  text = text.replace(new RegExp(`(?<![A-Za-z0-9_/])${escaped}/`, 'g'), '');
+  // Step 3: bare "<wrapper>" token → "." for `cd <wrapper>` style.
+  text = text.replace(new RegExp(`(?<![A-Za-z0-9_/])${escaped}(?![A-Za-z0-9_])`, 'g'), '.');
   return text;
 }
 
-function applyWrapperRewrite(text: string, threadId: string | undefined): string {
+function applyWrapperRewrite(
+  text: string,
+  threadId: string | undefined,
+  workspace?: string,
+): string {
   const slug = threadId ? _threadWrappers.get(threadId) : undefined;
   if (!slug) return text;
-  const rewritten = stripWrapperPrefixes(text, slug);
+  const rewritten = stripWrapperPrefixes(text, slug, workspace);
   if (rewritten !== text) {
     console.error(`[wrapper] stripped ${slug} from ${text.length} chars of shell text`);
   }
@@ -379,7 +405,7 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
   // runs it with cwd=<workspace> — the slug was meant relative to Neo's container cwd
   // (/app/<slug>/) and has no meaning on the host.
   if (full.endsWith('.sh') || full.endsWith('.bash') || code.startsWith('#!')) {
-    code = applyWrapperRewrite(code, cmd.thread_id);
+    code = applyWrapperRewrite(code, cmd.thread_id, workspace);
   }
 
   mkdirSync(dirname(full), { recursive: true });
@@ -463,7 +489,7 @@ async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionRe
   // Strip relative wrapper references (`cd <slug>`, `mkdir <slug>/data`) for which
   // remapCommandPaths can't help — they're syntactically indistinguishable from real
   // subdirs. Uses the slug captured from earlier absolute writes on this thread.
-  remappedCommand = applyWrapperRewrite(remappedCommand, cmd.thread_id);
+  remappedCommand = applyWrapperRewrite(remappedCommand, cmd.thread_id, safeCwd);
 
   // Ensure workspace exists before spawning — cwd must exist or spawn throws ENOENT
   mkdirSync(safeCwd, { recursive: true });

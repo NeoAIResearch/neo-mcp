@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 8 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, and control task lifecycle — via stdio transport.
+A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 12 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, control task lifecycle, and register third-party credentials (GitHub, HuggingFace, Anthropic, OpenRouter) — via stdio transport.
 
-Current pip version: **0.4.34**. Current npm version: **1.1.23**.
+Current pip version: **0.4.40**. Current npm version: **1.1.24**.
 
 ## Project structure
 
@@ -16,7 +16,8 @@ Each concern lives in its own top-level folder.
 neo-mcp/
 ├── python/                         # pip-installable MCP server (neo-mcp package)
 │   ├── src/neo_mcp/
-│   │   ├── server.py               # MCP server — all 8 tools, single file
+│   │   ├── server.py               # MCP server — all 12 tools, single file
+│   │   ├── integrations/           # GitHub/HF/Anthropic/OpenRouter credential storage
 │   │   ├── oauth.py                # OAuth 2.0 PKCE authorization server (HTTP mode)
 │   │   ├── setup.py                # setup wizard (neo-mcp setup)
 │   │   ├── daemon.py               # Python daemon (fallback — primary is npm daemon)
@@ -90,7 +91,7 @@ python3 -m pytest python/tests/ -v
 # Run connectivity test (requires NEO_SECRET_KEY)
 NEO_SECRET_KEY=sk-v1-... python3 python/tests/test_connection.py
 
-# Register with Claude Code (pip stdio — daemon auto-starts silently)
+# Register with Claude Code (pip stdio — Python poller runs in-process)
 claude mcp add --scope user neo \
   -e NEO_SECRET_KEY=your-secret \
   -- neo-mcp
@@ -170,7 +171,7 @@ All file reads and writes are validated to be within the thread's workspace or `
 `neo_submit_task` always submits with `deployment_type: "vscode"`. The submission path:
 
 1. `get_or_create_deployment_id()` — reads `~/.neo/daemon/standalone_deployment_id` or creates it; falls back to `NEO_DEPLOYMENT_ID` env var
-2. If no daemon running: `_auto_start_npm_daemon()` launches `npx neo-mcp-daemon` as a detached subprocess, waits up to 5 s for its PID file
+2. No separate daemon spawn — the Python `BackendPoller` is already running as a background asyncio task inside this same MCP-server process (started in `run_server`). If a standalone npm daemon is ALREADY running (PID file present), the Python poller defers to it; otherwise the Python poller handles all commands.
 3. POSTs to `/v2/thread/init-chat-direct` with `deployment_type: "vscode"` and `deployment_id`
 4. Returns `thread_id` immediately; background polling starts via `asyncio.create_task(_poll_task_bg(thread_id))`
 
@@ -184,11 +185,13 @@ All file reads and writes are validated to be within the thread's workspace or `
 
 ### Execution — always local
 
-**Execution always happens on the user's machine**, via:
-- The Neo VS Code/Cursor extension (zero setup — handles everything automatically), OR
-- The npm daemon (`npx neo-mcp-daemon`) — started automatically by the agent on first task submission
+**Execution always happens on the user's machine.** Polling options, in order of precedence:
 
-The server runs in stdio mode — server and daemon run on the same machine. `neo_submit_task` auto-starts `npx neo-mcp-daemon` silently if it's not running. No user action needed.
+1. **Neo VS Code / Cursor extension** — when the extension is installed and the user is working inside it, the extension's own daemon runs and this pip MCP server defers to it.
+2. **Python `BackendPoller` (default for pip users)** — runs inline as a background asyncio task inside the same process as the MCP server. Starts automatically when `python3 -m neo_mcp` (or the `neo-mcp` console script) boots. Has the same adaptive polling as the npm daemon (`wait_time=1` active / `POLL_WAIT_TIME=5` idle). No user action needed.
+3. **Standalone npm daemon (`npx neo-mcp-daemon`)** — optional; users who prefer a separate process can start it manually. When a live `npm_daemon.pid` is detected, the Python poller skips its own loop.
+
+There is no auto-spawn of `npx neo-mcp-daemon` from `neo_submit_task` — the Python poller running in-process is all that's required for the pipeline to work end-to-end.
 
 ### Thread-ID based polling — the core loop
 After submission, `init-chat-direct` returns a `thread_id`. **All status and message queries use `thread_id`** — these APIs work with API key auth:
@@ -224,6 +227,24 @@ When the VS Code/Cursor extension daemon is running:
 | `neo_stop_task` | DELETE | `/v2/thread/cleanup-direct/{thread_id}` |
 
 Auth on every request: `Authorization: Bearer $NEO_SECRET_KEY`
+
+### Integration tools (local only, no backend call)
+
+| Tool | Purpose |
+|---|---|
+| `neo_list_integrations` | List configured third-party credentials (names only, no secrets) |
+| `neo_add_integration` | Register a credential — writes to the native file (`~/.git-credentials`, `~/.cache/huggingface/token`) or `~/.neo/integrations/<provider>.env` with mode `0o600` |
+| `neo_remove_integration` | Delete the credential file(s) and metadata entry |
+| `neo_test_integration` | Probe the provider API with the stored credential |
+
+Providers wired today: `github`, `huggingface`, `anthropic`, `openrouter`. Metadata file `~/.neo/integrations.json` is a shared contract with the VS Code extension. `IntegrationManager.env_for_subprocess()` is merged into every `run_subprocess` child env so Neo tasks inherit `ANTHROPIC_API_KEY`, `HF_TOKEN`, `GITHUB_TOKEN`, etc. without re-prompting.
+
+### Secret storage backends (`integrations/secret_store.py`)
+
+- **`file`** (default) — one `~/.neo/integrations/<provider>.env` file per provider at `0o600`. Works everywhere (headless Linux, Docker, CI). Readable by any same-user process.
+- **`keyring`** (opt-in, `pip install neo-mcp[keyring]`) — OS keyring (macOS Keychain, Windows Credential Manager, Linux Secret Service). Encrypted at rest. Enable with `NEO_INTEGRATIONS_BACKEND=keyring`. Raises RuntimeError on startup if no functional backend — never silently falls back to plaintext.
+
+Native tool-interface files (`~/.git-credentials`, `~/.cache/huggingface/token`) are always written so `git`/`huggingface-cli` pick up credentials regardless of backend — the SecretStore holds the canonical copy used by `load_env()` and `remove_secret()`.
 
 ## Test suite
 

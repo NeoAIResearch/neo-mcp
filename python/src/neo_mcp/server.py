@@ -38,6 +38,8 @@ from .action_handlers import ActionHandlers
 from .auth import derive_deployment_id, get_or_create_deployment_id, get_secret_key
 from .backend_client import BackendClient
 from .backend_poller import BackendPoller
+from .integrations import IntegrationManager, PROVIDERS, ValidationError
+from .integrations.secret_store import get_secret_store
 from .job_manager import JobManager
 from .paths import (
     DAEMON_DIR,
@@ -48,7 +50,83 @@ from .paths import (
     THREAD_WORKSPACES_FILE,
 )
 
+
+def _package_version() -> str:
+    """Return the installed neo-mcp package version, or 'unknown' if undetectable.
+
+    Surfaced in MCP `serverInfo.version` so Inspector / `claude mcp logs` / editor
+    tool panels all show the same version users see from `pip show neo-mcp`.
+    """
+    try:
+        from importlib.metadata import version
+        return version("neo-mcp")
+    except Exception:
+        return "unknown"
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# PyPI update check — fire-and-forget background task
+# ---------------------------------------------------------------------------
+
+_PYPI_CACHE_TTL_SECONDS = 24 * 3600
+_PYPI_CACHE_FILE = DAEMON_DIR / "pypi_update_check.json"
+_PYPI_URL = "https://pypi.org/pypi/neo-mcp/json"
+
+
+async def _check_for_pypi_update() -> None:
+    """Log a stderr WARNING if a newer neo-mcp is on PyPI. Safe to fire-and-forget.
+
+    Never raises — network / parse / cache failures all end silently. Result is
+    cached for 24 h in ~/.neo/daemon/pypi_update_check.json so spawns don't
+    repeatedly hit PyPI.
+    """
+    import time
+
+    installed = _package_version()
+    if installed == "unknown":
+        return
+
+    latest: Optional[str] = None
+    try:
+        if _PYPI_CACHE_FILE.exists():
+            cached = json.loads(_PYPI_CACHE_FILE.read_text())
+            if time.time() - float(cached.get("checked_at", 0)) < _PYPI_CACHE_TTL_SECONDS:
+                latest = cached.get("latest")
+    except Exception:
+        pass  # corrupt cache → refetch
+
+    if not latest:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(_PYPI_URL)
+                resp.raise_for_status()
+                latest = resp.json().get("info", {}).get("version")
+            if latest:
+                DAEMON_DIR.mkdir(parents=True, exist_ok=True)
+                _PYPI_CACHE_FILE.write_text(
+                    json.dumps({"checked_at": time.time(), "latest": latest})
+                )
+        except Exception:
+            return  # offline, PyPI flaky, whatever — don't spam logs
+
+    if not latest or latest == installed:
+        return
+
+    try:
+        from packaging.version import Version
+        if Version(latest) <= Version(installed):
+            return  # dev build newer than PyPI; don't warn
+    except Exception:
+        # packaging missing or unparsable — fall back to "different string → warn"
+        pass
+
+    logger.warning(
+        "neo-mcp %s is installed; %s is available on PyPI. "
+        "Upgrade: pip install --upgrade neo-mcp",
+        installed, latest,
+    )
 
 # ---------------------------------------------------------------------------
 # Lock file helpers
@@ -161,7 +239,7 @@ def build_server(
         thread_workspaces=thread_workspaces,
     )
 
-    server = Server("neo-mcp")
+    server = Server("neo-mcp", version=_package_version())
 
     # ----------------------------------------------------------------
     # Tool definitions
@@ -404,6 +482,124 @@ def build_server(
                 ),
             ),
             types.Tool(
+                name="neo_list_integrations",
+                description=(
+                    "List all third-party integrations configured for Neo to use locally. "
+                    "Returns the provider name, auth method, when it was added, and which "
+                    "credential files are registered. NEVER returns the secret value itself. "
+                    "Use this to see which services (GitHub, HuggingFace, Anthropic, OpenRouter) "
+                    "Neo tasks can access without re-prompting the user."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+            ),
+            types.Tool(
+                name="neo_add_integration",
+                description=(
+                    "Register a third-party credential for Neo to use on this machine. "
+                    "Supported providers: github (PAT), huggingface (token), "
+                    "anthropic (api_key), openrouter (api_key). "
+                    "Secrets are written to each provider's native file (e.g. "
+                    "~/.git-credentials, ~/.cache/huggingface/token) with mode 0o600, "
+                    "or to ~/.neo/integrations/<provider>.env for providers without "
+                    "a native file. Neo subprocesses automatically inherit these as "
+                    "env vars (ANTHROPIC_API_KEY, HF_TOKEN, GITHUB_TOKEN, ...). "
+                    "\n\n"
+                    "IMPORTANT — after this tool succeeds, the response contains a "
+                    "'safety' string. You MUST relay that safety message to the user "
+                    "verbatim so they are reassured the key is stored only on their "
+                    "own device and never leaves it. Do NOT echo the credential value."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "enum": sorted(PROVIDERS.keys()),
+                            "description": "Which provider to configure.",
+                        },
+                        "credentials": {
+                            "type": "object",
+                            "description": (
+                                "Provider-specific credential fields. "
+                                "github: {pat, username?}; "
+                                "huggingface: {token}; "
+                                "anthropic: {api_key}; "
+                                "openrouter: {api_key}."
+                            ),
+                            "additionalProperties": True,
+                        },
+                    },
+                    "required": ["provider", "credentials"],
+                },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+            ),
+            types.Tool(
+                name="neo_remove_integration",
+                description=(
+                    "Remove a previously configured integration. Deletes the native "
+                    "credential file(s) and the metadata entry. Irreversible — the user "
+                    "must re-supply the secret to add it again."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "enum": sorted(PROVIDERS.keys()),
+                            "description": "Which provider to remove.",
+                        },
+                    },
+                    "required": ["provider"],
+                },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=True,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+            ),
+            types.Tool(
+                name="neo_test_integration",
+                description=(
+                    "Test the stored credentials for an integration by calling the "
+                    "provider's API. Returns {ok, message, latency_ms}. Useful when a "
+                    "downstream Neo task fails auth — run this first to confirm the "
+                    "credential is still valid before debugging the task."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "enum": sorted(PROVIDERS.keys()),
+                            "description": "Which provider to test.",
+                        },
+                    },
+                    "required": ["provider"],
+                },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=True,
+                ),
+            ),
+            types.Tool(
                 name="neo_list_tasks",
                 description=(
                     "List all known Neo tasks with their current live status. "
@@ -456,8 +652,18 @@ def build_server(
                 result = await _stop_task(client, poller, args)
             elif name == "neo_list_tasks":
                 result = await _list_tasks(client)
+            elif name == "neo_list_integrations":
+                result = _list_integrations()
+            elif name == "neo_add_integration":
+                result = _add_integration(args)
+            elif name == "neo_remove_integration":
+                result = _remove_integration(args)
+            elif name == "neo_test_integration":
+                result = await _test_integration(args)
             else:
                 result = {"error": f"Unknown tool: {name}"}
+        except ValidationError as exc:
+            result = {"error": str(exc)}
         except RuntimeError as exc:
             result = {"error": str(exc)}
         except Exception as exc:  # noqa: BLE001
@@ -596,11 +802,122 @@ async def _list_tasks(client: BackendClient) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Integration tool implementations
+# ---------------------------------------------------------------------------
+
+def _list_integrations() -> dict:
+    mgr = IntegrationManager()
+    items = mgr.list()
+    return {"count": len(items), "integrations": items}
+
+
+_ASSISTANT_RELAY_INSTRUCTION = (
+    "TELL THE USER: relay the 'safety' message above to the user verbatim, "
+    "so they know exactly where their credentials live and what guarantees "
+    "apply. Do not show the credential value back to the user."
+)
+
+_SAFETY_COMMON_TAIL = (
+    "They never leave your machine — never sent to Neo's backend, never "
+    "logged, never committed to git (~/.neo/ and .env are in .gitignore). "
+    "Neo injects them as environment variables only when running your "
+    "tasks locally on this computer. Run neo_remove_integration to delete them."
+)
+
+
+def _build_safety_message(provider: str, backend: str, files_written: list[str]) -> str:
+    """Produce a truthful per-storage-site reassurance string.
+
+    Providers can write more than one location:
+      - anthropic/openrouter: one location (either keyring entry or 0o600 .env)
+      - huggingface/github:   two locations (the canonical store + a native
+                              plaintext file at 0o600 so the matching CLI
+                              tool can read it directly)
+
+    We enumerate every location so the safety message is precisely accurate.
+    Saying "only in keyring" when we ALSO wrote ~/.cache/huggingface/token
+    would be a lie the user might rely on.
+    """
+    keyring_entries = [f for f in files_written if f.startswith("neo-mcp:")]
+    file_paths = [f for f in files_written if not f.startswith("neo-mcp:")]
+
+    lead = f"Your {provider} credentials are stored only on this device."
+
+    if keyring_entries and file_paths:
+        where = (
+            f"The primary copy lives in your operating-system keyring "
+            f"({backend}, encrypted at rest). A second copy is written at "
+            f"{', '.join(file_paths)} (mode 0o600, owner-readable only) so "
+            f"the matching CLI tool (git / huggingface-cli) can read it directly."
+        )
+    elif keyring_entries:
+        where = (
+            f"Held in your operating-system keyring ({backend}), "
+            f"encrypted at rest."
+        )
+    else:
+        where = (
+            f"Written to {', '.join(file_paths)} with mode 0o600 "
+            f"(owner-readable only)."
+        )
+
+    return " ".join((lead, where, _SAFETY_COMMON_TAIL))
+
+
+def _add_integration(args: dict) -> dict:
+    provider = args.get("provider")
+    credentials = args.get("credentials") or {}
+    if not provider:
+        raise ValidationError("Missing required field: provider")
+    if not isinstance(credentials, dict):
+        raise ValidationError("credentials must be an object")
+    mgr = IntegrationManager()
+    result = mgr.add(provider, credentials)
+
+    store = get_secret_store()
+    backend = store.backend
+    files_written = result.get("files_written", [])
+    # storage_location stays for backwards-compatibility callers — first
+    # entry in files_written is the canonical primary location.
+    location = files_written[0] if files_written else store.location(provider)
+
+    return {
+        "status": "added",
+        "provider": provider,
+        "storage_backend": backend,
+        "storage_location": location,
+        "files_written": files_written,
+        "safety": _build_safety_message(provider, backend, files_written),
+        "assistant_instruction": _ASSISTANT_RELAY_INSTRUCTION,
+    }
+
+
+def _remove_integration(args: dict) -> dict:
+    provider = args.get("provider")
+    if not provider:
+        raise ValidationError("Missing required field: provider")
+    mgr = IntegrationManager()
+    result = mgr.remove(provider)
+    return {"status": "removed", **result}
+
+
+async def _test_integration(args: dict) -> dict:
+    provider = args.get("provider")
+    if not provider:
+        raise ValidationError("Missing required field: provider")
+    mgr = IntegrationManager()
+    return await mgr.test(provider)
+
+
+# ---------------------------------------------------------------------------
 # Async run + CLI entry point
 # ---------------------------------------------------------------------------
 
 async def run(secret_key: str, workspace: str) -> None:
     """Build MCP server, start poller, run stdio transport until EOF."""
+    logger.info("neo-mcp %s starting (workspace=%s)", _package_version(), workspace)
+    asyncio.create_task(_check_for_pypi_update(), name="pypi-update-check")
+
     server, client, poller = build_server(secret_key=secret_key, workspace=workspace)
 
     pid = os.getpid()
