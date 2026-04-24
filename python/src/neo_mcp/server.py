@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import tempfile
@@ -169,6 +170,52 @@ def _pid_is_alive(pid: int) -> bool:
         return False
 
 
+def _pid_cmdline(pid: int) -> Optional[str]:
+    """Return the process command line for pid, or None if we can't read it.
+
+    Tries /proc/{pid}/cmdline first (Linux), then `ps -p pid -o args=`
+    (macOS/BSD/Windows-WSL). None means "don't know" — caller should fall
+    back to the liveness-only check rather than assume dead.
+    """
+    proc_cmdline = Path(f"/proc/{pid}/cmdline")
+    if proc_cmdline.exists():
+        try:
+            raw = proc_cmdline.read_bytes()
+            return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        except OSError:
+            return None
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _pid_is_neo_daemon(pid: int) -> bool:
+    """Return True if pid is alive AND its cmdline looks like a neo daemon.
+
+    Guards against PID reuse: a dead daemon's PID can be recycled by the OS
+    and handed to an unrelated process (bash, node, etc.). A plain os.kill
+    liveness check would then misidentify that unrelated process as a live
+    neo daemon and wrongly suppress our in-process poller.
+
+    If we can't read the cmdline at all (unknown platform, permission
+    denied), fall back to the liveness-only check to preserve prior behavior.
+    """
+    if not _pid_is_alive(pid):
+        return False
+    cmdline = _pid_cmdline(pid)
+    if cmdline is None:
+        return True  # can't verify — trust liveness
+    lowered = cmdline.lower()
+    return "neo-mcp" in lowered or "neo_mcp" in lowered
+
+
 def _poller_already_running(deployment_id: str = "") -> bool:
     """Return True if any daemon with the same deployment ID is already polling.
 
@@ -176,14 +223,23 @@ def _poller_already_running(deployment_id: str = "") -> bool:
     1. Our own lock file (neo-mcp.lock)
     2. npm daemon PID file: daemon_{deployment_id}.pid
     3. Generic fallback PID files: npm_daemon.pid / python_daemon.pid
+
+    Stale PID files pointing at reused, non-neo PIDs are deleted so the
+    next startup doesn't trip on them again.
     """
     # 1. Our own lock file
     if LOCK_FILE.exists():
         try:
             data = json.loads(LOCK_FILE.read_text())
             pid = data.get("pid")
-            if pid and int(pid) != os.getpid() and _pid_is_alive(int(pid)):
-                return True
+            if pid and int(pid) != os.getpid():
+                if _pid_is_neo_daemon(int(pid)):
+                    return True
+                if _pid_is_alive(int(pid)) is False:
+                    try:
+                        LOCK_FILE.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         except (OSError, ValueError, TypeError):
             pass
 
@@ -197,14 +253,28 @@ def _poller_already_running(deployment_id: str = "") -> bool:
         DAEMON_DIR / "python_daemon.pid",
     ]
     for pid_file in candidates:
-        if pid_file.exists():
-            try:
-                pid = int(pid_file.read_text().strip())
-                if pid != os.getpid() and _pid_is_alive(pid):
-                    logger.info("Existing daemon detected via %s (pid=%d) — skipping poller start", pid_file.name, pid)
-                    return True
-            except (OSError, ValueError):
-                pass
+        if not pid_file.exists():
+            continue
+        try:
+            pid = int(pid_file.read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if pid == os.getpid():
+            continue
+        if _pid_is_neo_daemon(pid):
+            logger.info("Existing daemon detected via %s (pid=%d) — skipping poller start", pid_file.name, pid)
+            return True
+        # Stale: either the PID is dead, or it's been reused by an unrelated
+        # process. Remove the file so this MCP start (and future ones) don't
+        # suppress our in-process poller.
+        logger.info(
+            "Stale PID file %s (pid=%d not a neo daemon) — removing",
+            pid_file.name, pid,
+        )
+        try:
+            pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     return False
 
@@ -484,11 +554,15 @@ def build_server(
             types.Tool(
                 name="neo_list_integrations",
                 description=(
-                    "List all third-party integrations configured for Neo to use locally. "
-                    "Returns the provider name, auth method, when it was added, and which "
-                    "credential files are registered. NEVER returns the secret value itself. "
-                    "Use this to see which services (GitHub, HuggingFace, Anthropic, OpenRouter) "
-                    "Neo tasks can access without re-prompting the user."
+                    "USE THIS TOOL when the user asks questions like \"which keys have "
+                    "I saved for Neo?\", \"what integrations are set up?\", \"do I "
+                    "already have an OpenRouter/Anthropic/GitHub/HF key configured?\", "
+                    "or before calling neo_add_integration to check if a credential "
+                    "already exists. "
+                    "Returns the provider name, auth method, when it was added, and "
+                    "which credential files are registered. NEVER returns the secret "
+                    "value itself — safe to show the full response to the user. "
+                    "Covers github, huggingface, anthropic, openrouter."
                 ),
                 inputSchema={
                     "type": "object",
@@ -505,14 +579,29 @@ def build_server(
             types.Tool(
                 name="neo_add_integration",
                 description=(
-                    "Register a third-party credential for Neo to use on this machine. "
+                    "USE THIS TOOL whenever the user wants to give Neo a credential — "
+                    "phrasings like \"save my OpenRouter key for Neo\", \"use this "
+                    "Anthropic key with Neo\", \"here's my HuggingFace token\", "
+                    "\"set my GitHub PAT\", or any message where the user pastes an "
+                    "API key / token and wants Neo to use it. "
+                    "DO NOT instead suggest the user create a .env file, export an "
+                    "env var, or edit a config file — this tool IS the correct and "
+                    "only supported way to register credentials for Neo. "
+                    "DO NOT ask follow-up questions before calling this tool if the "
+                    "user already provided both the provider and the key — just call "
+                    "it. "
+                    "\n\n"
+                    "Key-format heuristics (use when the provider isn't explicit): "
+                    "\"sk-or-...\" → openrouter; \"sk-ant-...\" → anthropic; "
+                    "\"hf_...\" → huggingface; \"ghp_...\" / \"github_pat_...\" → github. "
+                    "\n\n"
                     "Supported providers: github (PAT), huggingface (token), "
-                    "anthropic (api_key), openrouter (api_key). "
-                    "Secrets are written to each provider's native file (e.g. "
-                    "~/.git-credentials, ~/.cache/huggingface/token) with mode 0o600, "
-                    "or to ~/.neo/integrations/<provider>.env for providers without "
-                    "a native file. Neo subprocesses automatically inherit these as "
-                    "env vars (ANTHROPIC_API_KEY, HF_TOKEN, GITHUB_TOKEN, ...). "
+                    "anthropic (api_key), openrouter (api_key). Secrets are stored "
+                    "locally (native files like ~/.git-credentials or "
+                    "~/.neo/integrations/<provider>.env, mode 0o600) and never sent "
+                    "to any server. Neo subprocesses automatically inherit them as "
+                    "env vars (ANTHROPIC_API_KEY, HF_TOKEN, GITHUB_TOKEN, "
+                    "OPENROUTER_API_KEY). "
                     "\n\n"
                     "IMPORTANT — after this tool succeeds, the response contains a "
                     "'safety' string. You MUST relay that safety message to the user "
@@ -551,9 +640,14 @@ def build_server(
             types.Tool(
                 name="neo_remove_integration",
                 description=(
-                    "Remove a previously configured integration. Deletes the native "
-                    "credential file(s) and the metadata entry. Irreversible — the user "
-                    "must re-supply the secret to add it again."
+                    "USE THIS TOOL when the user says things like \"remove my "
+                    "OpenRouter key from Neo\", \"delete the GitHub integration\", "
+                    "\"forget my Anthropic key\", or \"revoke Neo's access to X\". "
+                    "Deletes the native credential file(s) and the metadata entry. "
+                    "Irreversible — the user must re-supply the secret via "
+                    "neo_add_integration to use that provider again. "
+                    "If the user wants to REPLACE a key (rotate it), prefer calling "
+                    "neo_add_integration directly — it overwrites the existing entry."
                 ),
                 inputSchema={
                     "type": "object",
@@ -576,10 +670,15 @@ def build_server(
             types.Tool(
                 name="neo_test_integration",
                 description=(
-                    "Test the stored credentials for an integration by calling the "
-                    "provider's API. Returns {ok, message, latency_ms}. Useful when a "
-                    "downstream Neo task fails auth — run this first to confirm the "
-                    "credential is still valid before debugging the task."
+                    "USE THIS TOOL when the user says \"check if my OpenRouter key "
+                    "still works\", \"test my GitHub token\", \"is my Anthropic key "
+                    "valid?\", or right after neo_add_integration to confirm the "
+                    "credential is live. Also use it FIRST when a Neo task fails "
+                    "with a 401/403/auth error — verify the stored credential before "
+                    "debugging the task. "
+                    "Calls the provider's own API (GitHub, HuggingFace, Anthropic, "
+                    "OpenRouter) and returns {ok, message, latency_ms}. Read-only — "
+                    "does not modify the stored credential."
                 ),
                 inputSchema={
                     "type": "object",
@@ -869,7 +968,23 @@ async def _list_tasks(client: BackendClient) -> dict:
 def _list_integrations() -> dict:
     mgr = IntegrationManager()
     items = mgr.list()
-    return {"count": len(items), "integrations": items}
+    # Count entries present in the shared metadata file but NOT usable by
+    # this server (e.g. VS Code extension entries keyed by random IDs).
+    # Surfacing this lets the user understand why neo_list_integrations
+    # might show fewer rows than another tool inspecting the same file.
+    raw = mgr._load_metadata().get("integrations", {})
+    ignored = max(0, len(raw) - len(items))
+    resp: dict = {"count": len(items), "integrations": items}
+    if ignored:
+        resp["ignored_foreign_entries"] = ignored
+        resp["note"] = (
+            f"{ignored} entr{'y' if ignored == 1 else 'ies'} in "
+            "~/.neo/integrations.json were written by another tool (likely "
+            "the Neo VS Code extension) under non-canonical keys — Neo tasks "
+            "started from this server cannot load those credentials. Re-add "
+            "them via neo_add_integration if you want this server to use them."
+        )
+    return resp
 
 
 _ASSISTANT_RELAY_INSTRUCTION = (

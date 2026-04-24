@@ -8,7 +8,7 @@ These are installed into `~/.claude/skills/` and become `/slash-commands` in Cla
 
 | Folder | Command | What it does |
 |---|---|---|
-| [`claude-code/`](claude-code/SKILL.md) | `/neo` | Auto-routes AI/ML tasks to Neo, manages full lifecycle |
+| [`claude-code/`](claude-code/SKILL.md) | `/neo` | Auto-routes AI/ML tasks to Neo, manages full lifecycle. Also exposes `neo_add_integration` / `neo_list_integrations` / `neo_test_integration` / `neo_remove_integration` for registering GitHub / HuggingFace / Anthropic / OpenRouter keys locally — see [docs/INTEGRATIONS.md](../docs/INTEGRATIONS.md). |
 | [`neo-setup/`](neo-setup/SKILL.md) | `/neo-setup` | Interactive installation and configuration wizard |
 
 **Install automatically** (npm):

@@ -68,16 +68,37 @@ class IntegrationManager:
     # ---- public API ------------------------------------------------------
 
     def list(self) -> list[dict]:
+        """Return only integrations this server can actually use.
+
+        The metadata file ~/.neo/integrations.json is shared with the VS
+        Code extension, which writes entries under random IDs like
+        "integration-1768977015296-3prpe3wd9" with display-cased provider
+        names ("OpenRouter") inside the value. Our credential loaders
+        (env_for_subprocess) key off MODULES, which only knows the
+        canonical lowercase names — so extension-written entries never
+        reach Neo subprocesses on this machine anyway. Showing them in
+        the list just confuses the user into thinking the provider is
+        configured when it is not.
+
+        Strategy: include an entry only if its key case-folds to a known
+        provider. The displayed "provider" is always canonical-lowercase
+        so the list matches what the other tools (add/remove/test) accept.
+        """
         data = self._load_metadata()
-        items = [
-            {
-                "provider": name,
+        known = {p.lower(): p for p in PROVIDERS.keys()}
+        items: list[dict] = []
+        for name, entry in data.get("integrations", {}).items():
+            if not isinstance(entry, dict):
+                continue
+            canonical = known.get(str(name).lower())
+            if canonical is None:
+                continue  # extension-written ID key we can't use
+            items.append({
+                "provider": canonical,
                 "method": entry.get("method"),
                 "added_at": entry.get("added_at"),
                 "files": entry.get("files", []),
-            }
-            for name, entry in data.get("integrations", {}).items()
-        ]
+            })
         return sorted(items, key=lambda x: x["provider"])
 
     def add(self, provider: str, credentials: dict) -> dict:

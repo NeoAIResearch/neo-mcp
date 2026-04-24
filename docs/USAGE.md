@@ -49,6 +49,12 @@ neo_task_status   →  check overall status at any time
 | `neo_pause_task` | Pause execution mid-task. |
 | `neo_resume_task` | Resume a paused task. |
 | `neo_stop_task` | Cancel and clean up. |
+| `neo_list_integrations` | Check which third-party keys are configured (GitHub / HuggingFace / Anthropic / OpenRouter). Returns names only — never the secret value. |
+| `neo_add_integration` | Register a third-party API key locally. Example: *"save my OpenRouter key sk-or-... for Neo"*. |
+| `neo_test_integration` | Verify a stored key still works against the provider's API. Run this first when a Neo task fails with a 401/403. |
+| `neo_remove_integration` | Delete a stored key from this machine. Irreversible — re-add via `neo_add_integration` to use again. |
+
+> **Integrations** store keys locally (`~/.neo/integrations/*.env` mode `0o600`, or OS keyring with `NEO_INTEGRATIONS_BACKEND=keyring`). Keys never leave your machine. Full guide: [INTEGRATIONS.md](INTEGRATIONS.md).
 
 ---
 

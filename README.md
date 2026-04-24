@@ -26,6 +26,8 @@ Your editor  ──MCP──▶  neo-mcp server  ──API──▶  Neo backend
 
 **Files are always written to your machine, never stored remotely.**
 
+Neo can also hold your third-party API keys (GitHub, HuggingFace, Anthropic, OpenRouter) locally so it can use them in tasks without re-prompting — keys stay on your machine, never sent to Neo's backend. Full guide: [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
+
 ---
 
 ## Install
@@ -317,6 +319,12 @@ The assistant should list `neo_submit_task`, `neo_task_status`, `neo_get_message
 | `neo_pause_task` | Pause a running task. Can be resumed. |
 | `neo_resume_task` | Resume a paused task. |
 | `neo_stop_task` | Permanently stop and clean up a task. |
+| `neo_list_integrations` | List stored third-party API keys (names only — never the value). |
+| `neo_add_integration` | Register a GitHub PAT / HuggingFace token / Anthropic key / OpenRouter key so Neo tasks can use it as an env var. |
+| `neo_test_integration` | Call the provider's API to confirm a stored key is still valid. |
+| `neo_remove_integration` | Delete a stored key from this machine. |
+
+> **Integration tools** store credentials locally — file mode `0o600` under `~/.neo/integrations/`, or your OS keyring if `NEO_INTEGRATIONS_BACKEND=keyring`. Keys never leave your machine. Full guide: [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
 
 ---
 
