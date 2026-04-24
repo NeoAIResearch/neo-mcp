@@ -385,6 +385,12 @@ The assistant should list `neo_submit_task`, `neo_task_status`, `neo_get_message
 | `neo_pause_task` | Pause a running task. Can be resumed. |
 | `neo_resume_task` | Resume a paused task. |
 | `neo_stop_task` | Permanently stop and clean up a task. |
+| `neo_list_integrations` | List stored third-party API keys (names only — never the value). |
+| `neo_add_integration` | Register a GitHub PAT / HuggingFace token / Anthropic / OpenRouter key locally so Neo tasks auto-receive it as an env var. |
+| `neo_test_integration` | Verify a stored key is still valid by calling the provider's API. |
+| `neo_remove_integration` | Delete a stored key from this machine. |
+
+> **Integration tools** store credentials locally (file `0o600` under `~/.neo/integrations/`, or OS keyring with `NEO_INTEGRATIONS_BACKEND=keyring`). Keys never leave your machine. Full guide: [docs/INTEGRATIONS.md](INTEGRATIONS.md).
 
 ---
 

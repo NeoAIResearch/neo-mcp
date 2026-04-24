@@ -272,6 +272,31 @@ Always pass workspace as the project root (git root), never a subdirectory.
 
 ---
 
+## Integration tools (for registering third-party API keys)
+
+The MCP server also exposes four local-only tools for managing user API keys:
+
+| Tool | Purpose |
+|---|---|
+| `neo_list_integrations` | Show which GitHub / HuggingFace / Anthropic / OpenRouter keys are configured. |
+| `neo_add_integration` | Register a key locally (file `0o600` or OS keyring). Keys never leave the user's machine. |
+| `neo_test_integration` | Verify a stored key still works. |
+| `neo_remove_integration` | Delete a stored key. |
+
+Wire them into your MCP client exactly like the task tools above; each takes `{ provider }` (and `neo_add_integration` takes `{ provider, credentials }`). Full behavioural spec: [docs/INTEGRATIONS.md](https://github.com/heyneo/neo-mcp/blob/main/docs/INTEGRATIONS.md).
+
+---
+
+## Task instruction rules (pass through to Neo)
+
+Whenever you include a real-world identifier in a task — model ID, Hugging Face repo, PyPI package, dataset name, API SKU — either verify it against its canonical source yourself, or include this literal instruction inside the task prompt:
+
+> *Research and confirm every referenced ID against its canonical source before using it. Do NOT fall back to guessed, shortened, or substitute IDs. If any ID is ambiguous or unverifiable, halt and ask for clarification via WAITING_FOR_FEEDBACK — do not proceed.*
+
+If Neo starts drifting from the user's intent mid-run, prefer `neo_send_feedback` to course-correct — it preserves in-flight state. Only use `neo_stop_task` + a fresh submit when the premise is wrong or the run is too far off to salvage. Either way, narrate the action to the user: *"Sending feedback to correct X"* or *"Stopping task N and resubmitting with corrected Y because Z."*
+
+---
+
 ## Tool routing guide
 
 | Task type | Use Neo? |

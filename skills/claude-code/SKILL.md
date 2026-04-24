@@ -78,10 +78,14 @@ When invoked as `/neo <task>`, call `neo_submit_task` with the provided text and
 | `neo_list_tasks` | User closed a window / lost track of a task | Lists all running/recent tasks; reconnects pollers automatically |
 | `neo_task_status` | Checking if still running | Reads from in-memory cache — fast, no API call if poller is active |
 | `neo_get_messages` | Reading output when COMPLETED | Paginated; capped at ~20 000 tokens |
-| `neo_send_feedback` | Neo is WAITING_FOR_FEEDBACK | Call `neo_task_status` after sending to confirm resume |
+| `neo_send_feedback` | Neo is WAITING_FOR_FEEDBACK, or to course-correct a digressing task mid-run | Call `neo_task_status` after sending to confirm resume |
 | `neo_pause_task` | User asks to pause | — |
 | `neo_resume_task` | User asks to resume | — |
-| `neo_stop_task` | User asks to cancel | — |
+| `neo_stop_task` | User asks to cancel, or last-resort course-correction when feedback can't salvage the run | — |
+| `neo_list_integrations` | User asks which third-party keys are configured, or before adding a key to check for duplicates | Never returns the secret value |
+| `neo_add_integration` | User pastes an API key for Neo to use (GitHub PAT / HuggingFace / Anthropic / OpenRouter). Pattern-match the key prefix (`sk-or-`, `sk-ant-`, `hf_`, `ghp_`/`github_pat_`) to infer the provider when unstated. Do NOT suggest the user create a `.env` file — this tool IS the registration path. | Stored locally only — `~/.neo/integrations/<provider>.env` at `0o600`, or OS keyring with `NEO_INTEGRATIONS_BACKEND=keyring`. After success, relay the response's `safety` message to the user verbatim |
+| `neo_test_integration` | Verify a stored key is live — run this first when a Neo task fails with a 401/403 before debugging the task | Read-only; calls the provider's API directly |
+| `neo_remove_integration` | User asks to delete/revoke/forget a stored key. For key rotation, prefer calling `neo_add_integration` (which overwrites). | Irreversible — user must re-supply to use again |
 
 ---
 
@@ -95,6 +99,8 @@ When invoked as `/neo <task>`, call `neo_submit_task` with the provided text and
 - **`wait_for_completion: true`** blocks until done and returns output directly. Only use for short tasks (< 3 min). For anything longer, leave it `false` and poll with `neo_task_status`.
 - **Prefer `neo_task_status` over `neo_get_messages`** for mid-run checks — it reads from cache.
 - **Never poll in a tight loop** — call `neo_task_status` once per user turn. The background poller handles the rest.
+- **Verify external IDs before delegating.** When the task references real-world identifiers (model IDs, Hugging Face repos, PyPI packages, dataset names, API SKUs, etc.), either confirm the exact IDs yourself via WebSearch / official docs first, or include this instruction verbatim in the task prompt to Neo: *"Research and confirm every referenced ID against its canonical source before using it. Do NOT fall back to guessed, shortened, or substitute IDs. If any ID is ambiguous or unverifiable, halt and ask for clarification via WAITING_FOR_FEEDBACK — do not proceed."* Silent fallback to fabricated IDs is the single most common way Neo tasks go off-rails.
+- **Correcting a digressing task — feedback first, stop only as last resort.** If Neo has started work but is drifting from the user's intent, call `neo_send_feedback` with a short correction — this preserves all in-flight state and context. Only call `neo_stop_task` (and submit a fresh task) when the original premise was wrong or the run has gone too far to salvage with a nudge. Either way, tell the user verbatim what you are doing: *"Sending feedback to correct X"* or *"Stopping task N and resubmitting with corrected Y because Z."* Never terminate and restart silently.
 
 ---
 

@@ -189,6 +189,12 @@ Restart Windsurf after editing.
 | `neo_pause_task` | Pause a running task. |
 | `neo_resume_task` | Resume a paused task. |
 | `neo_stop_task` | Stop and clean up a task permanently. |
+| `neo_list_integrations` | List stored third-party API keys (names only — never the value). |
+| `neo_add_integration` | Register a GitHub PAT / HuggingFace token / Anthropic key / OpenRouter key so Neo tasks can use it as an env var. |
+| `neo_test_integration` | Call the provider's API to confirm a stored key is still valid. |
+| `neo_remove_integration` | Delete a stored key from this machine. |
+
+> **Integration tools** store credentials locally (file `0o600` under `~/.neo/integrations/`, or OS keyring with `NEO_INTEGRATIONS_BACKEND=keyring`). Keys never leave your machine. See the full guide at [docs/INTEGRATIONS.md](https://github.com/heyneo/neo-mcp/blob/main/docs/INTEGRATIONS.md).
 
 ---
 

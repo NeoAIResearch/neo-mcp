@@ -1730,6 +1730,117 @@ class TestIntegrationManager(_IntegrationFixture):
         self.assertTrue(items[0]["added_at"])
         self.assertIn("anthropic.env", items[0]["files"][0])
 
+    def test_list_filters_vscode_extension_id_keyed_entries(self):
+        """The VS Code extension writes entries under random IDs like
+        'integration-1768977015296-3prpe3wd9' into the same shared metadata
+        file. Those entries' credentials are not reachable via our MODULES
+        lookup, so listing them misleads the user into thinking a provider
+        is configured. The list must filter them out.
+        """
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("openrouter", {"api_key": "sk-or-real"})
+        # Simulate the extension writing alongside us.
+        data = mgr._load_metadata()
+        data["integrations"]["integration-1768977015296-3prpe3wd9"] = {
+            "provider": "Anthropic",
+            "method": "api_key",
+            "added_at": "2026-04-20T00:00:00Z",
+        }
+        data["integrations"]["integration-1775131950811-4a6cyfhtf"] = {
+            "provider": "GitHub",
+            "method": "pat",
+        }
+        mgr._save_metadata(data)
+
+        items = mgr.list()
+        self.assertEqual([i["provider"] for i in items], ["openrouter"])
+
+    def test_list_normalizes_case_insensitive_provider_keys(self):
+        """An 'OpenRouter'-keyed entry (display-cased) should still be
+        surfaced, but under its canonical lowercase name so the other
+        integration tools (remove, test) can act on it.
+        """
+        mgr = IntegrationManager(metadata_file=self.meta)
+        data = mgr._load_metadata()
+        data["integrations"]["OpenRouter"] = {
+            "method": "api_key",
+            "added_at": "2026-04-24T00:00:00Z",
+            "files": [],
+        }
+        mgr._save_metadata(data)
+
+        items = mgr.list()
+        self.assertEqual([i["provider"] for i in items], ["openrouter"])
+
+    def test_list_handles_all_four_provider_casings(self):
+        """Each of the four providers under any casing collapses to its
+        canonical lowercase form. This matches what different VS Code
+        extension builds have shipped over time (GitHub, Github, GITHUB…).
+        """
+        mgr = IntegrationManager(metadata_file=self.meta)
+        data = mgr._load_metadata()
+        for key in ("GitHub", "HuggingFace", "Anthropic", "OpenRouter"):
+            data["integrations"][key] = {"method": "x", "added_at": "t", "files": []}
+        mgr._save_metadata(data)
+
+        items = mgr.list()
+        self.assertEqual(
+            [i["provider"] for i in items],
+            ["anthropic", "github", "huggingface", "openrouter"],
+        )
+
+    def test_list_skips_non_dict_values(self):
+        """Corrupt metadata (entry value is a string / None / list) must not
+        crash list(). Those entries are simply filtered out.
+        """
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("openrouter", {"api_key": "sk-or-good"})
+        data = mgr._load_metadata()
+        data["integrations"]["garbage_string"] = "not-a-dict"
+        data["integrations"]["garbage_none"] = None
+        data["integrations"]["garbage_list"] = [1, 2, 3]
+        mgr._save_metadata(data)
+
+        items = mgr.list()
+        self.assertEqual([i["provider"] for i in items], ["openrouter"])
+
+    def test_list_with_only_foreign_entries_returns_empty(self):
+        """Device where ONLY the VS Code extension has written — our list
+        is empty, but we must not crash.
+        """
+        mgr = IntegrationManager(metadata_file=self.meta)
+        data = mgr._load_metadata()
+        data["integrations"]["integration-1768977015296-3prpe3wd9"] = {
+            "method": "api_key",
+        }
+        mgr._save_metadata(data)
+
+        self.assertEqual(mgr.list(), [])
+
+    def test_env_for_subprocess_ignores_foreign_id_keyed_entries(self):
+        """THIS IS THE REAL BUG: credentials written by the VS Code
+        extension under random IDs were silently unreachable by
+        env_for_subprocess. Tasks thought they were configured but ran
+        without the key. Lock in the safe behavior — foreign entries are
+        never merged into the subprocess env, regardless of what's in their
+        value dicts. (Users are told to re-add via neo_add_integration.)
+        """
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("openrouter", {"api_key": "sk-or-real"})
+        data = mgr._load_metadata()
+        data["integrations"]["integration-1768977015296-3prpe3wd9"] = {
+            "provider": "anthropic",
+            "method": "api_key",
+            # Even if the entry claims to carry a secret, we refuse to
+            # trust it — we can't know which module would load it.
+            "api_key": "sk-ant-should-not-leak",
+        }
+        mgr._save_metadata(data)
+
+        env = mgr.env_for_subprocess()
+        self.assertEqual(env.get("OPENROUTER_API_KEY"), "sk-or-real")
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+
     def test_remove_deletes_secret_and_metadata(self):
         mgr = IntegrationManager(metadata_file=self.meta)
         mgr.add("anthropic", {"api_key": "sk-ant-toremove"})
@@ -1823,6 +1934,79 @@ class TestIntegrationManager(_IntegrationFixture):
         # and add still works after recovery
         mgr.add("anthropic", {"api_key": "sk-ant-recovered"})
         self.assertEqual([i["provider"] for i in mgr.list()], ["anthropic"])
+
+
+class TestListIntegrationsResponse(_IntegrationFixture):
+    """Covers the server-level _list_integrations() response shape — the
+    ignored-count note that tells the user why their list shrank."""
+
+    def _patched_manager(self):
+        from neo_mcp import server as _srv
+        return patch.object(_srv, "IntegrationManager", lambda: IntegrationManager(metadata_file=self.meta))
+
+    def test_clean_response_has_no_note(self):
+        from neo_mcp.server import _list_integrations
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("openrouter", {"api_key": "sk-or-clean"})
+        with self._patched_manager():
+            resp = _list_integrations()
+        self.assertEqual(resp["count"], 1)
+        self.assertNotIn("note", resp)
+        self.assertNotIn("ignored_foreign_entries", resp)
+
+    def test_one_ignored_entry_uses_singular_grammar(self):
+        from neo_mcp.server import _list_integrations
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("openrouter", {"api_key": "sk-or-ok"})
+        data = mgr._load_metadata()
+        data["integrations"]["integration-1768977015296-3prpe3wd9"] = {"method": "x"}
+        mgr._save_metadata(data)
+        with self._patched_manager():
+            resp = _list_integrations()
+        self.assertEqual(resp["ignored_foreign_entries"], 1)
+        self.assertIn("1 entry ", resp["note"])
+        self.assertNotIn("1 entries", resp["note"])
+
+    def test_multiple_ignored_entries_uses_plural_grammar(self):
+        from neo_mcp.server import _list_integrations
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("openrouter", {"api_key": "sk-or-ok"})
+        data = mgr._load_metadata()
+        data["integrations"]["integration-a"] = {"method": "x"}
+        data["integrations"]["integration-b"] = {"method": "y"}
+        data["integrations"]["integration-c"] = {"method": "z"}
+        mgr._save_metadata(data)
+        with self._patched_manager():
+            resp = _list_integrations()
+        self.assertEqual(resp["ignored_foreign_entries"], 3)
+        self.assertIn("3 entries ", resp["note"])
+
+    def test_response_reproduces_user_reported_scenario(self):
+        """End-to-end scenario matching the actual device output the user
+        pasted: two integration-<id> rows plus one real OpenRouter row.
+        After the fix, the list contains just openrouter and the note
+        tells the user exactly why the other two disappeared.
+        """
+        from neo_mcp.server import _list_integrations
+        mgr = IntegrationManager(metadata_file=self.meta)
+        mgr.add("openrouter", {"api_key": "sk-or-realkey_abc"})
+        data = mgr._load_metadata()
+        data["integrations"]["integration-1768977015296-3prpe3wd9"] = {
+            "method": "api_key",
+        }
+        data["integrations"]["integration-1775131950811-4a6cyfhtf"] = {
+            "method": "pat",
+        }
+        mgr._save_metadata(data)
+
+        with self._patched_manager():
+            resp = _list_integrations()
+
+        self.assertEqual(resp["count"], 1)
+        self.assertEqual(resp["integrations"][0]["provider"], "openrouter")
+        self.assertEqual(resp["ignored_foreign_entries"], 2)
+        self.assertIn("neo_add_integration", resp["note"])
+        self.assertIn("VS Code extension", resp["note"])
 
 
 class TestSecretStoreSelection(unittest.TestCase):
@@ -2953,6 +3137,68 @@ class TestRelativePathRejectionOrder(unittest.IsolatedAsyncioTestCase):
             client.init_chat.assert_awaited_once()
         finally:
             shutil.rmtree(td, ignore_errors=True)
+
+
+class TestPollerDetectionPidReuse(unittest.TestCase):
+    """A dead daemon's PID may be reused by an unrelated process (bash, node).
+    Guard against misidentifying the reused PID as a live neo daemon — that
+    would suppress the in-process Python poller and cause init_chat hangs.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._patches = []
+        from neo_mcp import server as _srv
+        # Redirect DAEMON_DIR / LOCK_FILE into a sandboxed tmp directory.
+        self._daemon_dir = Path(self._tmp) / "daemon"
+        self._daemon_dir.mkdir(parents=True, exist_ok=True)
+        self._patches.append(patch.object(_srv, "DAEMON_DIR", self._daemon_dir))
+        self._patches.append(patch.object(_srv, "LOCK_FILE", self._daemon_dir / "neo-mcp.lock"))
+        for p in self._patches:
+            p.start()
+        self._srv = _srv
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_returns_false_when_pid_is_not_a_neo_daemon(self):
+        # Use our own PID but mask os.getpid() so the suite doesn't short-circuit.
+        real_pid = os.getpid()
+        pid_file = self._daemon_dir / "daemon_12345678.pid"
+        pid_file.write_text(str(real_pid))
+        with patch.object(self._srv.os, "getpid", return_value=real_pid + 1), \
+             patch.object(self._srv, "_pid_cmdline", return_value="/bin/bash"):
+            self.assertFalse(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
+        # Stale file must be cleaned up so next startup doesn't re-trip.
+        self.assertFalse(pid_file.exists())
+
+    def test_returns_true_when_cmdline_matches_neo_mcp(self):
+        real_pid = os.getpid()
+        pid_file = self._daemon_dir / "daemon_12345678.pid"
+        pid_file.write_text(str(real_pid))
+        with patch.object(self._srv.os, "getpid", return_value=real_pid + 1), \
+             patch.object(self._srv, "_pid_cmdline", return_value="node /usr/bin/neo-mcp-daemon /ws"):
+            self.assertTrue(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
+        # Live neo daemon's PID file must NOT be deleted.
+        self.assertTrue(pid_file.exists())
+
+    def test_falls_back_to_liveness_when_cmdline_unknown(self):
+        real_pid = os.getpid()
+        pid_file = self._daemon_dir / "daemon_12345678.pid"
+        pid_file.write_text(str(real_pid))
+        with patch.object(self._srv.os, "getpid", return_value=real_pid + 1), \
+             patch.object(self._srv, "_pid_cmdline", return_value=None):
+            # cmdline unreadable → fall back to alive-only check → treat as live daemon.
+            self.assertTrue(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
+
+    def test_dead_pid_file_is_removed(self):
+        # Pick a PID that's almost certainly not alive.
+        pid_file = self._daemon_dir / "daemon_12345678.pid"
+        pid_file.write_text("9999999")
+        self.assertFalse(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
+        self.assertFalse(pid_file.exists())
 
 
 if __name__ == "__main__":
