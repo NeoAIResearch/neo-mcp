@@ -694,6 +694,43 @@ def _workspace_is_mcp_self(workspace: str) -> bool:
         return False
 
 
+def _normalize_workspace(ws: str) -> str:
+    """Canonicalize a workspace path.
+
+    Collapses `.`, `..`, duplicate slashes, trailing slashes, `~`, and
+    resolves symlinks so that `/foo/`, `/foo`, and `/foo/./` all produce
+    the same key in thread-workspaces.json.
+    """
+    return str(Path(ws).expanduser().resolve())
+
+
+def _validate_workspace(ws: str) -> Optional[str]:
+    """Return a user-facing error string if ws is unusable, else None.
+
+    Runs *after* normalization so error messages show the canonical path.
+    Fails fast at submit time instead of deferring to cryptic write errors.
+    """
+    p = Path(ws)
+    if not p.is_absolute():
+        return (
+            f"Workspace must be an absolute path, got {ws!r}. "
+            f"Pass the full project-root path (e.g. /home/user/myproject)."
+        )
+    if not p.exists():
+        return (
+            f"Workspace {ws!r} does not exist. "
+            f"Create the directory first, or pass an existing project root."
+        )
+    if not p.is_dir():
+        return f"Workspace {ws!r} is not a directory."
+    if not os.access(ws, os.W_OK):
+        return (
+            f"Workspace {ws!r} is not writable by this process "
+            f"(uid={os.geteuid()}). Check directory permissions."
+        )
+    return None
+
+
 async def _submit_task(
     client: BackendClient,
     deployment_id: str,
@@ -702,7 +739,25 @@ async def _submit_task(
     args: dict,
 ) -> dict:
     message = args["message"]
-    ws = args.get("workspace") or default_workspace
+    ws_raw = args.get("workspace") or default_workspace
+    # Reject relative paths *before* normalization, otherwise Path.resolve()
+    # silently prepends the MCP server's cwd and the user gets a misleading
+    # "does not exist" error instead of learning their input was wrong.
+    # Tilde and absolute paths fall through to normalization.
+    if not ws_raw.startswith("~") and not os.path.isabs(ws_raw):
+        return {
+            "error": (
+                f"Workspace must be an absolute path, got {ws_raw!r}. "
+                f"Pass the full project-root path (e.g. /home/user/myproject) "
+                f"or a tilde-prefixed path like ~/myproject."
+            )
+        }
+    # Normalize so subsequent checks, the mcp-self guard, and the
+    # thread-workspaces.json key all agree on a single canonical path.
+    try:
+        ws = _normalize_workspace(ws_raw)
+    except OSError as exc:
+        return {"error": f"Could not resolve workspace {ws_raw!r}: {exc}"}
     if _workspace_is_mcp_self(ws):
         return {
             "error": (
@@ -712,6 +767,9 @@ async def _submit_task(
                 f"{os.path.join(ws, 'my_project')}) and resubmit with that path."
             )
         }
+    validation_error = _validate_workspace(ws)
+    if validation_error is not None:
+        return {"error": validation_error}
     data = await client.init_chat(message=message, deployment_id=deployment_id, workspace=ws)
     thread_id = data.get("thread_id")
     if thread_id:
@@ -755,7 +813,10 @@ async def _stop_task(
 ) -> dict:
     thread_id = args["thread_id"]
     await client.stop_thread(thread_id=thread_id)
-    poller.set_thread_status(thread_id, "TERMINATED")
+    # Evict from thread-workspaces.json + in-memory caches so stopped threads
+    # don't accumulate across sessions. Status cache is cleared inside
+    # forget_thread, so set_thread_status here would be redundant.
+    poller.forget_thread(thread_id)
     return {"status": "stopped", "thread_id": thread_id}
 
 

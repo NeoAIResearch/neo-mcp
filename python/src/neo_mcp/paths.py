@@ -1,8 +1,13 @@
-"""Filesystem paths under ~/.neo/daemon/ (mirrors PollerDaemon.ts path constants)."""
+"""Filesystem paths under ~/.neo/daemon/ (mirrors PollerDaemon.ts path constants).
 
+Honors the NEO_HOME env var (same contract as npm/src/paths.ts) so tests can
+redirect state to a tmp dir without touching the user's real ~/.neo.
+"""
+
+import os
 from pathlib import Path
 
-NEO_DIR: Path = Path.home() / ".neo"
+NEO_DIR: Path = Path(os.environ["NEO_HOME"]) if os.environ.get("NEO_HOME") else Path.home() / ".neo"
 DAEMON_DIR: Path = NEO_DIR / "daemon"
 
 # Lock file — prevents duplicate poller instances
