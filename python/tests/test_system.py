@@ -1144,14 +1144,29 @@ class TestWorkspaceIsolation(unittest.TestCase):
         for i, ws in enumerate(self.workspaces):
             self.assertTrue(Path(ws, f"model_{i}.py").exists())
 
-    def test_unknown_thread_falls_back_to_default_workspace(self):
-        h = ActionHandlers(JobManager(), self.workspaces[0], {})
-        r = arun(h.handle_command({
-            "action": "write_code", "request_id": "r", "thread_id": "unknown",
-            "filename": "fallback.py", "code": "# fallback",
-        }))
-        self.assertEqual(r["status"], "success")
-        self.assertTrue(Path(self.workspaces[0], "fallback.py").exists())
+    def test_unknown_thread_refuses_write_and_reports_error(self):
+        """Fail-loud: a command for an unregistered thread must NOT write to
+        the default workspace. Prior behaviour was silent fallback which
+        could drop files into the wrong project folder (or the neo-mcp repo
+        itself). Shortened registration-wait keeps the test fast."""
+        import neo_mcp.action_handlers as ah_mod
+        orig = ah_mod._WORKSPACE_REGISTRATION_WAIT_SECONDS
+        ah_mod._WORKSPACE_REGISTRATION_WAIT_SECONDS = 0.02
+        try:
+            h = ActionHandlers(JobManager(), self.workspaces[0], {})
+            r = arun(h.handle_command({
+                "action": "write_code", "request_id": "r", "thread_id": "unknown",
+                "filename": "fallback.py", "code": "# fallback",
+            }))
+            self.assertEqual(r["status"], "error")
+            self.assertIn("No workspace registered", r["error"])
+            self.assertIn("unknown", r["error"])
+            self.assertFalse(
+                Path(self.workspaces[0], "fallback.py").exists(),
+                "file must NOT have leaked into default workspace",
+            )
+        finally:
+            ah_mod._WORKSPACE_REGISTRATION_WAIT_SECONDS = orig
 
 
 # ===========================================================================
@@ -1367,9 +1382,16 @@ class TestRelativeWrapperStrip(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self.td = make_ws()
-        self.h, _ = make_handlers(workspace=self.td)
-        self.ws = Path(self.td)
         self.tid = "t-wrap-1"
+        # Register t-wrap-1 so the fail-loud _workspace_for has a mapping.
+        # Prior to the fail-loud change these tests relied on the silent
+        # fallback to default_workspace; registering the thread is the
+        # explicit form of what they actually needed.
+        self.h, _ = make_handlers(
+            workspace=self.td,
+            thread_workspaces={self.tid: self.td},
+        )
+        self.ws = Path(self.td)
 
     def tearDown(self):
         shutil.rmtree(self.td, ignore_errors=True)
@@ -2443,6 +2465,494 @@ class TestRunSubprocessEnvInjection(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["data"]["stdout"], "sk-ant-LEAK_CANARY_9f3c")
+
+
+# ===========================================================================
+# PART 30 — init_chat error messages and retry-on-timeout
+# ===========================================================================
+
+class TestInitChatErrorMessages(unittest.IsolatedAsyncioTestCase):
+    """Fix #2: timeout error string should be actionable and retry once."""
+
+    async def test_timeout_error_string_is_descriptive(self):
+        """Empty-message TimeoutException must still produce a useful error."""
+        import httpx
+        from neo_mcp.backend_client import BackendClient
+        from neo_mcp.config import REQUEST_TIMEOUT
+
+        client = BackendClient(auth_token="sk-v1-test")
+        # Both attempts raise timeout → retry is exhausted, error surfaces.
+        client._http.post = AsyncMock(side_effect=httpx.ReadTimeout(""))
+        try:
+            await client.init_chat(message="hi", deployment_id="d")
+            self.fail("expected RuntimeError")
+        except RuntimeError as exc:
+            msg = str(exc)
+            self.assertIn("timed out", msg)
+            self.assertIn(f"{REQUEST_TIMEOUT}s", msg, f"timeout value missing: {msg}")
+            self.assertIn("ReadTimeout", msg, f"exception type missing: {msg}")
+            # No naked trailing colon.
+            self.assertFalse(msg.rstrip().endswith(":"), f"naked colon: {msg!r}")
+
+    async def test_timeout_is_retried_once(self):
+        """First-attempt timeout must retry and succeed on attempt 2."""
+        import httpx
+        from neo_mcp.backend_client import BackendClient
+
+        client = BackendClient(auth_token="sk-v1-test")
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.is_success = True
+        ok.content = b'{"thread_id":"t-1"}'
+        ok.json = MagicMock(return_value={"thread_id": "t-1"})
+        client._http.post = AsyncMock(
+            side_effect=[httpx.ReadTimeout(""), ok]
+        )
+        result = await client.init_chat(message="hi", deployment_id="d")
+        self.assertEqual(result["thread_id"], "t-1")
+        self.assertEqual(client._http.post.await_count, 2)
+
+    async def test_network_error_string_handles_empty_exception(self):
+        import httpx
+        from neo_mcp.backend_client import BackendClient
+
+        client = BackendClient(auth_token="sk-v1-test")
+        client._http.post = AsyncMock(side_effect=httpx.ConnectError(""))
+        try:
+            await client.init_chat(message="hi", deployment_id="d")
+            self.fail("expected RuntimeError")
+        except RuntimeError as exc:
+            msg = str(exc)
+            self.assertIn("network error", msg)
+            self.assertIn("ConnectError", msg)
+            self.assertFalse(msg.rstrip().endswith(":"))
+
+
+# ===========================================================================
+# PART 31 — forget_thread — stop_task must evict thread-workspaces entry
+# ===========================================================================
+
+class TestForgetThread(unittest.TestCase):
+    """Fix #3: after neo_stop_task, the thread-workspaces entry is gone."""
+
+    def setUp(self):
+        self.td = make_ws()
+        self.p = make_poller_with_mock_send()
+        self.p.register_thread_workspace("t1", self.td)
+        self.p.register_thread_workspace("t2", self.td)
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_forget_thread_removes_from_memory(self):
+        self.p.forget_thread("t1")
+        self.assertNotIn("t1", self.p._thread_workspaces)
+        self.assertIn("t2", self.p._thread_workspaces)
+
+    def test_forget_thread_persists_removal(self):
+        import json
+        from neo_mcp.paths import THREAD_WORKSPACES_FILE
+
+        self.p.forget_thread("t1")
+        raw = json.loads(THREAD_WORKSPACES_FILE.read_text())
+        self.assertNotIn("t1", raw)
+        self.assertIn("t2", raw)
+
+    def test_forget_unknown_thread_is_noop(self):
+        # Must not raise.
+        self.p.forget_thread("never-existed")
+        self.assertIn("t1", self.p._thread_workspaces)
+        self.assertIn("t2", self.p._thread_workspaces)
+
+    def test_forget_thread_also_clears_status_cache(self):
+        self.p.set_thread_status("t1", "RUNNING")
+        self.p.forget_thread("t1")
+        self.assertNotIn("t1", self.p._thread_statuses)
+
+
+# ===========================================================================
+# PART 32 — Workspace fail-loud (fix B) and submit-register race (fix E)
+# ===========================================================================
+
+class TestWorkspaceForFailLoud(unittest.TestCase):
+    """Fix B: _workspace_for raises for unknown thread_id instead of silent fallback."""
+
+    def setUp(self):
+        self.td = make_ws()
+        self.td2 = make_ws()
+        self.h, self.ws = make_handlers(
+            workspace=self.td,
+            thread_workspaces={"known-thread": self.td2},
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+        shutil.rmtree(self.td2, ignore_errors=True)
+
+    def test_known_thread_returns_registered_workspace(self):
+        self.assertEqual(self.h._workspace_for("known-thread"), self.td2)
+
+    def test_unknown_thread_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self.h._workspace_for("never-registered")
+        msg = str(ctx.exception)
+        self.assertIn("never-registered", msg)
+        self.assertIn("No workspace registered", msg)
+        self.assertIn(self.td, msg, "must name the default ws we refused to fall back to")
+
+    def test_none_thread_id_falls_back_to_default(self):
+        """Legacy handshake paths without thread_id still fall through — file
+        operations always carry a thread_id, so this is the lower-risk case."""
+        self.assertEqual(self.h._workspace_for(None), self.td)
+
+
+class TestWorkspaceRegistrationRace(unittest.IsolatedAsyncioTestCase):
+    """Fix E: handle_command waits briefly for workspace registration."""
+
+    async def asyncSetUp(self):
+        self.td = make_ws()
+        self.h, self.ws = make_handlers(
+            workspace=self.td,
+            thread_workspaces={},
+        )
+
+    async def asyncTearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    async def test_waits_and_succeeds_when_registration_arrives(self):
+        """Dispatch races registration — mapping lands within wait window."""
+        async def late_register():
+            await asyncio.sleep(0.1)
+            self.h._thread_workspaces["racing-thread"] = self.td
+
+        reg_task = asyncio.create_task(late_register())
+        result = await self.h.handle_command({
+            "action": "write_code",
+            "request_id": "race-1",
+            "thread_id": "racing-thread",
+            "filename": "hello.txt",
+            "code": "ok",
+        })
+        await reg_task
+        self.assertEqual(result.get("status"), "success", f"unexpected: {result}")
+        self.assertTrue((Path(self.td) / "hello.txt").exists())
+
+    async def test_fails_loud_when_registration_never_arrives(self):
+        """If mapping never registers, the handler surfaces a clean error
+        rather than silently writing to the default workspace."""
+        # Shorten wait so the test doesn't take 500 ms.
+        import neo_mcp.action_handlers as ah_mod
+        orig = ah_mod._WORKSPACE_REGISTRATION_WAIT_SECONDS
+        ah_mod._WORKSPACE_REGISTRATION_WAIT_SECONDS = 0.05
+        try:
+            result = await self.h.handle_command({
+                "action": "write_code",
+                "request_id": "fail-1",
+                "thread_id": "orphan-thread",
+                "filename": "should_not_exist.txt",
+                "code": "x",
+            })
+            self.assertEqual(result.get("status"), "error")
+            self.assertIn("No workspace registered", result["error"])
+            self.assertIn("orphan-thread", result["error"])
+            # Critical: must not have written to default workspace.
+            self.assertFalse(
+                (Path(self.td) / "should_not_exist.txt").exists(),
+                "file leaked into default workspace — fail-loud broken",
+            )
+        finally:
+            ah_mod._WORKSPACE_REGISTRATION_WAIT_SECONDS = orig
+
+    async def test_no_wait_when_already_registered(self):
+        """When mapping is already present, handler dispatches immediately."""
+        self.h._thread_workspaces["ready-thread"] = self.td
+        start = time.monotonic()
+        result = await self.h.handle_command({
+            "action": "write_code",
+            "request_id": "quick-1",
+            "thread_id": "ready-thread",
+            "filename": "quick.txt",
+            "code": "fast",
+        })
+        elapsed = time.monotonic() - start
+        self.assertEqual(result.get("status"), "success")
+        self.assertLess(elapsed, 0.05, f"took {elapsed}s — should not wait when already registered")
+
+
+# ===========================================================================
+# PART 33 — Workspace normalization (fix D) and validation (fix C)
+# ===========================================================================
+
+class TestWorkspaceNormalization(unittest.TestCase):
+    """Fix D: _normalize_workspace produces a single canonical form."""
+
+    def setUp(self):
+        self.td = make_ws()
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_trailing_slash_is_stripped(self):
+        from neo_mcp.server import _normalize_workspace
+        self.assertEqual(_normalize_workspace(self.td + "/"), self.td)
+
+    def test_redundant_slashes_collapsed(self):
+        from neo_mcp.server import _normalize_workspace
+        doubled = self.td.replace("/", "//", 1)
+        self.assertEqual(_normalize_workspace(doubled), self.td)
+
+    def test_dot_segments_resolved(self):
+        from neo_mcp.server import _normalize_workspace
+        with_dot = f"{self.td}/./."
+        self.assertEqual(_normalize_workspace(with_dot), self.td)
+
+    def test_symlink_resolved(self):
+        from neo_mcp.server import _normalize_workspace
+        link = Path(self.td) / "link-to-tmp"
+        real = Path(tempfile.mkdtemp())
+        try:
+            os.symlink(str(real), str(link))
+            self.assertEqual(_normalize_workspace(str(link)), str(real.resolve()))
+        finally:
+            shutil.rmtree(real, ignore_errors=True)
+
+    def test_tilde_expanded(self):
+        from neo_mcp.server import _normalize_workspace
+        home = str(Path.home().resolve())
+        self.assertEqual(_normalize_workspace("~"), home)
+
+
+class TestWorkspaceValidation(unittest.TestCase):
+    """Fix C: _validate_workspace rejects bad paths with clear messages."""
+
+    def setUp(self):
+        self.td = make_ws()
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_absolute_existing_dir_accepted(self):
+        from neo_mcp.server import _validate_workspace
+        self.assertIsNone(_validate_workspace(self.td))
+
+    def test_relative_path_rejected(self):
+        from neo_mcp.server import _validate_workspace
+        err = _validate_workspace("relative/path")
+        self.assertIsNotNone(err)
+        self.assertIn("absolute", err)
+
+    def test_nonexistent_path_rejected(self):
+        from neo_mcp.server import _validate_workspace
+        err = _validate_workspace("/tmp/neo-does-not-exist-xyz-12345")
+        self.assertIsNotNone(err)
+        self.assertIn("does not exist", err)
+
+    def test_file_path_rejected(self):
+        from neo_mcp.server import _validate_workspace
+        f = Path(self.td) / "file.txt"
+        f.write_text("x")
+        err = _validate_workspace(str(f))
+        self.assertIsNotNone(err)
+        self.assertIn("not a directory", err)
+
+    def test_nonwritable_path_rejected(self):
+        from neo_mcp.server import _validate_workspace
+        import stat
+        ro = Path(self.td) / "readonly"
+        ro.mkdir()
+        # Skip when running as root — os.access ignores DAC for uid 0.
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses file permissions")
+        os.chmod(ro, stat.S_IREAD | stat.S_IEXEC)
+        try:
+            err = _validate_workspace(str(ro))
+            self.assertIsNotNone(err)
+            self.assertIn("not writable", err)
+        finally:
+            os.chmod(ro, stat.S_IRWXU)
+
+    def test_submit_rejects_nonexistent_workspace(self):
+        """End-to-end: _submit_task returns error before calling init_chat."""
+        from neo_mcp.server import _submit_task
+        client = MagicMock()
+        client.init_chat = AsyncMock()
+        poller = MagicMock()
+        result = asyncio.run(_submit_task(
+            client, "dep-id", poller, self.td,
+            {"message": "hi", "workspace": "/tmp/neo-absolutely-not-there-98765"},
+        ))
+        self.assertIn("error", result)
+        self.assertIn("does not exist", result["error"])
+        client.init_chat.assert_not_called()
+
+    def test_submit_normalizes_trailing_slash_before_mcp_self_check(self):
+        """Trailing-slash variants must resolve to the same form that
+        downstream code (register_thread_workspace) will use."""
+        from neo_mcp.server import _submit_task
+        client = MagicMock()
+        client.init_chat = AsyncMock(return_value={"thread_id": "t-norm"})
+        poller = MagicMock()
+        asyncio.run(_submit_task(
+            client, "dep-id", poller, self.td,
+            {"message": "hi", "workspace": self.td + "/"},
+        ))
+        # init_chat was called with the normalized (no trailing slash) form.
+        call = client.init_chat.await_args
+        self.assertEqual(call.kwargs["workspace"], self.td)
+        # Register was called with the same canonical path.
+        poller.register_thread_workspace.assert_called_once_with("t-norm", self.td)
+
+
+# ===========================================================================
+# PART 34 — Remap regex: substring false positives (fix F)
+# ===========================================================================
+
+class TestRemapCommandPathsRegex(unittest.TestCase):
+    """Fix F: /workspace, /app, /project roots must not match as substrings
+    inside longer filenames. Regression: concurrent tasks where Neo assigned
+    a wrapper folder starting with 'workspace_' caused catastrophic rewrites."""
+
+    def setUp(self):
+        self.td = make_ws()
+        self.h, _ = make_handlers(
+            workspace=self.td,
+            thread_workspaces={"t": self.td},
+        )
+        self.ws = Path(self.td)
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    # --- Legit container-root usage: MUST remap ---
+
+    def test_remap_bare_app_root(self):
+        out = self.h._remap_command_paths("ls /app", self.ws)
+        self.assertEqual(out, f"ls {self.td}")
+
+    def test_remap_app_with_file(self):
+        out = self.h._remap_command_paths("echo x > /app/file.txt", self.ws)
+        self.assertEqual(out, f"echo x > {self.td}/file.txt")
+
+    def test_remap_app_with_wrapper_strips_wrapper(self):
+        out = self.h._remap_command_paths(
+            "echo x > /app/wrapper_0635/file.txt", self.ws,
+        )
+        # wrapper stripped because len(parts) >= 2
+        self.assertEqual(out, f"echo x > {self.td}/file.txt")
+
+    def test_remap_quoted_path(self):
+        out = self.h._remap_command_paths('cat "/app/foo.txt"', self.ws)
+        self.assertEqual(out, f'cat "{self.td}/foo.txt"')
+
+    def test_remap_workspace_root(self):
+        out = self.h._remap_command_paths("cat /workspace/a.txt", self.ws)
+        self.assertEqual(out, f"cat {self.td}/a.txt")
+
+    def test_remap_app_project_root(self):
+        out = self.h._remap_command_paths("ls /app/project/foo", self.ws)
+        self.assertEqual(out, f"ls {self.td}/foo")
+
+    # --- Substring false positives: MUST NOT remap ---
+
+    def test_no_match_app_dash_suffix(self):
+        """/app-backup is a real path name, not a container-root prefix."""
+        cmd = "ls /app-backup/data"
+        self.assertEqual(self.h._remap_command_paths(cmd, self.ws), cmd)
+
+    def test_no_match_app_underscore_suffix(self):
+        cmd = "ls /app_extra/file"
+        self.assertEqual(self.h._remap_command_paths(cmd, self.ws), cmd)
+
+    def test_no_match_workspace_underscore_suffix(self):
+        """The exact concurrent-bug trigger: /workspace_marker_setup_XXXX
+        was matching /workspace inside, corrupting the path."""
+        cmd = "cat /workspace_marker_setup_0635/marker_B.txt"
+        self.assertEqual(self.h._remap_command_paths(cmd, self.ws), cmd)
+
+    def test_no_match_workspace_dash_suffix(self):
+        cmd = "cat /workspace-fake/x.txt"
+        self.assertEqual(self.h._remap_command_paths(cmd, self.ws), cmd)
+
+    def test_no_match_applepie(self):
+        """Longer word starting with /app: must not steal the /app prefix."""
+        cmd = "echo /applepie"
+        self.assertEqual(self.h._remap_command_paths(cmd, self.ws), cmd)
+
+    def test_no_double_remap_when_workspace_and_app_both_match_pre_fix(self):
+        """The exact catastrophic pattern from the concurrent-task live run:
+        BEFORE the fix, /workspace inside /app/workspace_... got rewritten to
+        the workspace path, which then made /app match the now-broken string.
+        After the fix, only /app matches as intended."""
+        cmd = "echo -n workspace-B > /app/workspace_marker_setup_0635/marker_B.txt"
+        expected = f"echo -n workspace-B > {self.td}/marker_B.txt"
+        self.assertEqual(self.h._remap_command_paths(cmd, self.ws), expected)
+
+
+# ===========================================================================
+# PART 35 — Relative-path rejection order (fix G)
+# ===========================================================================
+
+class TestRelativePathRejectionOrder(unittest.IsolatedAsyncioTestCase):
+    """Fix G: relative-path error must fire BEFORE normalization prepends cwd."""
+
+    async def test_submit_rejects_relative_with_clear_error(self):
+        from neo_mcp.server import _submit_task
+        client = MagicMock()
+        client.init_chat = AsyncMock()
+        poller = MagicMock()
+        td = make_ws()
+        try:
+            result = await _submit_task(
+                client, "dep-id", poller, td,
+                {"message": "hi", "workspace": "relative/path"},
+            )
+            self.assertIn("error", result)
+            # The error must mention the RAW input, not some resolved form.
+            self.assertIn("'relative/path'", result["error"])
+            self.assertIn("absolute", result["error"])
+            # Must NOT have called init_chat.
+            client.init_chat.assert_not_called()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    async def test_submit_accepts_tilde_path(self):
+        from neo_mcp.server import _submit_task
+        client = MagicMock()
+        client.init_chat = AsyncMock(return_value={"thread_id": "t-tilde"})
+        poller = MagicMock()
+        td = make_ws()
+        try:
+            # Use the tmp workspace aliased via a tilde path to home + relative.
+            # We can't actually create a file under ~ in a test, so instead we
+            # just verify that a tilde input doesn't trip the relative-path
+            # check (it falls through to the does-not-exist error).
+            result = await _submit_task(
+                client, "dep-id", poller, td,
+                {"message": "hi", "workspace": "~/this-dir-does-not-exist"},
+            )
+            self.assertIn("error", result)
+            # It should say "does not exist", NOT "must be absolute" — proving
+            # the tilde path got through the absolute-check.
+            self.assertIn("does not exist", result["error"])
+            self.assertNotIn("absolute", result["error"])
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    async def test_submit_accepts_absolute_path(self):
+        from neo_mcp.server import _submit_task
+        client = MagicMock()
+        client.init_chat = AsyncMock(return_value={"thread_id": "t-abs"})
+        poller = MagicMock()
+        td = make_ws()
+        try:
+            result = await _submit_task(
+                client, "dep-id", poller, td,
+                {"message": "hi", "workspace": td},
+            )
+            self.assertEqual(result.get("thread_id"), "t-abs")
+            client.init_chat.assert_awaited_once()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
 
 
 if __name__ == "__main__":

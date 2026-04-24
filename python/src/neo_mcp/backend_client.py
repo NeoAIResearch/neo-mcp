@@ -152,10 +152,11 @@ class BackendClient:
         if workspace:
             payload["workspace"] = workspace
 
-        # Retry once on RemoteProtocolError — happens when the connection pool
-        # returns a keep-alive connection that the server has already closed.
-        # httpx auto-retries idempotent methods (GET) but not POST, so we do it
-        # ourselves. Second attempt always gets a fresh connection.
+        # Retry once on RemoteProtocolError or TimeoutException — both can be
+        # transient: stale keep-alive connections (server already closed them)
+        # or slow cold-starts. httpx auto-retries idempotent methods (GET) but
+        # not POST, so we do it ourselves. Second attempt always gets a fresh
+        # connection.
         resp: Optional[httpx.Response] = None
         last_exc: Optional[Exception] = None
         for attempt in range(2):
@@ -163,18 +164,31 @@ class BackendClient:
                 resp = await self._http.post(url, json=payload, headers=self._headers())
                 last_exc = None
                 break
-            except httpx.RemoteProtocolError as exc:
+            except (httpx.RemoteProtocolError, httpx.TimeoutException) as exc:
                 last_exc = exc
                 if attempt == 0:
-                    logger.debug("init_chat: stale connection on attempt 1, retrying")
+                    logger.debug(
+                        "init_chat: %s on attempt 1 (%s), retrying",
+                        type(exc).__name__,
+                        str(exc) or "<no message>",
+                    )
                     continue
-            except httpx.TimeoutException as exc:
-                raise RuntimeError(f"init_chat timed out: {exc}") from exc
             except httpx.RequestError as exc:
-                raise RuntimeError(f"init_chat network error: {exc}") from exc
+                raise RuntimeError(
+                    f"init_chat network error ({type(exc).__name__}): "
+                    f"{str(exc) or '<no message>'}"
+                ) from exc
 
         if last_exc is not None:
-            raise RuntimeError(f"init_chat network error: {last_exc}") from last_exc
+            detail = str(last_exc) or "<no message>"
+            if isinstance(last_exc, httpx.TimeoutException):
+                raise RuntimeError(
+                    f"init_chat timed out after {REQUEST_TIMEOUT}s "
+                    f"({type(last_exc).__name__}: {detail})"
+                ) from last_exc
+            raise RuntimeError(
+                f"init_chat network error ({type(last_exc).__name__}): {detail}"
+            ) from last_exc
 
         assert resp is not None
         if resp.status_code == 401:

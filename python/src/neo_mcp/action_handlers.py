@@ -13,15 +13,35 @@ Security: all file paths are validated to be within the thread's workspace
 or /tmp — no traversal outside those boundaries is allowed.
 """
 
+import asyncio
 import logging
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
 
 from .integrations import IntegrationManager
 from .job_manager import JobManager
+
+# Actions that write/read files in the thread's workspace. For these we must
+# have a registered thread_id → workspace mapping; if it's missing (because
+# the submit→register race left us ahead of the poller, or the mapping was
+# evicted) we wait briefly before dispatching.
+_ACTIONS_REQUIRING_WORKSPACE = frozenset({
+    "write_code",
+    "get_file",
+    "run_subprocess",
+    "list_files",
+})
+
+# Override in tests or via env var. 500 ms is a generous upper bound on the
+# tiny window between init_chat returning and register_thread_workspace
+# completing (disk write + os.rename).
+_WORKSPACE_REGISTRATION_WAIT_SECONDS: float = float(
+    os.environ.get("NEO_WORKSPACE_REGISTRATION_WAIT_SECONDS", "0.5")
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,10 +177,27 @@ class ActionHandlers:
     # Public dispatch entry point
     # ------------------------------------------------------------------
 
+    async def _wait_for_workspace_registration(self, thread_id: str) -> bool:
+        """Wait up to _WORKSPACE_REGISTRATION_WAIT_SECONDS for thread_id to be registered.
+
+        Closes the race where the backend dispatches a command before
+        register_thread_workspace persists the mapping. Returns True if the
+        mapping appeared in time, False otherwise.
+        """
+        if thread_id in self._thread_workspaces:
+            return True
+        deadline = time.monotonic() + _WORKSPACE_REGISTRATION_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+            if thread_id in self._thread_workspaces:
+                return True
+        return False
+
     async def handle_command(self, command: dict[str, Any]) -> dict[str, Any]:
         """Route command to the appropriate handler and return a response dict."""
         action = command.get("action", "")
         request_id = command.get("request_id", "")
+        thread_id = command.get("thread_id")
 
         handlers = {
             "create_session": self._create_session,
@@ -175,6 +212,19 @@ class ActionHandlers:
         handler = handlers.get(action)
         if handler is None:
             return {"request_id": request_id, "status": "error", "error": f"Unknown action: {action}"}
+
+        # Close the submit→register race: for actions that need a workspace,
+        # wait briefly if the mapping hasn't arrived yet. Without this, a fast
+        # backend dispatch could hit the fail-loud path in _workspace_for.
+        if action in _ACTIONS_REQUIRING_WORKSPACE and thread_id:
+            if not await self._wait_for_workspace_registration(thread_id):
+                logger.warning(
+                    "No workspace registered for thread %s after %.2fs wait; dispatching anyway",
+                    thread_id,
+                    _WORKSPACE_REGISTRATION_WAIT_SECONDS,
+                )
+                # Fall through — the handler's _workspace_for call will raise a
+                # clear error rather than silently writing to the wrong folder.
 
         try:
             return await handler(command)
@@ -527,8 +577,28 @@ class ActionHandlers:
     # ------------------------------------------------------------------
 
     def _workspace_for(self, thread_id: Optional[str]) -> str:
+        """Return the workspace registered for thread_id, or raise.
+
+        Silent fallback to _default_workspace used to mean commands for an
+        unknown thread would write to the MCP server's cwd — potentially the
+        wrong project folder, or worse, the neo-mcp source tree itself. We
+        now fail loudly; the Neo backend surfaces the error to the user.
+
+        Commands without any thread_id at all (e.g. legacy handshake paths)
+        still fall through to the default workspace — these are not file
+        operations so the risk is lower.
+        """
         if thread_id and thread_id in self._thread_workspaces:
             return self._thread_workspaces[thread_id]
+        if thread_id:
+            raise RuntimeError(
+                f"No workspace registered for thread {thread_id!r}. "
+                f"Refusing to fall back to default workspace "
+                f"{self._default_workspace!r} — this would write files "
+                f"outside the thread's intended project folder. "
+                f"If you just submitted this task, the registration may "
+                f"still be in flight; retry shortly."
+            )
         return self._default_workspace
 
     def _remap_command_paths(self, command: str, workspace: Path) -> str:
@@ -544,7 +614,19 @@ class ActionHandlers:
         roots = ['/app/project', '/workspace', '/project', '/app']
         result = command
         for root in roots:
-            pattern = re.escape(root) + r'(/[^\s\'"`;|&<>(){}\[\]\\]*)?'
+            # Lookahead prevents a root from matching as a substring of a longer
+            # filename. The character after the root must be either a path
+            # separator (continuation like /app/foo) or a token terminator
+            # (whitespace, quote, shell metachar, or end-of-string). Without
+            # this we got catastrophic rewrites:
+            #   /app/workspace_foo_0635  →  /workspace matched inside → corruption
+            #   /app-backup/data         →  /app matched, leaves "-backup/data"
+            #   /app_extra/foo           →  /app matched, leaves "_extra/foo"
+            pattern = (
+                re.escape(root)
+                + r'(?=/|[\s\'"`;|&<>(){}\[\]\\]|$)'
+                + r'(/[^\s\'"`;|&<>(){}\[\]\\]*)?'
+            )
             root_path = Path(root)
 
             def _replace(m: re.Match, _root: Path = root_path, _ws: Path = workspace) -> str:

@@ -149,6 +149,19 @@ class BackendPoller:
         self._save_thread_workspaces()
         logger.info("Registered workspace for thread %s: %s", thread_id, workspace)
 
+    def forget_thread(self, thread_id: str) -> None:
+        """Evict a thread's workspace mapping and cached status.
+
+        Called from _stop_task so that permanently-stopped threads don't
+        accumulate in thread-workspaces.json. Safe to call for unknown
+        thread IDs (no-op).
+        """
+        removed_workspace = self._thread_workspaces.pop(thread_id, None)
+        self._thread_statuses.pop(thread_id, None)
+        if removed_workspace is not None:
+            self._save_thread_workspaces()
+            logger.info("Forgot thread %s (was %s)", thread_id, removed_workspace)
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
