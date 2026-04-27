@@ -283,6 +283,10 @@ def _load_thread_workspaces() -> dict[str, str]:
     return BackendPoller._load_thread_workspaces()
 
 
+def _load_thread_wrappers() -> dict[str, list[str]]:
+    return BackendPoller._load_thread_wrappers()
+
+
 # ---------------------------------------------------------------------------
 # Server construction
 # ---------------------------------------------------------------------------
@@ -294,6 +298,7 @@ def build_server(
     """Build and wire the MCP server, client, and poller. Returns all three."""
     deployment_id = get_or_create_deployment_id(secret_key)
     thread_workspaces = _load_thread_workspaces()
+    thread_wrappers = _load_thread_wrappers()
 
     client = BackendClient(auth_token=secret_key)
     job_manager = JobManager()
@@ -301,12 +306,14 @@ def build_server(
         job_manager=job_manager,
         default_workspace=workspace,
         thread_workspaces=thread_workspaces,
+        thread_wrappers=thread_wrappers,
     )
     poller = BackendPoller(
         deployment_id=deployment_id,
         client=client,
         handlers=handlers,
         thread_workspaces=thread_workspaces,
+        thread_wrappers=thread_wrappers,
     )
 
     server = Server("neo-mcp", version=_package_version())
@@ -357,6 +364,19 @@ def build_server(
                                 "Run `git rev-parse --show-toplevel` to find the git root, "
                                 "or fall back to os.getcwd(). "
                                 "Passing a subdirectory creates duplicate nested folders."
+                            ),
+                        },
+                        "wrapper_hint": {
+                            "type": "string",
+                            "description": (
+                                "Optional project slug Neo should treat as the project wrapper "
+                                "(e.g. 'rag_system_langchain_0937' or 'kimi-rag-api'). "
+                                "Pre-seeds the daemon's wrapper-stripping for this thread, "
+                                "eliminating the race where the wrapper is learned only from "
+                                "the first absolute container path. Without this, a Neo plan "
+                                "that opens with `mkdir -p <slug>/plans` creates a stray "
+                                "<slug>/ folder at workspace root. Pass when you know the "
+                                "project name in advance."
                             ),
                         },
                     },
@@ -869,10 +889,24 @@ async def _submit_task(
     validation_error = _validate_workspace(ws)
     if validation_error is not None:
         return {"error": validation_error}
-    data = await client.init_chat(message=message, deployment_id=deployment_id, workspace=ws)
+    wrapper_hint = args.get("wrapper_hint") or None
+    if isinstance(wrapper_hint, str):
+        wrapper_hint = wrapper_hint.strip() or None
+    data = await client.init_chat(
+        message=message,
+        deployment_id=deployment_id,
+        workspace=ws,
+        wrapper_hint=wrapper_hint,
+    )
     thread_id = data.get("thread_id")
     if thread_id:
         poller.set_thread_status(thread_id, "RUNNING")
+        # Register wrapper FIRST so the very first command — even a relative
+        # `mkdir -p <slug>/...` that lands before any absolute path teaches
+        # the daemon the slug — gets stripped instead of creating a stray
+        # <slug>/ folder at workspace root.
+        if wrapper_hint:
+            poller.register_thread_wrapper(thread_id, wrapper_hint)
         # Register workspace NOW — before any poll commands arrive.
         # ActionHandlers._workspace_for(thread_id) reads this shared dict,
         # so write_code / run_subprocess will use the correct local path.
@@ -1446,17 +1480,20 @@ async def run_daemon(secret_key: str, workspace: str, deployment_id: Optional[st
         return
 
     thread_workspaces = _load_thread_workspaces()
+    thread_wrappers = _load_thread_wrappers()
     client = BackendClient(auth_token=secret_key)
     handlers = ActionHandlers(
         job_manager=JobManager(),
         default_workspace=workspace,
         thread_workspaces=thread_workspaces,
+        thread_wrappers=thread_wrappers,
     )
     poller = BackendPoller(
         deployment_id=dep,
         client=client,
         handlers=handlers,
         thread_workspaces=thread_workspaces,
+        thread_wrappers=thread_wrappers,
     )
 
     pid = os.getpid()

@@ -45,14 +45,19 @@ _POOL_LIMITS = httpx.Limits(
 class BackendClient:
     def __init__(self, auth_token: str, base_url: str = API_URL) -> None:
         self._base_url = base_url.rstrip("/")
-        self._auth_token = auth_token
+        # Strip surrounding whitespace defensively — a trailing space in the
+        # token (e.g. from a sloppy MCP env-block in ~/.claude.json) becomes
+        # ``Bearer <token> `` in the Authorization header, which httpx rejects
+        # as ``Illegal header value``. Without this the daemon polls forever
+        # and the only symptom is repeating poll errors in the log.
+        self._auth_token = (auth_token or "").strip()
         self._http = httpx.AsyncClient(
             limits=_POOL_LIMITS,
             timeout=REQUEST_TIMEOUT,
         )
 
     def update_token(self, token: str) -> None:
-        self._auth_token = token
+        self._auth_token = (token or "").strip()
 
     async def aclose(self) -> None:
         """Close the underlying connection pool. Call on shutdown."""
@@ -141,8 +146,17 @@ class BackendClient:
         message: str,
         deployment_id: str,
         workspace: Optional[str] = None,
+        wrapper_hint: Optional[str] = None,
     ) -> dict[str, Any]:
-        """POST /v2/thread/init-chat-direct — submit a new task."""
+        """POST /v2/thread/init-chat-direct — submit a new task.
+
+        ``wrapper_hint`` (optional) is the project-slug Neo should treat as the
+        per-thread wrapper. Forwarded to the backend so it can echo the slug
+        in subsequent commands; the daemon also seeds it locally via
+        ``BackendPoller.register_thread_wrapper`` so wrapper-stripping is in
+        place before the very first command arrives. Backends that don't know
+        the field ignore it — this is forward-compat only.
+        """
         url = f"{self._base_url}/v2/thread/init-chat-direct"
         payload: dict[str, Any] = {
             "message": message,
@@ -151,6 +165,8 @@ class BackendClient:
         }
         if workspace:
             payload["workspace"] = workspace
+        if wrapper_hint:
+            payload["wrapper_hint"] = wrapper_hint
 
         # Retry once on RemoteProtocolError or TimeoutException — both can be
         # transient: stale keep-alive connections (server already closed them)

@@ -44,11 +44,20 @@ class BackendPoller:
         client: BackendClient,
         handlers: ActionHandlers,
         thread_workspaces: dict[str, str],
+        thread_wrappers: Optional[dict[str, list[str]]] = None,
     ) -> None:
         self._deployment_id = deployment_id
         self._client = client
         self._handlers = handlers
         self._thread_workspaces = thread_workspaces  # shared with ActionHandlers
+        # Shared with ActionHandlers — pre-seed via register_thread_wrapper so
+        # the very first relative-path command for a thread (e.g. `mkdir -p
+        # <slug>/plans`) gets the wrapper stripped instead of creating a stray
+        # <slug>/ folder at workspace root. If caller doesn't supply one, fall
+        # back to handlers' own dict so existing wiring keeps working.
+        self._thread_wrappers: dict[str, list[str]] = (
+            thread_wrappers if thread_wrappers is not None else handlers._thread_wrappers
+        )
         self._thread_statuses: dict[str, str] = {}
         self._running = False
         self._consecutive_errors = 0
@@ -149,6 +158,30 @@ class BackendPoller:
         self._save_thread_workspaces()
         logger.info("Registered workspace for thread %s: %s", thread_id, workspace)
 
+    def register_thread_wrapper(self, thread_id: str, wrapper: str) -> None:
+        """Pre-seed a Neo project-slug for this thread.
+
+        Append-if-new: the daemon also learns wrappers lazily from absolute
+        container paths it sees in subsequent commands (see
+        ActionHandlers._record_wrapper). Both sources accumulate into the same
+        list so multi-alias projects (e.g. internal slug
+        ``rag_system_langchain_0937`` plus a plan-text slug like
+        ``kimi-rag-api``) all get stripped from shell text.
+
+        Must be called right after init_chat returns thread_id — before any
+        poll commands arrive — to close the race where Neo's first action is
+        a relative `mkdir -p <slug>/...` and the wrapper isn't recorded yet.
+        Safe to call with empty/None wrapper (no-op).
+        """
+        if not wrapper:
+            return
+        slugs = self._thread_wrappers.setdefault(thread_id, [])
+        if wrapper in slugs:
+            return
+        slugs.append(wrapper)
+        self._save_thread_workspaces()
+        logger.info("Registered wrapper for thread %s: %r (now %r)", thread_id, wrapper, slugs)
+
     def forget_thread(self, thread_id: str) -> None:
         """Evict a thread's workspace mapping and cached status.
 
@@ -157,10 +190,14 @@ class BackendPoller:
         thread IDs (no-op).
         """
         removed_workspace = self._thread_workspaces.pop(thread_id, None)
+        removed_wrappers = self._thread_wrappers.pop(thread_id, None)
         self._thread_statuses.pop(thread_id, None)
-        if removed_workspace is not None:
+        if removed_workspace is not None or removed_wrappers is not None:
             self._save_thread_workspaces()
-            logger.info("Forgot thread %s (was %s)", thread_id, removed_workspace)
+            logger.info(
+                "Forgot thread %s (workspace=%s wrappers=%s)",
+                thread_id, removed_workspace, removed_wrappers,
+            )
 
     # ------------------------------------------------------------------
     # Internal
@@ -378,10 +415,28 @@ class BackendPoller:
             if len(entries) > _THREAD_WORKSPACE_MAX:
                 entries = sorted(entries, key=lambda e: e[2])[-_THREAD_WORKSPACE_MAX:]
 
-            data = {
-                tid: {"workspace": ws, "updated_at": int(ts)}
-                for tid, ws, ts in entries
-            }
+            kept_tids = {tid for tid, _, _ in entries}
+            data: dict[str, dict[str, Any]] = {}
+            for tid, ws, ts in entries:
+                entry: dict[str, Any] = {"workspace": ws, "updated_at": int(ts)}
+                wrappers = self._thread_wrappers.get(tid)
+                if wrappers:
+                    entry["wrappers"] = list(wrappers)
+                data[tid] = entry
+            # Persist wrappers for threads that have them even if their workspace
+            # entry was just trimmed (rare, but bullet-proof against losing a
+            # pre-seeded slug if registration races with TTL eviction).
+            for tid, wrappers in self._thread_wrappers.items():
+                if tid in kept_tids or not wrappers:
+                    continue
+                ws = self._thread_workspaces.get(tid, "")
+                if not ws:
+                    continue
+                data[tid] = {
+                    "workspace": ws,
+                    "updated_at": int(now.timestamp()),
+                    "wrappers": list(wrappers),
+                }
             # Atomic write: write to a temp file then rename so a crash mid-write
             # never leaves a corrupted file (matches npm daemon's renameSync pattern).
             THREAD_WORKSPACES_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -408,4 +463,31 @@ class BackendPoller:
             return result
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not load thread workspaces: %s", exc)
+            return {}
+
+    @staticmethod
+    def _load_thread_wrappers() -> dict[str, list[str]]:
+        """Read per-thread wrapper-slug lists from the same JSON file.
+
+        Tolerant of:
+          - Missing file → {}
+          - Legacy entries (string-valued workspace, no wrappers field) → []
+          - Single-string ``wrappers`` field (defensive) → wrapped in a list
+        """
+        if not THREAD_WORKSPACES_FILE.exists():
+            return {}
+        try:
+            raw = json.loads(THREAD_WORKSPACES_FILE.read_text())
+            result: dict[str, list[str]] = {}
+            for tid, val in raw.items():
+                if not isinstance(val, dict):
+                    continue
+                wrappers = val.get("wrappers")
+                if isinstance(wrappers, str) and wrappers:
+                    result[tid] = [wrappers]
+                elif isinstance(wrappers, list):
+                    result[tid] = [s for s in wrappers if isinstance(s, str) and s]
+            return result
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load thread wrappers: %s", exc)
             return {}

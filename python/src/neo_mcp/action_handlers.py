@@ -17,10 +17,11 @@ import asyncio
 import logging
 import os
 import re
+import shlex
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional, Union
 
 from .integrations import IntegrationManager
 from .job_manager import JobManager
@@ -71,18 +72,25 @@ class ActionHandlers:
         default_workspace: str,
         thread_workspaces: dict[str, str],
         integrations: Optional[IntegrationManager] = None,
+        thread_wrappers: Optional[dict[str, list[str]]] = None,
     ) -> None:
         self._job_manager = job_manager
         self._default_workspace = default_workspace
         self._thread_workspaces = thread_workspaces  # shared mutable dict
         self._integrations = integrations if integrations is not None else IntegrationManager()
-        # Per-thread Neo project slug (e.g. "movie_recommender_system_1703"), captured
-        # the first time we see an absolute container path for the thread. Used to
-        # rewrite *relative* wrapper references that Neo embeds inside shell scripts
-        # (`mkdir -p <slug>/data`) — those aren't caught by _remap_command_paths because
-        # there's no syntactic marker. Without this, scripts executed with cwd=<workspace>
-        # create <workspace>/<slug>/data instead of <workspace>/data.
-        self._thread_wrappers: dict[str, str] = {}
+        # Per-thread Neo project slugs (e.g. ["rag_system_langchain_0937", "kimi-rag-api"]).
+        # Captured incrementally as the daemon sees absolute container paths for the
+        # thread, plus any pre-seeded slugs supplied via register_thread_wrapper at
+        # submit time. Used to rewrite *relative* wrapper references that Neo embeds
+        # inside shell scripts (`mkdir -p <slug>/data`, `cd <slug>`) — those aren't
+        # caught by _remap_command_paths because there's no syntactic marker. Without
+        # this, scripts executed with cwd=<workspace> create <workspace>/<slug>/data
+        # instead of <workspace>/data, or `cd kimi-rag-api` lands in a non-existent
+        # subdir and subsequent commands run at workspace root.
+        # Shared mutable dict so BackendPoller can persist wrappers across restarts.
+        self._thread_wrappers: dict[str, list[str]] = (
+            thread_wrappers if thread_wrappers is not None else {}
+        )
 
     def update_workspace(self, workspace: str) -> None:
         self._default_workspace = workspace
@@ -113,15 +121,21 @@ class ActionHandlers:
         return None
 
     def _record_wrapper(self, thread_id: Optional[str], abs_path: Path) -> None:
-        if not thread_id or thread_id in self._thread_wrappers:
+        if not thread_id:
             return
         slug = self._extract_wrapper(abs_path)
-        if slug:
-            self._thread_wrappers[thread_id] = slug
-            logger.info("Recorded Neo project wrapper for thread %s: %r", thread_id, slug)
+        if not slug:
+            return
+        slugs = self._thread_wrappers.setdefault(thread_id, [])
+        if slug not in slugs:
+            slugs.append(slug)
+            logger.info("Recorded Neo project wrapper for thread %s: %r (now %r)", thread_id, slug, slugs)
 
     def _strip_wrapper_prefixes(
-        self, text: str, wrapper: str, workspace: Optional[Path] = None,
+        self,
+        text: str,
+        wrappers: Union[str, Iterable[str]],
+        workspace: Optional[Path] = None,
     ) -> str:
         """Rewrite Neo's project-wrapper references in shell text to host paths.
 
@@ -134,43 +148,71 @@ class ActionHandlers:
         - Relative refs like `mkdir -p <wrapper>/data` or `cd <wrapper>` need to
           lose the wrapper so they resolve against <workspace>.
 
+        ``wrappers`` may be a single string (legacy) or an iterable of slugs. Each
+        slug is rewritten independently — Neo can refer to the same project under
+        multiple aliases (e.g. internal slug `rag_system_langchain_0937` plus a
+        plan-text slug like `kimi-rag-api`); both must be stripped so the bare
+        command lands at the workspace.
+
         The absolute-remap step only runs when `workspace` is supplied.
         """
-        # Step 1: absolute-container-path remap. Replace /<root>/<wrapper>[/...] with
-        # the host workspace. Longest container roots first so /app/project beats /app.
-        if workspace is not None:
-            ws_str = str(workspace)
-            roots_sorted = sorted(
-                (str(r) for r in self._CONTAINER_ROOTS),
-                key=len,
-                reverse=True,
-            )
-            for root in roots_sorted:
-                # Match /root/wrapper as a full path segment. Trailing context must
-                # be a path separator, whitespace, quote, closing paren, or end of
-                # string — so `/app/my_proj_0001` and `/app/my_proj_0001/foo` both
-                # match but `/app/my_proj_0001_backup` does not.
-                text = re.sub(
-                    rf'{re.escape(root)}/{re.escape(wrapper)}(?=[/\s\'"\)]|$)',
-                    ws_str,
-                    text,
+        if isinstance(wrappers, str):
+            slug_list = [wrappers]
+        else:
+            # Dedup while preserving order so the rewrite is deterministic.
+            seen: set[str] = set()
+            slug_list = []
+            for s in wrappers:
+                if s and s not in seen:
+                    seen.add(s)
+                    slug_list.append(s)
+        if not slug_list:
+            return text
+        # Apply longest first so an alias like "my_proj_0001_backup" — if it ever
+        # showed up alongside "my_proj_0001" — would match first and not get
+        # corrupted by the shorter slug's pass. The lookbehinds in steps 2/3
+        # also defend against this, but explicit ordering is cheap insurance.
+        slug_list.sort(key=len, reverse=True)
+
+        for wrapper in slug_list:
+            # Step 1: absolute-container-path remap. Replace /<root>/<wrapper>[/...]
+            # with the host workspace. Longest container roots first so /app/project
+            # beats /app.
+            if workspace is not None:
+                ws_str = str(workspace)
+                roots_sorted = sorted(
+                    (str(r) for r in self._CONTAINER_ROOTS),
+                    key=len,
+                    reverse=True,
                 )
-        # Step 2: strip leading "<wrapper>/" relative references. Lookbehind now
-        # also excludes `/` — any `X/<wrapper>/` that survived step 1 is part of
-        # a path under an unknown root and should be left alone.
-        text = re.sub(rf'(?<![A-Za-z0-9_/]){re.escape(wrapper)}/', '', text)
-        # Step 3: bare "<wrapper>" token (no trailing /) → "." for `cd <wrapper>` style.
-        text = re.sub(rf'(?<![A-Za-z0-9_/]){re.escape(wrapper)}(?![A-Za-z0-9_])', '.', text)
+                for root in roots_sorted:
+                    # Match /root/wrapper as a full path segment. Trailing context
+                    # must be a path separator, whitespace, quote, closing paren,
+                    # or end of string — so `/app/my_proj_0001` and
+                    # `/app/my_proj_0001/foo` both match but
+                    # `/app/my_proj_0001_backup` does not.
+                    text = re.sub(
+                        rf'{re.escape(root)}/{re.escape(wrapper)}(?=[/\s\'"\)]|$)',
+                        ws_str,
+                        text,
+                    )
+            # Step 2: strip leading "<wrapper>/" relative references. Lookbehind
+            # also excludes `/` — any `X/<wrapper>/` that survived step 1 is part
+            # of a path under an unknown root and should be left alone.
+            text = re.sub(rf'(?<![A-Za-z0-9_/]){re.escape(wrapper)}/', '', text)
+            # Step 3: bare "<wrapper>" token (no trailing /) → "." for
+            # `cd <wrapper>` style.
+            text = re.sub(rf'(?<![A-Za-z0-9_/]){re.escape(wrapper)}(?![A-Za-z0-9_])', '.', text)
         return text
 
     def _apply_wrapper_rewrite(self, text: str, thread_id: Optional[str]) -> str:
-        slug = self._thread_wrappers.get(thread_id) if thread_id else None
-        if not slug:
+        slugs = self._thread_wrappers.get(thread_id) if thread_id else None
+        if not slugs:
             return text
         workspace = Path(self._workspace_for(thread_id)).resolve()
-        rewritten = self._strip_wrapper_prefixes(text, slug, workspace)
+        rewritten = self._strip_wrapper_prefixes(text, slugs, workspace)
         if rewritten != text:
-            logger.info("Stripped wrapper %r from %d chars of shell text", slug, len(text))
+            logger.info("Stripped wrappers %r from %d chars of shell text", slugs, len(text))
         return rewritten
 
     # ------------------------------------------------------------------
@@ -433,11 +475,20 @@ class ActionHandlers:
         if extra_env:
             child_env.update(extra_env)
 
+        # cd-guard: prepend `cd <workspace> && ` to every command. With cwd=workspace
+        # already set on the spawn, this is technically redundant for the no-cd case,
+        # but it's defense-in-depth against malformed `&&`-chains in Neo's plan text:
+        # if Neo emits `cd <wrong-slug> && rm -rf …` and the recorded wrappers don't
+        # cover <wrong-slug>, the leading `cd <workspace>` succeeds, the `cd <wrong>`
+        # fails, and `&&` short-circuits the destructive tail. shlex.quote handles
+        # workspace paths that contain spaces or shell metacharacters.
+        guarded_cmd = f"cd {shlex.quote(str(ws_path))} && {command_str}"
+
         if not detach:
             # Blocking (synchronous) mode — mirrors npm executor.ts hRunSubprocess detach=false.
             # Run command to completion and return stdout/stderr immediately in the response.
             proc = await asyncio.create_subprocess_shell(
-                command_str,
+                guarded_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=workspace,
@@ -462,7 +513,7 @@ class ActionHandlers:
             }
 
         job_id = await self._job_manager.create_job(
-            command_str, workspace, thread_id or "unknown", extra_env=extra_env or None,
+            guarded_cmd, workspace, thread_id or "unknown", extra_env=extra_env or None,
         )
         logger.info("Subprocess started: job_id=%s cmd=%r", job_id, command_str[:80])
         return {
