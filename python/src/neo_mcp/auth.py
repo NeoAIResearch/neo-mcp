@@ -60,5 +60,16 @@ def get_or_create_deployment_id(secret_key: str) -> str:
 
 
 def get_secret_key() -> Optional[str]:
-    """Return NEO_SECRET_KEY from environment, or None if not set."""
-    return os.environ.get("NEO_SECRET_KEY")
+    """Return NEO_SECRET_KEY from environment, or None if not set.
+
+    Strips surrounding whitespace — config files (and in particular Claude
+    Code's MCP env block in ~/.claude.json) can carry a stray trailing space,
+    which httpx then rejects as ``Illegal header value`` and every poll fails
+    silently in the background. Tolerating whitespace here means the user
+    doesn't have to debug an opaque connectivity outage.
+    """
+    raw = os.environ.get("NEO_SECRET_KEY")
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped if stripped else None

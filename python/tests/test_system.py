@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -478,6 +479,64 @@ class TestRunSubprocess(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(r["status"], "completed")
         self.assertEqual(r["data"]["exit_code"], 0)
+
+    # --- cd-guard (Bug B safety net) ---
+
+    async def test_cd_guard_runs_command_at_workspace(self):
+        # The `cd <workspace> && ` prefix injected before the spawn must leave
+        # cwd at the workspace, so `pwd` echoes the workspace path. Resolve()
+        # to handle macOS /tmp → /private/tmp symlink redirection.
+        r = await self.h.handle_command(
+            self.cmd(command="pwd", detach=False)
+        )
+        self.assertEqual(r["status"], "completed")
+        self.assertEqual(
+            r["data"]["stdout"].strip(),
+            str(Path(self.td).resolve()),
+        )
+
+    async def test_cd_guard_short_circuits_bad_cd_chain(self):
+        # If Neo emits `cd <wrong-slug> && rm -rf …` and no recorded wrapper
+        # rewrites <wrong-slug>, the cd-guard's outer `cd <workspace> &&`
+        # succeeds, the inner `cd /nonexistent` fails, and `&&` short-circuits
+        # the destructive tail. The marker must NOT exist after this.
+        marker = Path(tempfile.gettempdir()) / f"neo-cdguard-{uuid.uuid4().hex}.marker"
+        if marker.exists():
+            marker.unlink()
+        try:
+            r = await self.h.handle_command(self.cmd(
+                command=f"cd /does-not-exist-12345 && touch {marker}",
+                detach=False,
+            ))
+            self.assertEqual(r["status"], "error")  # nonzero exit from failed cd
+            self.assertFalse(
+                marker.exists(),
+                f"cd-guard failed to short-circuit: {marker} was created",
+            )
+        finally:
+            if marker.exists():
+                marker.unlink()
+
+    async def test_cd_guard_quotes_workspace_with_spaces(self):
+        # Workspace paths can contain spaces — the cd-guard must shlex.quote
+        # them or the spawn dies with `cd: too many arguments`.
+        ws_with_space = tempfile.mkdtemp(prefix="neo test ")
+        try:
+            h, _ = make_handlers(
+                workspace=ws_with_space,
+                thread_workspaces={"t-space": ws_with_space},
+            )
+            r = await h.handle_command({
+                "action": "run_subprocess", "request_id": "r",
+                "thread_id": "t-space", "command": "pwd", "detach": False,
+            })
+            self.assertEqual(r["status"], "completed")
+            self.assertEqual(
+                r["data"]["stdout"].strip(),
+                str(Path(ws_with_space).resolve()),
+            )
+        finally:
+            shutil.rmtree(ws_with_space, ignore_errors=True)
 
     # --- preflight check ---
 
@@ -1304,8 +1363,199 @@ class TestPollerWorkspaceRegistration(unittest.TestCase):
 
 
 # ===========================================================================
+# PART 15b — register_thread_wrapper — pre-seed slugs (Bug A primary fix)
+# ===========================================================================
+
+class TestRegisterThreadWrapper(unittest.TestCase):
+    """Wrapper-hint flow: bridge supplies the project slug at submit time so
+    the daemon can strip it from the very first relative-path command,
+    instead of waiting for an absolute container path to teach it the slug
+    (which is what produces the empty <slug>/ folder at workspace root)."""
+
+    def setUp(self):
+        self.td = make_ws()
+        self.p = make_poller_with_mock_send()
+        # Workspace must be registered for _save_thread_workspaces to persist
+        # the wrapper alongside it.
+        self.p.register_thread_workspace("t1", self.td)
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_register_seeds_in_memory_immediately(self):
+        self.p.register_thread_wrapper("t1", "rag_system_langchain_0937")
+        self.assertEqual(
+            self.p._thread_wrappers["t1"],
+            ["rag_system_langchain_0937"],
+        )
+
+    def test_register_appends_distinct_slugs(self):
+        self.p.register_thread_wrapper("t1", "rag_system_langchain_0937")
+        self.p.register_thread_wrapper("t1", "kimi-rag-api")
+        self.assertEqual(
+            self.p._thread_wrappers["t1"],
+            ["rag_system_langchain_0937", "kimi-rag-api"],
+        )
+
+    def test_register_dedups_repeat(self):
+        self.p.register_thread_wrapper("t1", "rag_system_langchain_0937")
+        self.p.register_thread_wrapper("t1", "rag_system_langchain_0937")
+        self.assertEqual(
+            self.p._thread_wrappers["t1"],
+            ["rag_system_langchain_0937"],
+        )
+
+    def test_register_empty_wrapper_is_noop(self):
+        self.p.register_thread_wrapper("t1", "")
+        self.assertNotIn("t1", self.p._thread_wrappers)
+
+    def test_register_persists_to_disk(self):
+        import json
+        from neo_mcp.paths import THREAD_WORKSPACES_FILE
+
+        self.p.register_thread_wrapper("t1", "rag_system_langchain_0937")
+        self.p.register_thread_wrapper("t1", "kimi-rag-api")
+        raw = json.loads(THREAD_WORKSPACES_FILE.read_text())
+        self.assertEqual(
+            raw["t1"]["wrappers"],
+            ["rag_system_langchain_0937", "kimi-rag-api"],
+        )
+
+    def test_handlers_see_registered_wrappers(self):
+        # The shared mutable dict pattern means ActionHandlers reads the same
+        # list register_thread_wrapper writes — apply_wrapper_rewrite must
+        # therefore strip the seeded slug without ever seeing an absolute path.
+        self.p._handlers._thread_wrappers = self.p._thread_wrappers
+        self.p._handlers._thread_workspaces["t1"] = self.td
+        self.p.register_thread_wrapper("t1", "kimi-rag-api")
+        rewritten = self.p._handlers._apply_wrapper_rewrite(
+            "mkdir -p kimi-rag-api/plans", "t1",
+        )
+        self.assertEqual(rewritten, "mkdir -p plans")
+
+
+# ===========================================================================
+# PART 15c — Wrapper persistence across daemon restart (Bug A safety net)
+# ===========================================================================
+
+class TestThreadWrapperPersistence(unittest.TestCase):
+    """Wrappers must survive daemon restart so a re-attached thread doesn't
+    re-open the wrapper-learn race after a process bounce."""
+
+    def setUp(self):
+        self.td = make_ws()
+        self.p = make_poller_with_mock_send()
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_load_wrappers_round_trip(self):
+        self.p.register_thread_workspace("t1", self.td)
+        self.p.register_thread_wrapper("t1", "rag_system_langchain_0937")
+        self.p.register_thread_wrapper("t1", "kimi-rag-api")
+        loaded = BackendPoller._load_thread_wrappers()
+        self.assertEqual(
+            loaded["t1"],
+            ["rag_system_langchain_0937", "kimi-rag-api"],
+        )
+
+    def test_load_wrappers_missing_field_returns_empty(self):
+        # Legacy entry without a `wrappers` field must not appear in the loaded
+        # wrapper map (and must not crash). Existing thread-workspaces.json
+        # files predate the wrappers field.
+        self.p.register_thread_workspace("t1", self.td)
+        loaded = BackendPoller._load_thread_wrappers()
+        self.assertNotIn("t1", loaded)
+
+    def test_load_wrappers_tolerates_string_form(self):
+        # Defensively accept a single-string `wrappers` value — wrap it in a list.
+        import json
+        from neo_mcp.paths import THREAD_WORKSPACES_FILE
+
+        THREAD_WORKSPACES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        THREAD_WORKSPACES_FILE.write_text(json.dumps({
+            "t1": {
+                "workspace": self.td,
+                "updated_at": int(time.time()),
+                "wrappers": "single_slug_form",
+            },
+        }))
+        loaded = BackendPoller._load_thread_wrappers()
+        self.assertEqual(loaded["t1"], ["single_slug_form"])
+
+    def test_load_wrappers_skips_non_string_entries(self):
+        import json
+        from neo_mcp.paths import THREAD_WORKSPACES_FILE
+
+        THREAD_WORKSPACES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        THREAD_WORKSPACES_FILE.write_text(json.dumps({
+            "t1": {
+                "workspace": self.td,
+                "updated_at": int(time.time()),
+                "wrappers": ["good_slug", 42, "", "another_good"],
+            },
+        }))
+        loaded = BackendPoller._load_thread_wrappers()
+        self.assertEqual(loaded["t1"], ["good_slug", "another_good"])
+
+
+# ===========================================================================
 # PART 16 — Deployment ID
 # ===========================================================================
+
+class TestSecretKeyWhitespace(unittest.TestCase):
+    """Tolerate trailing whitespace in NEO_SECRET_KEY.
+
+    A trailing space sneaks in via Claude Code's MCP env block in
+    ~/.claude.json (and similar config sources). httpx then rejects the
+    Authorization header as ``Illegal header value`` and every poll fails
+    silently — opaque connectivity outage from a typo. Strip at both
+    boundaries: env read AND BackendClient construction.
+    """
+
+    def setUp(self):
+        from neo_mcp.auth import get_secret_key as _gs
+        from neo_mcp.backend_client import BackendClient as _BC
+        self.get_secret_key = _gs
+        self.BackendClient = _BC
+        self._orig = os.environ.get("NEO_SECRET_KEY")
+
+    def tearDown(self):
+        _restore("NEO_SECRET_KEY", self._orig)
+
+    def test_trailing_space_stripped_from_env(self):
+        os.environ["NEO_SECRET_KEY"] = "sk-v1-abc "
+        self.assertEqual(self.get_secret_key(), "sk-v1-abc")
+
+    def test_leading_space_stripped_from_env(self):
+        os.environ["NEO_SECRET_KEY"] = "  sk-v1-abc"
+        self.assertEqual(self.get_secret_key(), "sk-v1-abc")
+
+    def test_empty_after_strip_returns_none(self):
+        os.environ["NEO_SECRET_KEY"] = "   "
+        self.assertIsNone(self.get_secret_key())
+
+    def test_unset_returns_none(self):
+        os.environ.pop("NEO_SECRET_KEY", None)
+        self.assertIsNone(self.get_secret_key())
+
+    def test_backend_client_strips_token_at_construction(self):
+        c = self.BackendClient(auth_token="sk-v1-abc \t\n")
+        self.assertEqual(c._auth_token, "sk-v1-abc")
+        # Authorization header must contain no trailing whitespace —
+        # otherwise httpx raises InvalidHeader and the poll loop dies.
+        self.assertEqual(c._headers()["Authorization"], "Bearer sk-v1-abc")
+
+    def test_backend_client_update_token_strips(self):
+        c = self.BackendClient(auth_token="sk-v1-abc")
+        c.update_token("sk-v1-def \r\n")
+        self.assertEqual(c._auth_token, "sk-v1-def")
+
+    def test_backend_client_handles_none_token_gracefully(self):
+        # Constructed elsewhere with empty/None? Don't crash on .strip().
+        c = self.BackendClient(auth_token="")
+        self.assertEqual(c._auth_token, "")
+
 
 class TestDeploymentId(unittest.TestCase):
 
@@ -1412,12 +1662,25 @@ class TestRelativeWrapperStrip(unittest.IsolatedAsyncioTestCase):
 
     def test_record_wrapper_first_abs_write_captures_slug(self):
         self.h._record_wrapper(self.tid, Path("/app/my_proj_0001/data/a.txt"))
-        self.assertEqual(self.h._thread_wrappers[self.tid], "my_proj_0001")
+        self.assertEqual(self.h._thread_wrappers[self.tid], ["my_proj_0001"])
 
-    def test_record_wrapper_is_sticky_not_overwritten(self):
+    def test_record_wrapper_appends_additional_slug(self):
+        # Multi-slug tracking — Bug B fix: when Neo's plan-text references a
+        # second slug different from the first absolute-path-derived one
+        # (e.g. recorded "rag_system_langchain_0937" but plan says
+        # "kimi-rag-api"), both must accumulate so the strip pass catches
+        # either alias.
         self.h._record_wrapper(self.tid, Path("/app/my_proj_0001/data/a.txt"))
         self.h._record_wrapper(self.tid, Path("/app/different_proj_9999/data/b.txt"))
-        self.assertEqual(self.h._thread_wrappers[self.tid], "my_proj_0001")
+        self.assertEqual(
+            self.h._thread_wrappers[self.tid],
+            ["my_proj_0001", "different_proj_9999"],
+        )
+
+    def test_record_wrapper_dedups_repeated_slug(self):
+        self.h._record_wrapper(self.tid, Path("/app/my_proj_0001/data/a.txt"))
+        self.h._record_wrapper(self.tid, Path("/app/my_proj_0001/data/b.txt"))
+        self.assertEqual(self.h._thread_wrappers[self.tid], ["my_proj_0001"])
 
     def test_strip_prefix_in_mkdir(self):
         result = self.h._strip_wrapper_prefixes("mkdir -p my_proj_0001/data", "my_proj_0001")
@@ -1449,7 +1712,7 @@ class TestRelativeWrapperStrip(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content, "mkdir -p data && cd . && ls")
 
     def test_run_subprocess_strips_wrapper_from_command(self):
-        self.h._thread_wrappers[self.tid] = "movie_recommender_system_1703"
+        self.h._thread_wrappers[self.tid] = ["movie_recommender_system_1703"]
         # Inspect the rewrite via the public helper since _run_subprocess spawns a job.
         rewritten = self.h._apply_wrapper_rewrite(
             "mkdir -p movie_recommender_system_1703/data",
@@ -1526,7 +1789,7 @@ class TestRelativeWrapperStrip(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "mkdir -p data && cd .")
 
     def test_apply_wrapper_rewrite_uses_thread_workspace(self):
-        self.h._thread_wrappers[self.tid] = "my_proj_0001"
+        self.h._thread_wrappers[self.tid] = ["my_proj_0001"]
         result = self.h._apply_wrapper_rewrite(
             "target = '/app/my_proj_0001'", self.tid,
         )
@@ -1534,6 +1797,45 @@ class TestRelativeWrapperStrip(unittest.IsolatedAsyncioTestCase):
         # Linux are unchanged but /tmp → /private/tmp on macOS.
         ws_resolved = self.ws.resolve()
         self.assertEqual(result, f"target = '{ws_resolved}'")
+
+    # --- multi-slug stripping (Bug B) ---
+
+    def test_strip_multiple_wrappers_each_alias_rewritten(self):
+        # Neo records the internal slug from absolute paths AND a plan-text
+        # alias via wrapper_hint. Both must strip from a single command.
+        result = self.h._strip_wrapper_prefixes(
+            "cd kimi-rag-api && cd rag_system_langchain_0937 && pwd",
+            ["rag_system_langchain_0937", "kimi-rag-api"],
+        )
+        self.assertEqual(result, "cd . && cd . && pwd")
+
+    def test_strip_multiple_wrappers_apply_via_thread_dict(self):
+        self.h._thread_wrappers[self.tid] = [
+            "rag_system_langchain_0937", "kimi-rag-api",
+        ]
+        rewritten = self.h._apply_wrapper_rewrite(
+            "mkdir -p kimi-rag-api/data && cp rag_system_langchain_0937/x .",
+            self.tid,
+        )
+        self.assertEqual(rewritten, "mkdir -p data && cp x .")
+
+    def test_strip_wrappers_accepts_legacy_single_string(self):
+        # Backwards-compat: the API still accepts a bare string for callers
+        # that only know about one slug.
+        self.assertEqual(
+            self.h._strip_wrapper_prefixes("cd my_proj_0001 && ls", "my_proj_0001"),
+            "cd . && ls",
+        )
+
+    def test_strip_wrappers_dedups_iterable(self):
+        # Passing the same slug twice doesn't double-substitute.
+        self.assertEqual(
+            self.h._strip_wrapper_prefixes(
+                "cd my_proj_0001 && ls",
+                ["my_proj_0001", "my_proj_0001"],
+            ),
+            "cd . && ls",
+        )
 
 
 class TestWorkspaceSelfGuard(unittest.TestCase):
@@ -2752,6 +3054,21 @@ class TestForgetThread(unittest.TestCase):
         self.p.set_thread_status("t1", "RUNNING")
         self.p.forget_thread("t1")
         self.assertNotIn("t1", self.p._thread_statuses)
+
+    def test_forget_thread_also_evicts_wrappers(self):
+        self.p.register_thread_wrapper("t1", "rag_system_langchain_0937")
+        self.assertIn("t1", self.p._thread_wrappers)
+        self.p.forget_thread("t1")
+        self.assertNotIn("t1", self.p._thread_wrappers)
+
+    def test_forget_thread_persists_wrapper_removal(self):
+        import json
+        from neo_mcp.paths import THREAD_WORKSPACES_FILE
+
+        self.p.register_thread_wrapper("t1", "rag_system_langchain_0937")
+        self.p.forget_thread("t1")
+        raw = json.loads(THREAD_WORKSPACES_FILE.read_text())
+        self.assertNotIn("t1", raw)
 
 
 # ===========================================================================
