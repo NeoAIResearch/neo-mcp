@@ -260,14 +260,17 @@ describe('remapToWorkspace', () => {
       .toBe('/home/user/project/model.py');
   });
 
-  it('stripProjectWrapper: mismatched project name is stripped', () => {
+  it('app/project: user subfolder is preserved (regression)', () => {
+    // /app/project/ is the workspace mount — first segment is a real user
+    // subfolder, NOT a wrapper. Pre-fix this stripped `test_2` and files
+    // landed at workspace root instead of the requested subdir.
     expect(remapToWorkspace('/app/project/test_2/model.py', '/home/user/myapp', '', true))
-      .toBe('/home/user/myapp/model.py');
+      .toBe('/home/user/myapp/test_2/model.py');
   });
 
-  it('stripProjectWrapper: nested path — wrapper stripped, subdirs preserved', () => {
+  it('app/project: nested user subfolder structure preserved', () => {
     expect(remapToWorkspace('/app/project/test_2/src/utils.py', '/home/user/myapp', '', true))
-      .toBe('/home/user/myapp/src/utils.py');
+      .toBe('/home/user/myapp/test_2/src/utils.py');
   });
 
   it('stripProjectWrapper: filename-at-container-root kept (1 segment not stripped)', () => {
@@ -275,14 +278,16 @@ describe('remapToWorkspace', () => {
       .toBe('/home/user/myapp/model.py');
   });
 
-  it('stripProjectWrapper+isWorkdir: single-segment workdir maps to workspace root', () => {
+  it('app/project workdir: single segment preserved as user subfolder', () => {
+    // Workspace name `myapp` doesn't match `test_2`, and /app/project/ no longer
+    // unconditionally strips, so `test_2` becomes a real subdir of the workspace.
     expect(remapToWorkspace('/app/project/test_2', '/home/user/myapp', '', true, true))
-      .toBe('/home/user/myapp');
+      .toBe('/home/user/myapp/test_2');
   });
 
-  it('stripProjectWrapper+isWorkdir: workdir with subdir — wrapper stripped, subdir kept', () => {
+  it('app/project workdir: full subdir path preserved', () => {
     expect(remapToWorkspace('/app/project/test_2/demo', '/home/user/myapp', '', true, true))
-      .toBe('/home/user/myapp/demo');
+      .toBe('/home/user/myapp/test_2/demo');
   });
 
   it('stripProjectWrapper: workdir hint takes priority before stripping', () => {
@@ -429,7 +434,9 @@ describe('relative wrapper strip', () => {
   it('extractWrapper picks the slug from /app/<slug>/...', () => {
     expect(extractWrapper('/app/movie_recommender_system_1703/data/x.txt'))
       .toBe('movie_recommender_system_1703');
-    expect(extractWrapper('/app/project/foo/bar.py')).toBe('foo');
+    // /app/project/<X>/ is the workspace mount — <X> is a user subfolder, NOT
+    // a wrapper. Must return null so it isn't auto-recorded for stripping.
+    expect(extractWrapper('/app/project/foo/bar.py')).toBeNull();
   });
 
   it('extractWrapper returns null for non-container / bare-root paths', () => {
@@ -496,12 +503,25 @@ describe('relative wrapper strip', () => {
     ).toBe('ls /tmp/host_ws/src/main.py');
   });
 
-  it('stripWrapperPrefixes handles all four container roots', () => {
-    for (const root of ['/app/project', '/app', '/workspace', '/project']) {
+  it('stripWrapperPrefixes handles all wrapper-extracting container roots', () => {
+    // Wrapper-extracting roots: /app/, /workspace/, /project/. /app/project/ is
+    // the workspace mount and handled separately (its first segment is preserved
+    // as a user subfolder).
+    for (const root of ['/app', '/workspace', '/project']) {
       expect(
         stripWrapperPrefixes(`cat ${root}/my_proj_0001/data.txt`, 'my_proj_0001', '/tmp/host_ws'),
       ).toBe('cat /tmp/host_ws/data.txt');
     }
+  });
+
+  it('stripWrapperPrefixes preserves user subfolder under /app/project/', () => {
+    // /app/project/ is workspace mount — first segment after it is preserved as
+    // a user subfolder, even when it matches a registered wrapper. Step 0 swaps
+    // /app/project → <workspace>; the wrapper match in step 1 then doesn't fire
+    // because the leading workspace path's lookbehind excludes the next slash.
+    expect(
+      stripWrapperPrefixes('cat /app/project/my_proj_0001/data.txt', 'my_proj_0001', '/tmp/host_ws'),
+    ).toBe('cat /tmp/host_ws/my_proj_0001/data.txt');
   });
 
   it('stripWrapperPrefixes does NOT remap similar-named directories', () => {
@@ -510,11 +530,14 @@ describe('relative wrapper strip', () => {
     ).toBe('cat /app/my_proj_0001_backup/x.txt');
   });
 
-  it('stripWrapperPrefixes picks longest container root first', () => {
-    // /app/project must match before /app so there is no double-remap.
+  it('stripWrapperPrefixes: /app/project/ workspace-mount remap independent of wrappers', () => {
+    // Step 0 always rewrites /app/project → <workspace>. Then the wrapper-loop
+    // step 1 only iterates /app, /workspace, /project (NOT /app/project), so a
+    // user subfolder named like a wrapper isn't stripped here. (See the
+    // dedicated user-subfolder test above for the post-step-0 layout check.)
     expect(
       stripWrapperPrefixes('ls /app/project/my_proj_0001/foo', 'my_proj_0001', '/tmp/host_ws'),
-    ).toBe('ls /tmp/host_ws/foo');
+    ).toBe('ls /tmp/host_ws/my_proj_0001/foo');
   });
 
   it('stripWrapperPrefixes without workspace leaves absolute paths untouched', () => {
@@ -579,11 +602,12 @@ describe('write_code', () => {
     expect(readFileSync(join(ws, 'empty.py'), 'utf8')).toBe('');
   });
 
-  it('remaps /app/project container path', async () => {
-    // /app/project/{project-name}/{file}: first segment is the project wrapper and is
-    // stripped. "src" here is the project name on the backend; file lands at workspace root.
+  it('remaps /app/project container path preserving user subfolder', async () => {
+    // /app/project/ is the workspace mount, so paths under it are real user
+    // paths — the full subdir structure is preserved under the workspace.
     await dispatch(makeCmd({ action: 'write_code', filename: '/app/project/src/main.py', code: '# gen' }), ws);
-    expect(existsSync(join(ws, 'main.py'))).toBe(true);
+    expect(existsSync(join(ws, 'src', 'main.py'))).toBe(true);
+    expect(existsSync(join(ws, 'main.py'))).toBe(false);
   });
 
   it('remaps /app container path', async () => {
@@ -613,19 +637,39 @@ describe('write_code', () => {
     }
   });
 
-  it('relative filename with absolute container workdir strips project wrapper', async () => {
-    // workdir=/app/project/sub: "sub" is the project name on the backend — stripped.
-    // File lands at workspace root, not workspace/sub/.
+  it('relative filename with /app/project/ workdir preserves user subfolder', async () => {
+    // /app/project/ is the workspace mount — `sub` is a real user subfolder.
+    // Pre-fix this stripped `sub` and files landed at workspace root.
     const r = await dispatch(makeCmd({ action: 'write_code', filename: 'app.py', code: '# app', workdir: '/app/project/sub' }), ws);
     expect(r.status).toBe('success');
-    expect(existsSync(join(ws, 'app.py'))).toBe(true);
+    expect(existsSync(join(ws, 'sub', 'app.py'))).toBe(true);
   });
 
-  it('relative filename with absolute container workdir having subdir preserves subdir', async () => {
-    // workdir=/app/project/myproj/demo: "myproj" stripped, "demo" preserved.
+  it('relative filename with deeper /app/project/ workdir preserves full path', async () => {
     const r = await dispatch(makeCmd({ action: 'write_code', filename: 'app.py', code: '# app', workdir: '/app/project/myproj/demo' }), ws);
     expect(r.status).toBe('success');
-    expect(existsSync(join(ws, 'demo/app.py'))).toBe(true);
+    expect(existsSync(join(ws, 'myproj', 'demo', 'app.py'))).toBe(true);
+  });
+
+  it('relative filename with /app/<wrapper>/ workdir DOES strip the wrapper', async () => {
+    // Real Neo wrapper layout: /app/<slug>/ — wrapper segment is still stripped
+    // so the file lands at workspace root (not in a wrapper-named subfolder).
+    const r = await dispatch(makeCmd({ action: 'write_code', filename: 'app.py', code: '# app', workdir: '/app/myproj_0001/sub' }), ws);
+    expect(r.status).toBe('success');
+    expect(existsSync(join(ws, 'sub', 'app.py'))).toBe(true);
+    expect(existsSync(join(ws, 'myproj_0001'))).toBe(false);
+  });
+
+  it('regression: /app/project/<user-subfolder>/ preserves the subfolder', async () => {
+    // Real-world bug: when the user asks Neo to build inside <workspace>/demo/,
+    // Neo emits /app/project/demo/<file> paths. Pre-fix, the daemon stripped
+    // `demo/` (treating it as a wrapper) and files landed at workspace root.
+    // New semantic: /app/project/ is the workspace mount, so `demo/` is a real
+    // user subfolder and must be preserved.
+    const r = await dispatch(makeCmd({ action: 'write_code', filename: '/app/project/demo/data_loader.py', code: '# loader' }), ws);
+    expect(r.status).toBe('success');
+    expect(existsSync(join(ws, 'demo', 'data_loader.py'))).toBe(true);
+    expect(existsSync(join(ws, 'data_loader.py'))).toBe(false);
   });
 
   it('relative workdir single segment stripped — file lands at workspace root, not in project-name subfolder', async () => {
@@ -645,12 +689,13 @@ describe('write_code', () => {
     expect(existsSync(join(ws, 'multimodal_rag_0345'))).toBe(false, 'project-name folder must not be created');
   });
 
-  it('container-relative filename app/project/ normalized — lands at workspace root, not in app/ subfolder', async () => {
+  it('container-relative filename app/project/ normalized — preserves user subfolder', async () => {
     // Backend sometimes sends "app/project/myproj/model.py" without a leading '/'.
-    // Must be treated as /app/project/myproj/model.py and remapped to workspace root.
+    // Normalized to /app/project/myproj/model.py — under /app/project/ (workspace
+    // mount) the subdir structure is preserved.
     const r = await dispatch(makeCmd({ action: 'write_code', filename: 'app/project/myproj/model.py', code: '# m' }), ws);
     expect(r.status).toBe('success');
-    expect(existsSync(join(ws, 'model.py'))).toBe(true, 'file must land at workspace root');
+    expect(existsSync(join(ws, 'myproj', 'model.py'))).toBe(true, 'subdirs under /app/project/ must be preserved');
     expect(existsSync(join(ws, 'app'))).toBe(false, 'must NOT create app/ subfolder in workspace');
   });
 

@@ -149,11 +149,13 @@ class TestWriteCode(unittest.TestCase):
     # --- container path remapping ---
 
     def test_absolute_app_project_remapped(self):
-        # /app/project/{project-name}/{file}: first segment is the project wrapper and is
-        # stripped. "src" here is the project name on the backend; file lands at workspace root.
+        # /app/project/ is the workspace mount, so paths under it are real user
+        # paths — preserve the full subdir structure under the workspace.
         r = arun(self.h.handle_command(self.cmd(filename="/app/project/src/main.py", code="# main")))
         self.assertEqual(r["status"], "success")
-        self.assertTrue(Path(self.td, "main.py").exists())
+        self.assertTrue(Path(self.td, "src", "main.py").exists())
+        self.assertFalse(Path(self.td, "main.py").exists(),
+                         "must NOT strip 'src' — it's a real user subfolder under /app/project/")
 
     def test_absolute_app_root_remapped(self):
         r = arun(self.h.handle_command(self.cmd(filename="/app/model.py", code="# model")))
@@ -202,13 +204,14 @@ class TestWriteCode(unittest.TestCase):
 
     def test_container_relative_filename_normalized(self):
         # Backend sometimes sends "app/project/myproj/model.py" (no leading '/').
-        # Must be treated as /app/project/myproj/model.py and remapped to workspace root.
+        # Normalized to /app/project/myproj/model.py — under /app/project/ (workspace
+        # mount) the subdir structure is preserved as a real user path.
         r = arun(self.h.handle_command(
             self.cmd(filename="app/project/myproj/model.py", code="# m")
         ))
         self.assertEqual(r["status"], "success")
-        self.assertTrue(Path(self.td, "model.py").exists(),
-                        "container-relative filename must land at workspace root")
+        self.assertTrue(Path(self.td, "myproj", "model.py").exists(),
+                        "container-relative filename must preserve subdirs under /app/project/")
         self.assertFalse(Path(self.td, "app").exists(),
                          "must NOT create 'app/' subfolder in workspace")
 
@@ -268,6 +271,31 @@ class TestWriteCode(unittest.TestCase):
         self.assertEqual(r["status"], "success")
         self.assertTrue(Path(self.td, "src", "train.py").exists())
         self.assertFalse(Path(self.td, wrapper).exists())
+
+    def test_app_project_user_subfolder_preserved(self):
+        # Regression: when the user asks Neo to build inside `<workspace>/demo/`,
+        # Neo emits `/app/project/demo/<file>` paths. Pre-fix, the daemon stripped
+        # `demo/` (treating it as a wrapper) and files landed at workspace root.
+        # New semantic: /app/project/ is the workspace mount, so `demo/` is a
+        # real user subfolder and must be preserved.
+        r = arun(self.h.handle_command(
+            self.cmd(filename="/app/project/demo/data_loader.py", code="# loader")
+        ))
+        self.assertEqual(r["status"], "success")
+        self.assertTrue(Path(self.td, "demo", "data_loader.py").exists(),
+                        "file must land in user subfolder, not workspace root")
+        self.assertFalse(Path(self.td, "data_loader.py").exists(),
+                         "must NOT strip user subfolder name from /app/project/<sub>/...")
+
+    def test_app_project_user_subfolder_workdir_preserved(self):
+        # Same regression via workdir route: workdir=/app/project/demo + relative
+        # filename → file lands in <ws>/demo/, not at workspace root.
+        r = arun(self.h.handle_command(
+            self.cmd(filename="train.py", code="# t", workdir="/app/project/demo")
+        ))
+        self.assertEqual(r["status"], "success")
+        self.assertTrue(Path(self.td, "demo", "train.py").exists())
+        self.assertFalse(Path(self.td, "train.py").exists())
 
     # --- error cases ---
 
@@ -875,35 +903,40 @@ class TestRemapToWorkspace(unittest.TestCase):
         return str(self.h._remap_to_workspace(Path(path), self.ws, None, strip_project_wrapper=True, is_workdir=True))
 
     def test_strip_wrapper_matching_name_same_result(self):
-        """When workspace name matches the wrapper, stripping still gives the correct path."""
+        """When workspace name matches the first segment under /app/project/, legacy dedup strips it."""
         ws_name = self.ws.name
         result = self.remap_strip(f"/app/project/{ws_name}/model.py")
         self.assertEqual(result, str(self.ws / "model.py"))
 
-    def test_strip_wrapper_mismatched_name(self):
-        """Core fix: project wrapper is stripped even when workspace name differs."""
-        result = self.remap_strip("/app/project/test_2/model.py")
-        self.assertEqual(result, str(self.ws / "model.py"))
+    def test_app_project_does_not_strip_user_subfolder(self):
+        """Regression: /app/project/<X>/ is the workspace mount — <X> is a user subfolder.
 
-    def test_strip_wrapper_nested_path(self):
-        """Deep path: wrapper stripped, subdirectory structure preserved."""
+        Previously this stripped <X> as if it were a Neo wrapper, causing files
+        the user asked to live in `demo/` or `rag/` to land at the workspace
+        root instead. Now preserved.
+        """
+        result = self.remap_strip("/app/project/demo/data.csv")
+        self.assertEqual(result, str(self.ws / "demo" / "data.csv"))
+
+    def test_app_project_preserves_nested_user_path(self):
+        """Deep path under /app/project/: full structure preserved (no strip)."""
         result = self.remap_strip("/app/project/test_2/src/utils.py")
-        self.assertEqual(result, str(self.ws / "src/utils.py"))
+        self.assertEqual(result, str(self.ws / "test_2" / "src" / "utils.py"))
 
     def test_strip_wrapper_filename_at_container_root_kept(self):
         """Single-segment after /app/project/ is treated as a filename, not stripped."""
         result = self.remap_strip("/app/project/model.py")
         self.assertEqual(result, str(self.ws / "model.py"))
 
-    def test_strip_wrapper_workdir_single_segment_maps_to_workspace(self):
-        """workdir=/app/project/test_2 (is_workdir=True) maps to workspace root."""
-        result = self.remap_strip_wd("/app/project/test_2")
-        self.assertEqual(result, str(self.ws))
-
-    def test_strip_wrapper_workdir_subdir(self):
-        """workdir=/app/project/test_2/demo → workspace/demo."""
-        result = self.remap_strip_wd("/app/project/test_2/demo")
+    def test_app_project_workdir_single_segment_preserved(self):
+        """workdir=/app/project/<X> (is_workdir=True) preserves <X> as a user subfolder."""
+        result = self.remap_strip_wd("/app/project/demo")
         self.assertEqual(result, str(self.ws / "demo"))
+
+    def test_app_project_workdir_subdir_preserved(self):
+        """workdir=/app/project/<X>/<Y> → workspace/<X>/<Y> (full path preserved)."""
+        result = self.remap_strip_wd("/app/project/demo/src")
+        self.assertEqual(result, str(self.ws / "demo" / "src"))
 
     def test_strip_wrapper_workdir_hint_takes_priority(self):
         """workdir_hint is still applied before any stripping."""
@@ -1651,10 +1684,9 @@ class TestRelativeWrapperStrip(unittest.IsolatedAsyncioTestCase):
             self.h._extract_wrapper(Path("/app/movie_recommender_system_1703/data/x.txt")),
             "movie_recommender_system_1703",
         )
-        self.assertEqual(
-            self.h._extract_wrapper(Path("/app/project/foo/bar.py")),
-            "foo",
-        )
+        # /app/project/<X>/ is the workspace mount — <X> is a user subfolder, NOT
+        # a wrapper. Must return None so it isn't auto-recorded for stripping.
+        self.assertIsNone(self.h._extract_wrapper(Path("/app/project/foo/bar.py")))
 
     def test_extract_wrapper_returns_none_for_non_container_paths(self):
         self.assertIsNone(self.h._extract_wrapper(Path("/tmp/script.sh")))
@@ -1738,15 +1770,27 @@ class TestRelativeWrapperStrip(unittest.IsolatedAsyncioTestCase):
         result = self.h._strip_wrapper_prefixes(text, "my_proj_0001", ws)
         self.assertEqual(result, "ls /tmp/host_ws/src/main.py")
 
-    def test_strip_absolute_path_all_container_roots(self):
+    def test_strip_absolute_path_all_wrapper_roots(self):
+        # Wrapper-extracting roots: /app/, /workspace/, /project/. /app/project/ is
+        # excluded (workspace mount — its first segment is a user subfolder).
         ws = Path("/tmp/host_ws")
-        for root in ("/app/project", "/app", "/workspace", "/project"):
+        for root in ("/app", "/workspace", "/project"):
             text = f"cat {root}/my_proj_0001/data.txt"
             result = self.h._strip_wrapper_prefixes(text, "my_proj_0001", ws)
             self.assertEqual(
                 result, "cat /tmp/host_ws/data.txt",
                 f"failed for container root {root}",
             )
+
+    def test_strip_absolute_path_app_project_preserves_user_subfolder(self):
+        # /app/project/ is workspace mount — first segment is preserved as a user
+        # subfolder, even when it matches a registered wrapper. Step 0 swaps
+        # /app/project → <workspace>; step 1's lookbehind on the wrapper match
+        # then prevents stripping the now-leading <workspace>/<wrapper>/ segment.
+        ws = Path("/tmp/host_ws")
+        text = "cat /app/project/my_proj_0001/data.txt"
+        result = self.h._strip_wrapper_prefixes(text, "my_proj_0001", ws)
+        self.assertEqual(result, "cat /tmp/host_ws/my_proj_0001/data.txt")
 
     def test_strip_absolute_does_not_match_similar_name(self):
         # /app/my_proj_0001_backup must NOT be rewritten (different name).
@@ -1755,12 +1799,15 @@ class TestRelativeWrapperStrip(unittest.IsolatedAsyncioTestCase):
         result = self.h._strip_wrapper_prefixes(text, "my_proj_0001", ws)
         self.assertEqual(result, "cat /app/my_proj_0001_backup/x.txt")
 
-    def test_strip_absolute_longest_root_wins(self):
-        # /app/project should match before /app, so no double-remap.
+    def test_strip_absolute_app_project_is_workspace_mount(self):
+        # /app/project/ is the workspace mount — `/app/project/<X>/foo` becomes
+        # `<workspace>/<X>/foo` (preserve user subfolder). Step 0 of the rewrite
+        # handles the `/app/project` → `<workspace>` swap independently of any
+        # wrapper, so registered wrappers don't strip user subfolder names.
         ws = Path("/tmp/host_ws")
         text = "ls /app/project/my_proj_0001/foo"
         result = self.h._strip_wrapper_prefixes(text, "my_proj_0001", ws)
-        self.assertEqual(result, "ls /tmp/host_ws/foo")
+        self.assertEqual(result, "ls /tmp/host_ws/my_proj_0001/foo")
 
     def test_strip_no_workspace_leaves_absolute_paths_untouched(self):
         # Without workspace, step 1 is skipped. The tightened lookbehind in

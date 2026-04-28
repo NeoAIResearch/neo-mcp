@@ -100,21 +100,33 @@ class ActionHandlers:
     # ------------------------------------------------------------------
 
     _CONTAINER_ROOTS = (Path("/app/project"), Path("/app"), Path("/workspace"), Path("/project"))
+    # Subset of _CONTAINER_ROOTS where the segment after the root IS Neo's project
+    # wrapper (e.g. /app/ml_project_0855/...). /app/project/ is excluded — that
+    # path is the workspace mount, so /app/project/<X>/ has <X> as a real user
+    # subfolder, not a wrapper to strip. Real Neo container layouts use /app/<slug>/
+    # (verified from the project-setup script, which sets TARGET_PROJECT_ROOT="/app/<slug>").
+    _WRAPPER_EXTRACTING_ROOTS = (Path("/app"), Path("/workspace"), Path("/project"))
 
     def _extract_wrapper(self, abs_path: Path) -> Optional[str]:
-        """Return Neo's project-name wrapper if abs_path is /<container-root>/<wrapper>/...
+        """Return Neo's project-name wrapper if abs_path is /<wrapper-root>/<wrapper>/...
+
+        Only paths under /app/, /workspace/, /project/ have a wrapper segment.
+        /app/project/<X>/ paths have <X> as a real user subfolder, not a wrapper.
 
         Examples:
             /app/movie_recommender_system_1703/data/x.txt → "movie_recommender_system_1703"
-            /app/project/foo/bar.py                       → "foo"
+            /app/project/foo/bar.py                       → None  (foo is a user subfolder)
             /tmp/script.sh                                → None
         """
-        for root in self._CONTAINER_ROOTS:
+        for root in self._WRAPPER_EXTRACTING_ROOTS:
             try:
                 rel = abs_path.relative_to(root)
             except ValueError:
                 continue
             parts = rel.parts
+            # Reject `/app/project/...` matched via /app/ root — `project` is not a wrapper.
+            if not parts or parts[0] == "project":
+                return None
             if len(parts) >= 2:  # need wrapper + something after
                 return parts[0]
             return None
@@ -174,14 +186,30 @@ class ActionHandlers:
         # also defend against this, but explicit ordering is cheap insurance.
         slug_list.sort(key=len, reverse=True)
 
+        # Step 0: workspace-mount remap. /app/project[/...] → <workspace>[/...]
+        # regardless of wrapper. This handles shell SCRIPT CONTENT that embeds
+        # absolute /app/project paths — without this a script containing
+        # `cd /app/project/demo` would walk the host's real /app/project on disk.
+        # _remap_command_paths handles this for command strings; mirror it here.
+        if workspace is not None:
+            ws_str = str(workspace)
+            text = re.sub(
+                r'/app/project(?=[/\s\'"\)]|$)',
+                ws_str,
+                text,
+            )
+
         for wrapper in slug_list:
             # Step 1: absolute-container-path remap. Replace /<root>/<wrapper>[/...]
-            # with the host workspace. Longest container roots first so /app/project
-            # beats /app.
+            # with the host workspace. Only iterate the wrapper-extracting roots —
+            # /app/project/ is excluded because it's the workspace mount, where
+            # /app/project/<X>/ has <X> as a real user subfolder. If we matched
+            # against /app/project/<wrapper> here, registering wrapper="demo"
+            # would clobber the user's literal `/app/project/demo/...` paths.
             if workspace is not None:
                 ws_str = str(workspace)
                 roots_sorted = sorted(
-                    (str(r) for r in self._CONTAINER_ROOTS),
+                    (str(r) for r in self._WRAPPER_EXTRACTING_ROOTS),
                     key=len,
                     reverse=True,
                 )
@@ -733,7 +761,10 @@ class ActionHandlers:
         if relative is None:
             try:
                 relative = path.relative_to(Path("/app/project"))
-                stripable_root = True
+                # /app/project/ is the workspace mount point — paths under it are
+                # real user paths, NOT wrapper-rooted. Don't auto-strip the first
+                # segment. Legacy workspace-name dedup still applies below.
+                stripable_root = False
             except ValueError:
                 pass
 
