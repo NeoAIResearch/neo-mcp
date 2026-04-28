@@ -369,14 +369,18 @@ def build_server(
                         "wrapper_hint": {
                             "type": "string",
                             "description": (
-                                "Optional project slug Neo should treat as the project wrapper "
-                                "(e.g. 'rag_system_langchain_0937' or 'kimi-rag-api'). "
-                                "Pre-seeds the daemon's wrapper-stripping for this thread, "
-                                "eliminating the race where the wrapper is learned only from "
-                                "the first absolute container path. Without this, a Neo plan "
-                                "that opens with `mkdir -p <slug>/plans` creates a stray "
-                                "<slug>/ folder at workspace root. Pass when you know the "
-                                "project name in advance."
+                                "Optional Neo-generated project slug to pre-seed wrapper-stripping "
+                                "for this thread (e.g. 'rag_system_langchain_0937', 'kimi-rag-api', "
+                                "'ml_project_0855'). Real Neo slugs always contain a digit, "
+                                "underscore, or dash. ONLY pass this when you already know Neo's "
+                                "auto-generated container slug — DO NOT pass a user-intended "
+                                "subfolder name like 'demo', 'rag', 'src': those are real "
+                                "subdirectories of the workspace mount (/app/project/), not "
+                                "wrappers, and registering them would cause Neo's writes inside "
+                                "those subfolders to land at the workspace root. Bare folder "
+                                "names without a digit/underscore/dash are rejected. Omit this "
+                                "field if unsure — Neo learns its slug from the first absolute "
+                                "container path the daemon sees."
                             ),
                         },
                     },
@@ -892,6 +896,28 @@ async def _submit_task(
     wrapper_hint = args.get("wrapper_hint") or None
     if isinstance(wrapper_hint, str):
         wrapper_hint = wrapper_hint.strip() or None
+    # Validate wrapper_hint shape — real Neo project slugs are slug-like
+    # (e.g. "ml_project_0855", "rag_system_langchain_0937", "kimi-rag-api"),
+    # not bare folder names like "demo" or "rag". Bare names erroneously
+    # registered as wrappers cause user-intended subfolders to be stripped
+    # from absolute paths and shell text. Reject anything that's too short
+    # to be a slug or contains only lowercase letters with no separator/digit.
+    if wrapper_hint:
+        looks_slug = (
+            len(wrapper_hint) >= 4
+            and ("_" in wrapper_hint or "-" in wrapper_hint or any(c.isdigit() for c in wrapper_hint))
+        )
+        if not looks_slug:
+            return {
+                "error": (
+                    f"Invalid wrapper_hint {wrapper_hint!r}: real Neo project "
+                    f"slugs contain a digit, underscore, or dash (e.g. "
+                    f"'ml_project_0855', 'kimi-rag-api'). Bare folder names "
+                    f"like 'demo' or 'rag' are user subfolders, not wrappers — "
+                    f"omit wrapper_hint and Neo will write inside that folder "
+                    f"because the workspace mount is /app/project/."
+                )
+            }
     data = await client.init_chat(
         message=message,
         deployment_id=deployment_id,

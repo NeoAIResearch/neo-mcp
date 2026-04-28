@@ -180,12 +180,16 @@ export function remapToWorkspace(absPath: string, workspace: string, workdir: st
     if (absPath.startsWith(wd + '/')) relative = absPath.slice(wd.length + 1);
   }
 
-  // Try /app/project first (tracked separately to keep most-specific match precedence)
+  // Try /app/project first (tracked separately to keep most-specific match precedence).
+  // /app/project/ is the workspace mount, so paths under it are real user paths —
+  // NOT wrapper-rooted. stripableRoot stays false here so the first segment after
+  // /app/project/ is preserved as a user subfolder. Legacy workspace-name dedup
+  // still applies below.
   if (relative === null) {
-    if (absPath === '/app/project') { relative = ''; stripableRoot = true; }
+    if (absPath === '/app/project') { relative = ''; stripableRoot = false; }
     else if (absPath.startsWith('/app/project/')) {
       relative = absPath.slice('/app/project/'.length);
-      stripableRoot = true;
+      stripableRoot = false;
     }
   }
 
@@ -270,13 +274,19 @@ export function remapCommandPaths(command: string, workspace: string): string {
 const _threadWrappers = new Map<string, string>();
 
 const _CONTAINER_ROOTS = ['/app/project', '/app', '/workspace', '/project'];
+// Subset of _CONTAINER_ROOTS where the segment after the root IS Neo's project
+// wrapper. /app/project/ is excluded — that path is the workspace mount, so
+// /app/project/<X>/ has <X> as a real user subfolder, not a wrapper to strip.
+const _WRAPPER_EXTRACTING_ROOTS = ['/app', '/workspace', '/project'];
 
 export function extractWrapper(absPath: string): string | null {
-  for (const root of _CONTAINER_ROOTS) {
+  for (const root of _WRAPPER_EXTRACTING_ROOTS) {
     if (absPath === root) return null;
     if (absPath.startsWith(root + '/')) {
       const rel = absPath.slice(root.length + 1);
       const slashIdx = rel.indexOf('/');
+      // Reject /app/project/... — `project` after /app/ is not a wrapper.
+      if (slashIdx > 0 && rel.slice(0, slashIdx) === 'project') return null;
       return slashIdx > 0 ? rel.slice(0, slashIdx) : null; // need wrapper + something after
     }
   }
@@ -298,13 +308,22 @@ export function stripWrapperPrefixes(
   workspace?: string,
 ): string {
   const escaped = wrapper.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // Step 1: absolute-container-path remap. Replace /<root>/<wrapper>[/...] with
-  // the host workspace. Longest container roots first so /app/project beats /app.
-  // Without this, Neo-generated scripts containing `target = '/app/<wrapper>'`
-  // would walk the host's real /app/ (often polluted with unrelated dirs on
-  // dev machines) instead of the user's actual workspace.
+  // Step 0: workspace-mount remap. /app/project[/...] → <workspace>[/...] regardless
+  // of wrapper. Mirrors remapCommandPaths() for shell SCRIPT CONTENT that embeds
+  // absolute /app/project paths — without this a script with `cd /app/project/demo`
+  // would walk the host's real /app/project on disk. The boundary lookahead matches
+  // a path separator, whitespace, quote, paren, or end-of-string.
   if (workspace) {
-    const rootsSorted = [..._CONTAINER_ROOTS].sort((a, b) => b.length - a.length);
+    text = text.replace(/\/app\/project(?=[/\s'"\)]|$)/g, workspace);
+  }
+  // Step 1: absolute-container-path remap. Replace /<root>/<wrapper>[/...] with
+  // the host workspace. Only iterate the wrapper-extracting roots — /app/project/
+  // is excluded because it's the workspace mount, where /app/project/<X>/ has <X>
+  // as a real user subfolder. If we matched against /app/project/<wrapper> here,
+  // registering wrapper="demo" would clobber the user's literal /app/project/demo/...
+  // paths.
+  if (workspace) {
+    const rootsSorted = [..._WRAPPER_EXTRACTING_ROOTS].sort((a, b) => b.length - a.length);
     for (const root of rootsSorted) {
       const rootEsc = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       // Boundary: path separator, whitespace, quote, closing paren, or end-of-string.
