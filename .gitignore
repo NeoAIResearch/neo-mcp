@@ -31,7 +31,8 @@ workspace_check.txt
 # Claude Code / skills framework state
 skills-lock.json
 .agents/
+.windsurf
+.continue
 
 # vscode_extension is tracked separately
-# vscode_extension/
-
+vscode_extension/

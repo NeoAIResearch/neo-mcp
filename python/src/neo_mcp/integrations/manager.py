@@ -19,6 +19,41 @@ from .registry import PROVIDERS, IntegrationSchema
 
 logger = logging.getLogger(__name__)
 
+_CREDENTIAL_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"akia[0-9a-z]{16}", re.I), "AWS Access Key"),
+    (re.compile(r"hf_[a-z0-9_\-]{32,}", re.I), "HuggingFace Token"),
+    (re.compile(r"ghp_[A-Za-z0-9_]{36,}"), "GitHub Token (ghp)"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{82,}"), "GitHub PAT"),
+    (re.compile(r"sk-ant-[A-Za-z0-9\-_]{90,}"), "Anthropic API Key"),
+    (re.compile(r"sk-or-[A-Za-z0-9\-_]{32,}"), "OpenRouter Key"),
+    (re.compile(r"sk-proj-[A-Za-z0-9\-_]{40,}"), "OpenAI Project Key"),
+    (re.compile(r"sk-[A-Za-z0-9]{48,}"), "OpenAI API Key"),
+    (re.compile(r'"api_key"\s*:\s*"[^"]{16,}"', re.I), "API Key in JSON"),
+    (re.compile(r'"token"\s*:\s*"[^"]{20,}"', re.I), "Token in JSON"),
+    (re.compile(r'"secret"\s*:\s*"[^"]+\"', re.I), "Secret in JSON"),
+    (re.compile(r"secret_access_key.*[A-Za-z0-9/+=]{40,}", re.I), "AWS Secret Key"),
+    (re.compile(r'"key"\s*:\s*"[a-f0-9]{32}"', re.I), "Kaggle API Key"),
+]
+
+
+def _escape_xml(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+         .replace("'", "&apos;")
+    )
+
+
+def _validate_no_credentials(xml: str) -> None:
+    for pattern, name in _CREDENTIAL_PATTERNS:
+        if pattern.search(xml):
+            raise RuntimeError(
+                f"SECURITY VIOLATION: {name} detected in integration XML. "
+                "Credentials must never be sent to the backend."
+            )
+
 
 class ValidationError(ValueError):
     """Raised when a provider name is unknown or credentials fail schema checks."""
@@ -147,6 +182,38 @@ class IntegrationManager:
             "message": message,
             "latency_ms": latency_ms,
         }
+
+    def format_integrations_xml(self) -> str:
+        """Return an ``<integrations>`` XML block for the Neo backend.
+
+        Only metadata is included — no credential values, only the path to the
+        file where they live. Mirrors the VS Code extension's
+        ``formatIntegrationsXML()`` method (simplified field set).
+
+        Returns an empty string when no integrations are configured.
+        """
+        entries = self.list()
+        if not entries:
+            return ""
+
+        lines = ["<integrations>"]
+        for entry in entries:
+            provider = _escape_xml(entry["provider"])
+            method = _escape_xml(entry.get("method") or "")
+            attrs = (
+                f'id="{provider}" type="{provider}" provider="{provider}" '
+                f'name="{provider}" credential_method="{method}"'
+            )
+            lines.append(f"  <integration {attrs}>")
+            files = entry.get("files") or []
+            if files:
+                lines.append(f"    <credential_path>{_escape_xml(files[0])}</credential_path>")
+            lines.append("  </integration>")
+        lines.append("</integrations>")
+
+        xml = "\n".join(lines)
+        _validate_no_credentials(xml)
+        return xml
 
     def env_for_subprocess(self) -> dict[str, str]:
         """Aggregate load_env() from every configured provider.

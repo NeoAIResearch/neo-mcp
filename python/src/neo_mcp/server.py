@@ -36,6 +36,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from .action_handlers import ActionHandlers
+from .system_info import build_context_prefix
 from .auth import derive_deployment_id, get_or_create_deployment_id, get_secret_key
 from .backend_client import BackendClient
 from .backend_poller import BackendPoller
@@ -918,8 +919,18 @@ async def _submit_task(
                     f"because the workspace mount is /app/project/."
                 )
             }
+    context_prefix = await build_context_prefix(ws)
+    try:
+        integrations_xml = IntegrationManager().format_integrations_xml()
+    except Exception as exc:
+        logger.warning("format_integrations_xml failed: %s", exc)
+        integrations_xml = ""
+
+    parts = [p for p in (context_prefix, integrations_xml) if p]
+    full_message = "\n".join(parts) + "\n\n" + message if parts else message
+
     data = await client.init_chat(
-        message=message,
+        message=full_message,
         deployment_id=deployment_id,
         workspace=ws,
         wrapper_hint=wrapper_hint,
@@ -953,7 +964,14 @@ async def _get_messages(client: BackendClient, args: dict) -> dict:
 
 
 async def _send_feedback(client: BackendClient, args: dict) -> dict:
-    await client.send_feedback(thread_id=args["thread_id"], message=args["message"])
+    message = args["message"]
+    try:
+        integrations_xml = IntegrationManager().format_integrations_xml()
+        if integrations_xml:
+            message = f"{message}\n\n{integrations_xml}"
+    except Exception as exc:
+        logger.warning("format_integrations_xml failed on feedback: %s", exc)
+    await client.send_feedback(thread_id=args["thread_id"], message=message)
     return {"status": "ok", "thread_id": args["thread_id"]}
 
 

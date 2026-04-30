@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 12 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, control task lifecycle, and register third-party credentials (GitHub, HuggingFace, Anthropic, OpenRouter) — via stdio transport.
+A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.so`). It exposes 12 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, control task lifecycle, and register third-party credentials (GitHub, HuggingFace, Anthropic, OpenRouter, OpenAI, AWS S3, Weights & Biases, Kaggle) — via stdio transport.
 
-Current pip version: **0.4.46**. Current npm version: **1.1.26**.
+Current pip version: **0.4.47**. Current npm version: **1.1.26**.
 
 ## Project structure
 
@@ -17,13 +17,14 @@ neo-mcp/
 ├── python/                         # pip-installable MCP server (neo-mcp package)
 │   ├── src/neo_mcp/
 │   │   ├── server.py               # MCP server — all 12 tools, single file
-│   │   ├── integrations/           # GitHub/HF/Anthropic/OpenRouter credential storage
+│   │   ├── system_info.py          # exec_environment XML gatherer (OS/arch/CPU/RAM/shell/GPU/tools)
+│   │   ├── integrations/           # GitHub/HF/Anthropic/OpenRouter/OpenAI/S3/W&B/Kaggle credentials
 │   │   ├── oauth.py                # OAuth 2.0 PKCE authorization server (HTTP mode)
 │   │   ├── setup.py                # setup wizard (neo-mcp setup)
 │   │   ├── daemon.py               # Python daemon (fallback — primary is npm daemon)
 │   │   └── login.py                # browser OAuth flow (neo-mcp login)
 │   ├── tests/
-│   │   ├── test_system.py                 # primary unit suite (127 tests, no key needed)
+│   │   ├── test_system.py                 # primary unit suite (366 tests, no key needed)
 │   │   ├── test_auth.py                   # deployment ID policy tests
 │   │   ├── test_server.py                 # legacy tests (stale — references old API)
 │   │   └── test_connection.py             # connectivity smoke test (needs key)
@@ -111,6 +112,7 @@ The Python server is split into focused modules (not a single monolithic file):
 | `backend_poller.py` | Background poll loop — fetches commands, dispatches them, sends responses |
 | `action_handlers.py` | Executes commands locally — write_code, get_file, run_subprocess, list_files, create_session |
 | `job_manager.py` | Async subprocess lifecycle — create, stream output, terminate, cleanup |
+| `system_info.py` | Gathers exec_environment metadata (OS/arch/CPU/RAM/shell/GPU/tools); builds context prefix XML |
 | `auth.py` | Key resolution + deterministic deployment UUID derivation |
 | `paths.py` | All `~/.neo/daemon/` path constants in one place |
 | `config.py` | Tunable constants — poll intervals, timeouts, API URL |
@@ -165,6 +167,28 @@ All file reads and writes are validated to be within the thread's workspace or `
 - Output is streamed into memory (capped at 10 MB per stream) and also written to per-job log files under `~/.neo/daemon/jobs/`.
 - `cleanup_old_jobs()` removes **completed** jobs older than 24 h from the in-memory registry. Running jobs are never evicted regardless of age.
 - `cleanup_old_jobs()` is called automatically by `BackendPoller` every hour — no manual intervention needed.
+
+### Context prefix — exec_environment + integrations
+
+Before every `init-chat-direct` call, `_submit_task` prepends a structured XML block to the user message:
+
+```
+<exec_environment>
+  <application>vscode</application>
+  <version>{neo-mcp pip version}</version>
+  <platform>local</platform>
+  <ide>neo-mcp</ide>
+  <system>…OS/arch/CPU/RAM/shell…</system>
+  <capabilities>…python/git/docker/gpu…</capabilities>
+</exec_environment>
+<current_work_dir>{workspace}</current_work_dir>
+<git_branch>{branch}</git_branch>          ← omitted if not a git repo
+<integrations>…</integrations>              ← omitted if none configured
+```
+
+`system_info.SystemInfoGatherer` gathers this data once and caches it for 5 minutes. `IntegrationManager.format_integrations_xml()` appends only metadata (provider name + credential file path) — never credential values. A 13-pattern regex scan (`_validate_no_credentials`) raises `RuntimeError` if a credential value is accidentally included.
+
+The same integrations XML is also appended to `neo_send_feedback` payloads so Neo always has the latest integration state.
 
 ### Task submission — always vscode mode
 
@@ -237,7 +261,20 @@ Auth on every request: `Authorization: Bearer $NEO_SECRET_KEY`
 | `neo_remove_integration` | Delete the credential file(s) and metadata entry |
 | `neo_test_integration` | Probe the provider API with the stored credential |
 
-Providers wired today: `github`, `huggingface`, `anthropic`, `openrouter`. Metadata file `~/.neo/integrations.json` is a shared contract with the VS Code extension. `IntegrationManager.env_for_subprocess()` is merged into every `run_subprocess` child env so Neo tasks inherit `ANTHROPIC_API_KEY`, `HF_TOKEN`, `GITHUB_TOKEN`, etc. without re-prompting.
+Providers wired today: `github`, `huggingface`, `anthropic`, `openrouter`, `openai`, `s3`, `wandb`, `kaggle`. Metadata file `~/.neo/integrations.json` is a shared contract with the VS Code extension. `IntegrationManager.env_for_subprocess()` is merged into every `run_subprocess` child env so Neo tasks inherit `ANTHROPIC_API_KEY`, `HF_TOKEN`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `AWS_ACCESS_KEY_ID`, `WANDB_API_KEY`, `KAGGLE_KEY`, etc. without re-prompting.
+
+Credential storage per provider:
+
+| Provider | Native file(s) | Env vars injected |
+|---|---|---|
+| `github` | `~/.git-credentials` | `GITHUB_TOKEN` |
+| `huggingface` | `~/.cache/huggingface/token` | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` |
+| `anthropic` | `~/.neo/integrations/anthropic.env` | `ANTHROPIC_API_KEY` |
+| `openrouter` | `~/.neo/integrations/openrouter.env` | `OPENROUTER_API_KEY` |
+| `openai` | `~/.neo/integrations/openai.env` | `OPENAI_API_KEY` |
+| `s3` | `~/.aws/credentials` (`[neo]` profile) | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `AWS_PROFILE=neo` |
+| `wandb` | `~/.netrc` (`machine api.wandb.ai`) | `WANDB_API_KEY` |
+| `kaggle` | `~/.kaggle/kaggle.json` | `KAGGLE_USERNAME`, `KAGGLE_KEY` |
 
 ### Secret storage backends (`integrations/secret_store.py`)
 
@@ -248,7 +285,7 @@ Native tool-interface files (`~/.git-credentials`, `~/.cache/huggingface/token`)
 
 ## Test suite
 
-**Python** — `python/tests/test_system.py` (127 tests, no API key required):
+**Python** — `python/tests/test_system.py` (366 tests, no API key required):
 
 ```bash
 python3 -m pytest python/tests/test_system.py -v
@@ -260,7 +297,7 @@ python3 -m pytest python/tests/test_system.py -v
 cd npm && npx vitest run tests/system.test.ts
 ```
 
-Python coverage (16 test classes):
+Python coverage (21 test classes):
 
 | Class | What it tests |
 |---|---|
@@ -280,8 +317,14 @@ Python coverage (16 test classes):
 | `TestThreadStatusGate` | TERMINATED/FAILED/STOPPED reject, RUNNING/PAUSED/unknown accept |
 | `TestPollerWorkspaceRegistration` | in-memory update, overwrite, multiple threads isolated |
 | `TestDeploymentId` | creates file, stable, not key-derived, env override, key-derived, different keys |
+| `TestSystemInfoGatherer` | OS/arch/CPU/RAM/shell/Python/git/docker/GPU probes, cache, XML format |
+| `TestGetGitBranch` | git repo returns branch, non-git returns None |
+| `TestBuildContextPrefix` | XML structure, integrations appended, git branch included/omitted |
+| `TestFormatIntegrationsXML` | empty list, multiple providers, credential redaction, security scan raises |
+| `TestNewProviders` | s3/wandb/kaggle/openai write/load/remove/test roundtrips |
 
 When adding new features to `action_handlers.py`, `job_manager.py`, or `backend_poller.py` — add tests to `test_system.py`.
+When adding new features to `system_info.py` or `integrations/` — add tests to `test_system.py`.
 When adding new features to `executor.ts` or `daemon.ts` — add tests to `npm/tests/system.test.ts`.
 
 ## Known constraints
