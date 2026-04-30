@@ -1981,10 +1981,10 @@ def _make_fake_keyring():
 class TestIntegrationRegistry(unittest.TestCase):
     """Schema validation rules per provider."""
 
-    def test_all_four_providers_registered(self):
+    def test_all_providers_registered(self):
         self.assertEqual(
             sorted(PROVIDERS.keys()),
-            ["anthropic", "github", "huggingface", "openrouter"],
+            ["anthropic", "github", "huggingface", "kaggle", "openai", "openrouter", "s3", "wandb"],
         )
 
     def test_github_validates_pat_prefix(self):
@@ -3563,6 +3563,568 @@ class TestPollerDetectionPidReuse(unittest.TestCase):
         pid_file.write_text("9999999")
         self.assertFalse(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
         self.assertFalse(pid_file.exists())
+
+
+# ---------------------------------------------------------------------------
+# TestSystemInfoGatherer
+# ---------------------------------------------------------------------------
+
+class TestSystemInfoGatherer(unittest.TestCase):
+    """Tests for system_info.py — no subprocess calls, all probes mocked."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+        from neo_mcp.system_info import SystemInfoGatherer, _escape_xml, _normalize_arch, _normalize_os
+        self.SystemInfoGatherer = SystemInfoGatherer
+        self._escape_xml = _escape_xml
+        self._normalize_arch = _normalize_arch
+        self._normalize_os = _normalize_os
+
+    # --- helpers ---
+
+    def _make_env(self, **overrides) -> dict:
+        base = {
+            "application": "vscode",
+            "version": "0.4.46",
+            "platform": "local",
+            "ide": "neo-mcp",
+            "system": {
+                "os": "linux",
+                "arch": "x64",
+                "cpu_cores": 4,
+                "ram_total_gb": 16.0,
+                "ram_available_gb": 8.0,
+                "shell": {"default": "/bin/bash", "available": ["/bin/bash", "/bin/sh"]},
+            },
+            "capabilities": {
+                "python": {"available": True, "version": "3.11.2", "path": "/usr/bin/python3"},
+                "git": {"available": True, "version": "2.39.0"},
+                "docker": {"available": False},
+                "gpu": {"available": False},
+            },
+        }
+        base.update(overrides)
+        return base
+
+    # --- format_xml ---
+
+    def test_format_xml_contains_required_tags(self):
+        g = self.SystemInfoGatherer()
+        xml = g.format_xml(self._make_env())
+        for tag in ("<application>", "<version>", "<platform>", "<ide>",
+                    "<os>", "<arch>", "<cpu_cores>", "<ram_total_gb>",
+                    "<shell>", "<default>", "<available>",
+                    "<python>", "<git>", "<docker>", "<gpu>"):
+            self.assertIn(tag, xml, f"Missing tag: {tag}")
+
+    def test_format_xml_application_and_ide(self):
+        g = self.SystemInfoGatherer()
+        xml = g.format_xml(self._make_env())
+        self.assertIn("<application>vscode</application>", xml)
+        self.assertIn("<ide>neo-mcp</ide>", xml)
+
+    def test_format_xml_platform_local(self):
+        g = self.SystemInfoGatherer()
+        xml = g.format_xml(self._make_env())
+        self.assertIn("<platform>local</platform>", xml)
+
+    def test_format_xml_python_available_true(self):
+        g = self.SystemInfoGatherer()
+        xml = g.format_xml(self._make_env())
+        self.assertIn("<available>true</available>", xml)
+        self.assertIn("<version>3.11.2</version>", xml)
+        self.assertIn("<path>/usr/bin/python3</path>", xml)
+
+    def test_format_xml_python_unavailable_omits_version(self):
+        env = self._make_env()
+        env["capabilities"]["python"] = {"available": False}
+        g = self.SystemInfoGatherer()
+        xml = g.format_xml(env)
+        self.assertIn("<available>false</available>", xml)
+        self.assertNotIn("<path>", xml)
+
+    def test_format_xml_gpu_available_with_vram(self):
+        env = self._make_env()
+        env["capabilities"]["gpu"] = {
+            "available": True, "count": 1, "name": "NVIDIA A100", "vram_gb": 40
+        }
+        g = self.SystemInfoGatherer()
+        xml = g.format_xml(env)
+        self.assertIn("<name>NVIDIA A100</name>", xml)
+        self.assertIn("<vram_gb>40</vram_gb>", xml)
+
+    def test_format_xml_escapes_special_chars(self):
+        env = self._make_env()
+        env["system"]["shell"]["default"] = "/bin/bash<test>&"
+        g = self.SystemInfoGatherer()
+        xml = g.format_xml(env)
+        self.assertIn("&lt;test&gt;&amp;", xml)
+        self.assertNotIn("<test>", xml)
+
+    def test_format_xml_docker_omits_version_when_unavailable(self):
+        env = self._make_env()
+        env["capabilities"]["docker"] = {"available": False}
+        g = self.SystemInfoGatherer()
+        xml = g.format_xml(env)
+        # docker section present but no <version> for it
+        docker_section = xml[xml.index("<docker>"):xml.index("</docker>")]
+        self.assertNotIn("<version>", docker_section)
+
+    # --- caching ---
+
+    def test_gather_uses_cache_within_ttl(self):
+        import neo_mcp.system_info as si
+        g = self.SystemInfoGatherer()
+        fake_env = self._make_env()
+        g._cache = fake_env
+        g._cache_ts = time.monotonic()  # just set, still fresh
+        result = arun(g.gather())
+        self.assertIs(result, fake_env)
+
+    def test_gather_refreshes_after_cache_expiry(self):
+        import neo_mcp.system_info as si
+        g = self.SystemInfoGatherer()
+        fake_env = self._make_env()
+        g._cache = fake_env
+        g._cache_ts = time.monotonic() - 400  # expired
+
+        with patch("neo_mcp.system_info._get_shell_info", new=AsyncMock(return_value={"default": "/bin/sh", "available": ["/bin/sh"]})), \
+             patch("neo_mcp.system_info._get_python_info", new=AsyncMock(return_value={"available": False})), \
+             patch("neo_mcp.system_info._get_git_info", new=AsyncMock(return_value={"available": False})), \
+             patch("neo_mcp.system_info._get_docker_info", new=AsyncMock(return_value={"available": False})), \
+             patch("neo_mcp.system_info._get_gpu_info", new=AsyncMock(return_value={"available": False})):
+            result = arun(g.gather())
+
+        self.assertIsNot(result, fake_env)
+        self.assertIsNotNone(g._cache)
+
+    # --- normalization helpers ---
+
+    def test_normalize_arch_x86_64(self):
+        self.assertEqual(self._normalize_arch("x86_64"), "x64")
+
+    def test_normalize_arch_amd64(self):
+        self.assertEqual(self._normalize_arch("AMD64"), "x64")
+
+    def test_normalize_arch_aarch64(self):
+        self.assertEqual(self._normalize_arch("aarch64"), "arm64")
+
+    def test_normalize_arch_passthrough(self):
+        self.assertEqual(self._normalize_arch("riscv64"), "riscv64")
+
+    def test_normalize_os_linux(self):
+        self.assertEqual(self._normalize_os("Linux"), "linux")
+
+    def test_normalize_os_darwin(self):
+        self.assertEqual(self._normalize_os("Darwin"), "darwin")
+
+    def test_normalize_os_windows(self):
+        self.assertEqual(self._normalize_os("Windows"), "windows")
+
+    # --- escape_xml ---
+
+    def test_escape_xml_ampersand(self):
+        self.assertEqual(self._escape_xml("a&b"), "a&amp;b")
+
+    def test_escape_xml_angle_brackets(self):
+        self.assertEqual(self._escape_xml("<tag>"), "&lt;tag&gt;")
+
+    def test_escape_xml_passthrough(self):
+        self.assertEqual(self._escape_xml("hello world"), "hello world")
+
+
+# ---------------------------------------------------------------------------
+# TestGetGitBranch
+# ---------------------------------------------------------------------------
+
+class TestGetGitBranch(unittest.TestCase):
+
+    def test_returns_branch_name(self):
+        from neo_mcp.system_info import get_git_branch
+        ws = make_ws()
+        try:
+            # Initialise a real git repo and commit so HEAD has a branch name
+            import subprocess as sp
+            sp.run(["git", "init", ws], check=True, capture_output=True)
+            sp.run(["git", "-C", ws, "config", "user.email", "test@test.com"], check=True, capture_output=True)
+            sp.run(["git", "-C", ws, "config", "user.name", "Test"], check=True, capture_output=True)
+            (Path(ws) / "f.txt").write_text("hello")
+            sp.run(["git", "-C", ws, "add", "."], check=True, capture_output=True)
+            sp.run(["git", "-C", ws, "commit", "-m", "init"], check=True, capture_output=True)
+            branch = arun(get_git_branch(ws))
+            self.assertIsNotNone(branch)
+            self.assertIsInstance(branch, str)
+            self.assertTrue(len(branch) > 0)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_returns_none_for_non_git_dir(self):
+        from neo_mcp.system_info import get_git_branch
+        ws = make_ws()
+        try:
+            result = arun(get_git_branch(ws))
+            self.assertIsNone(result)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# TestBuildContextPrefix
+# ---------------------------------------------------------------------------
+
+class TestBuildContextPrefix(unittest.TestCase):
+
+    def test_prefix_contains_exec_environment(self):
+        from neo_mcp.system_info import build_context_prefix, _gatherer
+        ws = make_ws()
+        try:
+            with patch.object(_gatherer, "gather", new=AsyncMock(return_value={
+                "application": "vscode", "version": "0.4.46",
+                "platform": "local", "ide": "neo-mcp",
+                "system": {
+                    "os": "linux", "arch": "x64", "cpu_cores": 4,
+                    "ram_total_gb": 16.0, "ram_available_gb": 8.0,
+                    "shell": {"default": "/bin/bash", "available": ["/bin/bash"]},
+                },
+                "capabilities": {
+                    "python": {"available": False},
+                    "git": {"available": False},
+                    "docker": {"available": False},
+                    "gpu": {"available": False},
+                },
+            })):
+                prefix = arun(build_context_prefix(ws))
+            self.assertIn("<exec_environment>", prefix)
+            self.assertIn("</exec_environment>", prefix)
+            self.assertIn("<current_work_dir>", prefix)
+            self.assertIn(ws, prefix)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_prefix_omits_git_branch_for_non_git_dir(self):
+        from neo_mcp.system_info import build_context_prefix, _gatherer
+        ws = make_ws()
+        try:
+            with patch.object(_gatherer, "gather", new=AsyncMock(return_value={
+                "application": "vscode", "version": "0.4.46",
+                "platform": "local", "ide": "neo-mcp",
+                "system": {
+                    "os": "linux", "arch": "x64", "cpu_cores": 4,
+                    "ram_total_gb": 16.0, "ram_available_gb": 8.0,
+                    "shell": {"default": "/bin/bash", "available": ["/bin/bash"]},
+                },
+                "capabilities": {
+                    "python": {"available": False},
+                    "git": {"available": False},
+                    "docker": {"available": False},
+                    "gpu": {"available": False},
+                },
+            })):
+                prefix = arun(build_context_prefix(ws))
+            self.assertNotIn("<git_branch>", prefix)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_prefix_includes_git_branch_when_detected(self):
+        from neo_mcp.system_info import build_context_prefix, _gatherer
+        ws = make_ws()
+        try:
+            with patch.object(_gatherer, "gather", new=AsyncMock(return_value={
+                "application": "vscode", "version": "0.4.46",
+                "platform": "local", "ide": "neo-mcp",
+                "system": {
+                    "os": "linux", "arch": "x64", "cpu_cores": 4,
+                    "ram_total_gb": 16.0, "ram_available_gb": 8.0,
+                    "shell": {"default": "/bin/bash", "available": ["/bin/bash"]},
+                },
+                "capabilities": {
+                    "python": {"available": False},
+                    "git": {"available": False},
+                    "docker": {"available": False},
+                    "gpu": {"available": False},
+                },
+            })), \
+            patch("neo_mcp.system_info.get_git_branch", new=AsyncMock(return_value="feature/my-branch")):
+                prefix = arun(build_context_prefix(ws))
+            self.assertIn("<git_branch>feature/my-branch</git_branch>", prefix)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_prefix_still_works_when_gather_raises(self):
+        from neo_mcp.system_info import build_context_prefix, _gatherer
+        ws = make_ws()
+        try:
+            with patch.object(_gatherer, "gather", new=AsyncMock(side_effect=RuntimeError("probe failed"))):
+                prefix = arun(build_context_prefix(ws))
+            # Should still include current_work_dir even when exec_environment fails
+            self.assertIn("<current_work_dir>", prefix)
+            self.assertNotIn("<exec_environment>", prefix)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# TestFormatIntegrationsXML
+# ---------------------------------------------------------------------------
+
+class TestFormatIntegrationsXML(unittest.TestCase):
+
+    def _make_manager(self, integrations: dict) -> "IntegrationManager":
+        import json as _json
+        from neo_mcp.integrations.manager import IntegrationManager
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            _json.dump({"version": 1, "integrations": integrations}, f)
+            path = Path(f.name)
+        mgr = IntegrationManager(metadata_file=path)
+        self.addCleanup(path.unlink, missing_ok=True)
+        return mgr
+
+    def test_empty_integrations_returns_empty_string(self):
+        mgr = self._make_manager({})
+        self.assertEqual(mgr.format_integrations_xml(), "")
+
+    def test_single_integration_produces_xml(self):
+        mgr = self._make_manager({
+            "anthropic": {
+                "method": "api_key",
+                "added_at": "2025-01-01T00:00:00+00:00",
+                "files": ["/root/.neo/integrations/anthropic.env"],
+            }
+        })
+        xml = mgr.format_integrations_xml()
+        self.assertIn("<integrations>", xml)
+        self.assertIn("</integrations>", xml)
+        self.assertIn('provider="anthropic"', xml)
+        self.assertIn('credential_method="api_key"', xml)
+        self.assertIn("<credential_path>/root/.neo/integrations/anthropic.env</credential_path>", xml)
+
+    def test_multiple_integrations_all_present(self):
+        mgr = self._make_manager({
+            "anthropic": {"method": "api_key", "added_at": "2025-01-01T00:00:00+00:00", "files": ["/root/.neo/integrations/anthropic.env"]},
+            "github": {"method": "pat", "added_at": "2025-01-01T00:00:00+00:00", "files": ["/root/.git-credentials"]},
+        })
+        xml = mgr.format_integrations_xml()
+        self.assertIn('provider="anthropic"', xml)
+        self.assertIn('provider="github"', xml)
+        self.assertIn('credential_method="pat"', xml)
+
+    def test_no_files_omits_credential_path(self):
+        mgr = self._make_manager({
+            "anthropic": {"method": "api_key", "added_at": "2025-01-01T00:00:00+00:00", "files": []},
+        })
+        xml = mgr.format_integrations_xml()
+        self.assertNotIn("<credential_path>", xml)
+
+    def test_escapes_xml_special_chars_in_provider(self):
+        from neo_mcp.integrations.manager import _escape_xml
+        self.assertEqual(_escape_xml("a&b<c>d"), "a&amp;b&lt;c&gt;d")
+
+    def test_security_validation_raises_on_hf_token(self):
+        from neo_mcp.integrations.manager import _validate_no_credentials
+        with self.assertRaises(RuntimeError):
+            _validate_no_credentials('<credential_path>hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</credential_path>')
+
+    def test_security_validation_raises_on_anthropic_key(self):
+        from neo_mcp.integrations.manager import _validate_no_credentials
+        with self.assertRaises(RuntimeError):
+            _validate_no_credentials('<val>sk-ant-' + 'A' * 95 + '</val>')
+
+    def test_security_validation_passes_clean_xml(self):
+        from neo_mcp.integrations.manager import _validate_no_credentials
+        _validate_no_credentials('<integrations><integration provider="anthropic"/></integrations>')
+
+    def test_security_validation_raises_on_github_pat(self):
+        from neo_mcp.integrations.manager import _validate_no_credentials
+        with self.assertRaises(RuntimeError):
+            _validate_no_credentials('<val>ghp_' + 'A' * 40 + '</val>')
+
+    def test_unknown_provider_key_ignored(self):
+        # The manager's list() filters to known providers only
+        mgr = self._make_manager({
+            "integration-1768977015296-3prpe3wd9": {
+                "method": "api_key",
+                "added_at": "2025-01-01T00:00:00+00:00",
+                "files": ["/some/path"],
+            }
+        })
+        self.assertEqual(mgr.format_integrations_xml(), "")
+
+
+# ---------------------------------------------------------------------------
+# TestNewProviders
+# ---------------------------------------------------------------------------
+
+class TestNewProviders(unittest.TestCase):
+    """Smoke-tests for s3, wandb, kaggle, openai providers."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="neo-prov-test-"))
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _patched_store(self, provider):
+        """Return a file-backend SecretStore rooted in tmp dir."""
+        from neo_mcp.integrations.secret_store import FileSecretStore
+        store = FileSecretStore(base_dir=self._tmp / "secrets")
+        return store
+
+    # ---- registry completeness ----
+
+    def test_all_new_providers_in_registry(self):
+        from neo_mcp.integrations.registry import PROVIDERS
+        for p in ("s3", "wandb", "kaggle", "openai"):
+            self.assertIn(p, PROVIDERS, f"{p} missing from PROVIDERS")
+
+    def test_all_new_providers_in_modules(self):
+        from neo_mcp.integrations.providers import MODULES
+        for p in ("s3", "wandb", "kaggle", "openai"):
+            self.assertIn(p, MODULES, f"{p} missing from MODULES")
+
+    # ---- S3 ----
+
+    def test_s3_write_neo_profile(self):
+        from neo_mcp.integrations.providers import s3
+        creds_file = self._tmp / "aws_creds"
+        with patch.object(s3, "AWS_CREDENTIALS_FILE", creds_file), \
+             patch("neo_mcp.integrations.providers.s3.get_secret_store") as mock_store:
+            mock_store.return_value.location.return_value = str(self._tmp / "s3.env")
+            mock_store.return_value.backend = "file"
+            s3.write_secret({"aws_access_key_id": "AKIAIOSFODNN7EXAMPLE", "aws_secret_access_key": "wJalrXUtn", "region": "eu-west-1"})
+        content = creds_file.read_text()
+        self.assertIn("[neo]", content)
+        self.assertIn("AKIAIOSFODNN7EXAMPLE", content)
+        self.assertIn("eu-west-1", content)
+
+    def test_s3_remove_neo_profile(self):
+        from neo_mcp.integrations.providers import s3
+        creds_file = self._tmp / "aws_creds"
+        creds_file.write_text("[default]\naws_access_key_id = OTHER\n\n[neo]\naws_access_key_id = AKIA1234\naws_secret_access_key = secret\n")
+        with patch.object(s3, "AWS_CREDENTIALS_FILE", creds_file), \
+             patch("neo_mcp.integrations.providers.s3.get_secret_store") as mock_store:
+            mock_store.return_value.delete.return_value = False
+            s3.remove_secret()
+        content = creds_file.read_text()
+        self.assertNotIn("[neo]", content)
+        self.assertIn("[default]", content)
+
+    def test_s3_load_env_empty_when_not_configured(self):
+        from neo_mcp.integrations.providers import s3
+        with patch("neo_mcp.integrations.providers.s3.get_secret_store") as mock_store:
+            mock_store.return_value.read.return_value = {}
+            result = s3.load_env()
+        self.assertEqual(result, {})
+
+    def test_s3_load_env_injects_aws_vars(self):
+        from neo_mcp.integrations.providers import s3
+        with patch("neo_mcp.integrations.providers.s3.get_secret_store") as mock_store:
+            mock_store.return_value.read.return_value = {
+                "aws_access_key_id": "AKIATEST",
+                "aws_secret_access_key": "secretkey",
+                "region": "us-west-2",
+            }
+            result = s3.load_env()
+        self.assertEqual(result["AWS_ACCESS_KEY_ID"], "AKIATEST")
+        self.assertEqual(result["AWS_SECRET_ACCESS_KEY"], "secretkey")
+        self.assertEqual(result["AWS_DEFAULT_REGION"], "us-west-2")
+
+    # ---- wandb ----
+
+    def test_wandb_writes_netrc(self):
+        from neo_mcp.integrations.providers import wandb as wb
+        netrc = self._tmp / ".netrc"
+        with patch.object(wb, "NETRC_FILE", netrc), \
+             patch("neo_mcp.integrations.providers.wandb.get_secret_store") as mock_store:
+            mock_store.return_value.location.return_value = str(self._tmp / "wandb.env")
+            mock_store.return_value.backend = "file"
+            wb.write_secret({"api_key": "a" * 40})
+        content = netrc.read_text()
+        self.assertIn("machine api.wandb.ai", content)
+        self.assertIn("a" * 40, content)
+
+    def test_wandb_remove_strips_netrc(self):
+        from neo_mcp.integrations.providers import wandb as wb
+        netrc = self._tmp / ".netrc"
+        netrc.write_text("machine other.host\n  login u\n  password p\n\nmachine api.wandb.ai\n  login user\n  password key123\n")
+        with patch.object(wb, "NETRC_FILE", netrc), \
+             patch("neo_mcp.integrations.providers.wandb.get_secret_store") as mock_store:
+            mock_store.return_value.delete.return_value = False
+            wb.remove_secret()
+        content = netrc.read_text()
+        self.assertNotIn("api.wandb.ai", content)
+        self.assertIn("other.host", content)
+
+    def test_wandb_load_env(self):
+        from neo_mcp.integrations.providers import wandb as wb
+        with patch("neo_mcp.integrations.providers.wandb.get_secret_store") as mock_store:
+            mock_store.return_value.read.return_value = {"api_key": "mykey"}
+            result = wb.load_env()
+        self.assertEqual(result, {"WANDB_API_KEY": "mykey"})
+
+    # ---- kaggle ----
+
+    def test_kaggle_writes_json(self):
+        from neo_mcp.integrations.providers import kaggle as kg
+        kaggle_json = self._tmp / "kaggle.json"
+        with patch.object(kg, "KAGGLE_JSON", kaggle_json), \
+             patch("neo_mcp.integrations.providers.kaggle.get_secret_store") as mock_store:
+            mock_store.return_value.location.return_value = str(self._tmp / "kaggle.env")
+            mock_store.return_value.backend = "file"
+            kg.write_secret({"username": "testuser", "key": "a" * 32})
+        import json as _json
+        data = _json.loads(kaggle_json.read_text())
+        self.assertEqual(data["username"], "testuser")
+        self.assertEqual(data["key"], "a" * 32)
+
+    def test_kaggle_remove_deletes_json(self):
+        from neo_mcp.integrations.providers import kaggle as kg
+        kaggle_json = self._tmp / "kaggle.json"
+        kaggle_json.write_text('{"username":"u","key":"k"}')
+        with patch.object(kg, "KAGGLE_JSON", kaggle_json), \
+             patch("neo_mcp.integrations.providers.kaggle.get_secret_store") as mock_store:
+            mock_store.return_value.delete.return_value = False
+            kg.remove_secret()
+        self.assertFalse(kaggle_json.exists())
+
+    def test_kaggle_load_env(self):
+        from neo_mcp.integrations.providers import kaggle as kg
+        with patch("neo_mcp.integrations.providers.kaggle.get_secret_store") as mock_store:
+            mock_store.return_value.read.return_value = {"username": "u", "key": "k"}
+            result = kg.load_env()
+        self.assertEqual(result, {"KAGGLE_USERNAME": "u", "KAGGLE_KEY": "k"})
+
+    # ---- openai ----
+
+    def test_openai_load_env(self):
+        from neo_mcp.integrations.providers import openai as oai
+        with patch("neo_mcp.integrations.providers.openai.get_secret_store") as mock_store:
+            mock_store.return_value.read.return_value = {"api_key": "sk-test"}
+            result = oai.load_env()
+        self.assertEqual(result, {"OPENAI_API_KEY": "sk-test"})
+
+    def test_openai_load_env_empty_when_not_configured(self):
+        from neo_mcp.integrations.providers import openai as oai
+        with patch("neo_mcp.integrations.providers.openai.get_secret_store") as mock_store:
+            mock_store.return_value.read.return_value = {}
+            result = oai.load_env()
+        self.assertEqual(result, {})
+
+    # ---- security validator covers new patterns ----
+
+    def test_security_raises_on_openai_key(self):
+        from neo_mcp.integrations.manager import _validate_no_credentials
+        with self.assertRaises(RuntimeError):
+            _validate_no_credentials('<val>sk-' + 'A' * 50 + '</val>')
+
+    def test_security_raises_on_kaggle_key(self):
+        from neo_mcp.integrations.manager import _validate_no_credentials
+        with self.assertRaises(RuntimeError):
+            _validate_no_credentials('"key": "' + 'a' * 32 + '"')
+
+    def test_security_raises_on_aws_secret(self):
+        from neo_mcp.integrations.manager import _validate_no_credentials
+        with self.assertRaises(RuntimeError):
+            _validate_no_credentials('secret_access_key ' + 'A' * 42)
 
 
 if __name__ == "__main__":

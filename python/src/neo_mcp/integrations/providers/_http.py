@@ -8,7 +8,7 @@ import httpx
 # might echo back in an error response. If any of these appear in a response
 # body we strip the body entirely — we'd rather give the user a generic
 # "HTTP 4xx" than leak their key into the MCP tool response.
-_CREDENTIAL_MARKERS = ("sk-ant-", "sk-or-", "hf_", "ghp_", "github_pat_")
+_CREDENTIAL_MARKERS = ("sk-ant-", "sk-or-", "hf_", "ghp_", "github_pat_", "sk-", "AKIA")
 
 
 def _sanitize_body(body: str, status_code: int) -> str:

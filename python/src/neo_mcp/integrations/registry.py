@@ -48,4 +48,33 @@ PROVIDERS: dict[str, IntegrationSchema] = {
         validators={"api_key": r"^sk-or-[A-Za-z0-9\-_]+$"},
         method="api_key",
     ),
+    "s3": IntegrationSchema(
+        name="s3",
+        description="AWS S3 credentials for accessing buckets and datasets",
+        required_fields=("aws_access_key_id", "aws_secret_access_key"),
+        optional_fields=("region",),
+        validators={"aws_access_key_id": r"^AKIA[0-9A-Z]{16}$"},
+        method="access_key",
+    ),
+    "wandb": IntegrationSchema(
+        name="wandb",
+        description="Weights & Biases API key for experiment tracking",
+        required_fields=("api_key",),
+        validators={"api_key": r"^[A-Za-z0-9]{40}$"},
+        method="api_key",
+    ),
+    "kaggle": IntegrationSchema(
+        name="kaggle",
+        description="Kaggle API credentials for datasets and competitions",
+        required_fields=("username", "key"),
+        validators={"key": r"^[a-f0-9]{32}$"},
+        method="api_key",
+    ),
+    "openai": IntegrationSchema(
+        name="openai",
+        description="OpenAI API key for GPT models and embeddings",
+        required_fields=("api_key",),
+        validators={"api_key": r"^sk-[A-Za-z0-9_\-]+$"},
+        method="api_key",
+    ),
 }
