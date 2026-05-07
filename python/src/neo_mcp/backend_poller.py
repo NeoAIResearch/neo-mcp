@@ -367,11 +367,27 @@ class BackendPoller:
                     logger.debug("Could not auto-pause stale task %s: %s", tid, exc)
 
     def _write_daemon_log(self) -> None:
+        """Append a startup entry to ~/.neo/daemon/daemon.log.
+
+        Format matches the VS Code extension's DaemonLogger (Logger.ts):
+            [<ISO timestamp>] [INFO] <message> <meta json>
+
+        Both ``deploymentId`` and ``sandboxId`` are emitted — the former is
+        canonical, the latter kept for back-compat with older readers.
+        """
         DAEMON_DIR.mkdir(parents=True, exist_ok=True)
-        entry = json.dumps({"sandboxId": self._deployment_id, "source": "neo-mcp"})
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
+             f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+        meta = json.dumps({
+            "deploymentId": self._deployment_id,
+            "sandboxId": self._deployment_id,
+            "source": "neo-mcp",
+        })
+        line = f"[{ts}] [INFO] BackendPoller started {meta}\n"
         try:
             with open(DAEMON_LOG, "a") as fh:
-                fh.write(entry + "\n")
+                fh.write(line)
         except OSError as exc:
             logger.warning("Could not write daemon log: %s", exc)
 

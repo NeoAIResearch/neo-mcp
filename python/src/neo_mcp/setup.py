@@ -69,7 +69,8 @@ def _validate_api_key(secret_key: str) -> bool:
     import urllib.request
     import urllib.error
 
-    neo_api = os.environ.get("NEO_API_URL", "https://master.heyneo.so")
+    from .config import API_URL
+    neo_api = API_URL
     # Use a dummy thread_id — we expect 404, which still means auth passed.
     url = f"{neo_api}/v2/thread/status/00000000-0000-0000-0000-000000000000"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {secret_key}"})

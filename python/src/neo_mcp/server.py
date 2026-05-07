@@ -1228,25 +1228,24 @@ async def run(secret_key: str, workspace: str) -> None:
 
 
 def _setup_logging() -> None:
-    """Route all internal logging to a file so it doesn't pollute stdio."""
-    log_dir = os.path.expanduser("~/.neo/daemon")
-    log_file = os.path.join(log_dir, "neo-mcp.log")
+    """Route all internal logging to ``~/.neo/daemon/neo-mcp.log``.
+
+    Format and rotation policy match the VS Code extension's DaemonLogger
+    so a single reader can parse logs from any of the three daemons.
+    Deployment ID is auto-injected into every line's metadata.
+
+    Falls back to stderr on read-only filesystems (tests/sandboxes).
+    """
+    from .log_utils import setup_daemon_logging
+
+    log_file = DAEMON_DIR / "neo-mcp.log"
     try:
-        os.makedirs(log_dir, exist_ok=True)
-        logging.basicConfig(
-            filename=log_file,
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S",
-        )
-    except OSError:
-        # Fallback for read-only environments (tests/sandboxes): keep CLI usable.
-        logging.basicConfig(
-            stream=sys.stderr,
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S",
-        )
+        # Resolve deployment ID up front so every log line carries it.
+        # Cheap — just reads the standalone UUID file (or creates it once).
+        deployment_id = get_or_create_deployment_id(get_secret_key() or "")
+    except Exception:  # noqa: BLE001
+        deployment_id = "unknown"
+    setup_daemon_logging(deployment_id, log_file)
 
 
 def _start_health_server() -> None:
