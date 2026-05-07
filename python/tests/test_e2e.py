@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import httpx
 
 NEO_SECRET_KEY = os.environ.get("NEO_SECRET_KEY", "")
-NEO_API_URL = os.environ.get("NEO_API_URL", "https://master.heyneo.so")
+NEO_API_URL = os.environ.get("NEO_API_URL", "https://master.heyneo.com")
 
 _NEEDS_KEY = unittest.skipUnless(NEO_SECRET_KEY, "NEO_SECRET_KEY not set")
 

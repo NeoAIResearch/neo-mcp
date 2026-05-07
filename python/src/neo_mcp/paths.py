@@ -10,13 +10,21 @@ from pathlib import Path
 NEO_DIR: Path = Path(os.environ["NEO_HOME"]) if os.environ.get("NEO_HOME") else Path.home() / ".neo"
 DAEMON_DIR: Path = NEO_DIR / "daemon"
 
+# Optional user settings file. Schema: {"env": "staging" | "prod"}.
+# When present, takes precedence over NEO_ENVIRONMENT/NEO_ENV/NEO_API_URL for
+# selecting the backend base URL. See config.py:_resolve_api_url.
+SETTINGS_FILE: Path = NEO_DIR / "settings.json"
+
 # Lock file — prevents duplicate poller instances
 LOCK_FILE: Path = DAEMON_DIR / "neo-mcp.lock"
 
 # PID file — written on startup so other processes can check if we're alive
 PID_FILE: Path = DAEMON_DIR / "neo-mcp.pid"
 
-# Append-only log of daemon starts: {"sandboxId": "...", "source": "neo-mcp"}
+# Append-only log of daemon starts. Format mirrors the VS Code extension's
+# DaemonLogger (Logger.ts) so both daemons produce parseable interleaved lines:
+#   [<ISO timestamp>] [INFO] <message> {"deploymentId": "...", "sandboxId": "...", "source": "..."}
+# `sandboxId` is duplicated for back-compat with older readers.
 DAEMON_LOG: Path = DAEMON_DIR / "daemon.log"
 
 # Machine-specific deployment UUID written by the npm daemon on first run.

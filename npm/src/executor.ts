@@ -9,6 +9,15 @@ import { spawn, ChildProcess } from 'child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { dirname, isAbsolute, join, relative, resolve } from 'path';
+import type { DaemonLogger, LogMeta } from './logger.js';
+
+// Module-level logger — set by the daemon after deploymentId resolution.
+// Tests don't set it; calls become no-ops.
+let _logger: DaemonLogger | null = null;
+export function setExecutorLogger(logger: DaemonLogger): void { _logger = logger; }
+function elog(level: 'info' | 'warn' | 'error', msg: string, meta?: LogMeta): void {
+  if (_logger) _logger[level](msg, meta);
+}
 
 // Directories skipped during file listing — matches Python/TS daemon
 const SKIP_DIRS = new Set([
@@ -224,7 +233,7 @@ export function remapToWorkspace(absPath: string, workspace: string, workdir: st
       // /app/test_2 is the project root directory, maps to workspace.
       const shouldStrip = isWorkdir || slashIdx >= 0;
       if (shouldStrip) {
-        console.error(`[remap] stripping project wrapper "${firstSeg}" from ${absPath} (local workspace name is "${wsName}")`);
+        elog('info', 'remap: stripping project wrapper', { wrapper: firstSeg, absPath, workspaceName: wsName });
         relative = slashIdx >= 0 ? relative.slice(slashIdx + 1) : '';
       }
     } else if (firstSeg && wsName === firstSeg) {
@@ -298,7 +307,7 @@ function recordWrapper(threadId: string | undefined, absPath: string): void {
   const slug = extractWrapper(absPath);
   if (slug) {
     _threadWrappers.set(threadId, slug);
-    console.error(`[wrapper] recorded Neo project wrapper for thread ${threadId}: ${slug}`);
+    elog('info', 'recorded Neo project wrapper', { threadId, slug });
   }
 }
 
@@ -351,7 +360,7 @@ function applyWrapperRewrite(
   if (!slug) return text;
   const rewritten = stripWrapperPrefixes(text, slug, workspace);
   if (rewritten !== text) {
-    console.error(`[wrapper] stripped ${slug} from ${text.length} chars of shell text`);
+    elog('info', 'wrapper: stripped slug from shell text', { slug, chars: text.length });
   }
   return rewritten;
 }
@@ -369,7 +378,7 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
   }
   const workdir = fieldString(cmd, 'workdir') ?? '';
 
-  console.error(`[write_code] filename=${filename} workdir=${workdir} workspace=${workspace}`);
+  elog('info', 'write_code start', { filename, workdir, workspace });
 
   // Normalize container-relative filenames to absolute paths so they go through
   // the standard remap logic below. Backend sometimes omits the leading '/'
@@ -377,7 +386,7 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
   // under the workspace (workspace/app/project/myproj/model.py).
   const CONTAINER_REL_PREFIXES = ['app/project/', 'app/', 'workspace/', 'project/'];
   if (!isAbsolute(filename) && CONTAINER_REL_PREFIXES.some(p => filename!.startsWith(p))) {
-    console.error(`[write_code] normalized container-relative filename "${filename}" → "/${filename}"`);
+    elog('info', 'write_code: normalized container-relative filename', { from: filename, to: '/' + filename });
     filename = '/' + filename;
   }
 
@@ -392,7 +401,7 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
     // Otherwise it's a backend container path (e.g. /app/project/src/main.py) — remap.
     const direct = safeResolve(workspace, filename);
     full = direct ?? remapToWorkspace(resolved, workspace, workdir, true);
-    console.error(`[write_code] remapped ${filename} → ${full}`);
+    elog('info', 'write_code: remapped path', { from: filename, to: full });
   } else {
     // Relative filename: if workdir is absolute (backend container path like /app/project/test_2/demo),
     // remap it to the local workspace to preserve subdirectory structure.
@@ -407,13 +416,13 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
         : (() => {
             const slashIdx = workdir.indexOf('/');
             const rest = slashIdx >= 0 ? workdir.slice(slashIdx + 1) : '';
-            if (rest) console.error(`[write_code] relative workdir: stripped project wrapper "${workdir.slice(0, slashIdx)}" → base subdir "${rest}"`);
+            if (rest) elog('info', 'write_code: stripped relative workdir wrapper', { wrapper: workdir.slice(0, slashIdx), rest });
             return rest ? join(workspace, rest) : workspace;
           })()
       : workspace;
     const candidate = safeResolve(base, filename) ?? safeResolve(workspace, filename);
     if (!candidate) {
-      console.error(`[write_code] BLOCKED path=${filename} (outside workspace/tmp)`);
+      elog('warn', 'write_code: BLOCKED path (outside workspace/tmp)', { filename });
       return { request_id: cmd.request_id, status: 'error', error: `Path escapes allowed directories: ${filename}` };
     }
     full = candidate;
@@ -429,7 +438,7 @@ function hWriteCode(cmd: Command, workspace: string): ActionResult {
 
   mkdirSync(dirname(full), { recursive: true });
   writeFileSync(full, code, 'utf8');
-  console.error(`[write_code] wrote ${full}`);
+  elog('info', 'write_code: wrote', { path: full });
   return {
     request_id: cmd.request_id,
     status: 'success',
@@ -446,7 +455,7 @@ function hGetFile(cmd: Command, workspace: string): ActionResult {
   // Normalize container-relative paths (same logic as hWriteCode).
   const CONTAINER_REL_PREFIXES = ['app/project/', 'app/', 'workspace/', 'project/'];
   if (!isAbsolute(fp) && CONTAINER_REL_PREFIXES.some(p => fp!.startsWith(p))) {
-    console.error(`[get_file] normalized container-relative path "${fp}" → "/${fp}"`);
+    elog('info', 'get_file: normalized container-relative path', { from: fp, to: '/' + fp });
     fp = '/' + fp;
   }
   if (isAbsolute(fp)) {
@@ -456,7 +465,7 @@ function hGetFile(cmd: Command, workspace: string): ActionResult {
   let full = safeResolve(workspace, fp);
   if (!full && isAbsolute(fp)) {
     full = remapToWorkspace(resolve(fp), workspace, '', true);
-    console.error(`[get_file] remapped ${fp} → ${full}`);
+    elog('info', 'get_file: remapped path', { from: fp, to: full });
   }
   if (!full || !existsSync(full) || !statSync(full).isFile()) {
     return { request_id: cmd.request_id, status: 'error', error: `File not found: ${fp}` };
@@ -483,7 +492,7 @@ async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionRe
   if (scriptMatch) {
     const scriptPath = scriptMatch[1];
     if (!existsSync(scriptPath)) {
-      console.error(`[run_subprocess] Script not found locally: ${scriptPath}`);
+      elog('warn', 'run_subprocess: script not found locally', { scriptPath });
       return {
         request_id: cmd.request_id,
         status: 'error',
@@ -503,7 +512,7 @@ async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionRe
   // ActionHandlers._remap_command_paths().
   let remappedCommand = remapCommandPaths(command, workspace);
   if (remappedCommand !== command) {
-    console.error(`[run_subprocess] remapped paths: ${command.slice(0, 80)} → ${remappedCommand.slice(0, 80)}`);
+    elog('info', 'run_subprocess: remapped paths', { from: command.slice(0, 80), to: remappedCommand.slice(0, 80) });
   }
   // Strip relative wrapper references (`cd <slug>`, `mkdir <slug>/data`) for which
   // remapCommandPaths can't help — they're syntactically indistinguishable from real
@@ -512,7 +521,7 @@ async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionRe
 
   // Ensure workspace exists before spawning — cwd must exist or spawn throws ENOENT
   mkdirSync(safeCwd, { recursive: true });
-  console.error(`[run_subprocess] cwd=${safeCwd} cmd=${remappedCommand.slice(0, 120)} detach=${detach}`);
+  elog('info', 'run_subprocess', { cwd: safeCwd, cmd: remappedCommand.slice(0, 120), detach });
 
   if (!detach) {
     const proc = spawn(remappedCommand, { shell: true, cwd: safeCwd });
@@ -563,7 +572,7 @@ async function hRunSubprocess(cmd: Command, workspace: string): Promise<ActionRe
   // Kill hung jobs after 30 minutes — mirrors Python JOB_MAX_RUNTIME / asyncio.timeout().
   const killTimer = setTimeout(() => {
     if (job.exitCode === null) {
-      console.error(`[run_subprocess] Job ${jobId} exceeded max runtime — killing`);
+      elog('warn', 'run_subprocess: job exceeded max runtime — killing', { jobId });
       job.stderr += `\n[Killed: exceeded ${_JOB_MAX_RUNTIME_MS / 60_000}min max runtime]`;
       try { proc.kill('SIGKILL'); } catch { /* already gone */ }
     }
@@ -641,7 +650,7 @@ function hListFiles(cmd: Command, workspace: string): ActionResult {
       target = direct;
     } else {
       target = remapToWorkspace(resolve(directory), workspace, '', true, true);
-      console.error(`[list_files] remapped ${directory} → ${target}`);
+      elog('info', 'list_files: remapped path', { from: directory, to: target });
     }
   } else {
     target = safeResolve(workspace, directory) ?? workspace;
@@ -692,7 +701,7 @@ function hListFiles(cmd: Command, workspace: string): ActionResult {
 // ---------------------------------------------------------------------------
 
 export async function dispatch(cmd: Command, workspace: string): Promise<ActionResult> {
-  console.error(`[dispatch] action=${cmd.action} request_id=${cmd.request_id} thread_id=${cmd.thread_id ?? 'none'}`);
+  elog('info', 'dispatch', { action: cmd.action, request_id: cmd.request_id, thread_id: cmd.thread_id ?? null });
   try {
     switch (cmd.action) {
       case 'create_session':  return hCreateSession(cmd);
@@ -706,7 +715,7 @@ export async function dispatch(cmd: Command, workspace: string): Promise<ActionR
         return { request_id: cmd.request_id, status: 'error', error: `Unknown action: ${cmd.action}` };
     }
   } catch (err) {
-    console.error(`[dispatch] error in ${cmd.action}:`, err);
+    elog('error', 'dispatch error', { action: cmd.action, error: String(err) });
     return { request_id: cmd.request_id, status: 'error', error: String(err) };
   }
 }

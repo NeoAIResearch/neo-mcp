@@ -8,7 +8,7 @@
  * Environment:
  *   NEO_SECRET_KEY      — API key (sk-v1-...)  — primary auth
  *   NEO_DEPLOYMENT_ID   — optional UUID override
- *   NEO_API_URL         — optional, defaults to https://master.heyneo.so
+ *   NEO_API_URL         — optional, defaults to https://master.heyneo.com
  */
 
 import { resolve } from 'path';

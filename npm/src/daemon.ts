@@ -6,15 +6,27 @@
  */
 
 import { randomUUID } from 'crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
+import {
+  appendFileSync, closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync,
+  readFileSync, renameSync, unlinkSync, writeFileSync, writeSync,
+} from 'fs';
 import { resolve } from 'path';
 import { deriveDeploymentId, getAuthToken } from './auth.js';
 import { NEO_API_URL, POLL_MAX_INTERVAL, POLL_MAX_MESSAGES, getTaskTimeoutMs, TASK_TIMEOUT_CHECK_INTERVAL_MS } from './config.js';
-import { Command, dispatch } from './executor.js';
+import { Command, dispatch, setExecutorLogger } from './executor.js';
+import { DaemonLogger } from './logger.js';
 import {
-  DAEMON_DIR, DAEMON_LOG, NPM_PID_FILE, STANDALONE_UUID_FILE,
+  DAEMON_DIR, DAEMON_LOG, NEO_MCP_LOG, NPM_PID_FILE, STANDALONE_UUID_FILE,
   WORKSPACES_FILE, pidFileForDeployment,
 } from './paths.js';
+
+// Module-level logger — created lazily so getOrCreateDeploymentId() can run
+// even when nothing is going to be logged (e.g. setThreadStatus from tests).
+let _logger: DaemonLogger | null = null;
+function getLogger(deploymentId: string): DaemonLogger {
+  if (!_logger) _logger = new DaemonLogger(NEO_MCP_LOG, deploymentId);
+  return _logger;
+}
 
 // Read at call time so tests can override via env var after module load.
 function getMaxThreadWorkspaces(): number { return Number(process.env['NEO_THREAD_WORKSPACES_MAX'] ?? 500); }
@@ -67,9 +79,20 @@ function shouldAccept(threadId: string): boolean {
   return _ACCEPTED_STATUSES.has(status);
 }
 
+/**
+ * Append a startup entry to ~/.neo/daemon/daemon.log.
+ *
+ * Format matches the VS Code extension's DaemonLogger (Logger.ts):
+ *   [<ISO timestamp>] [INFO] <message> <meta json>
+ *
+ * Both ``deploymentId`` and ``sandboxId`` are emitted — the former is
+ * canonical, the latter kept for back-compat with older readers.
+ */
 function writeSandboxLog(deploymentId: string): void {
   mkdirSync(DAEMON_DIR, { recursive: true });
-  appendFileSync(DAEMON_LOG, `${JSON.stringify({ sandboxId: deploymentId, source: 'npm-daemon' })}\n`);
+  const ts = new Date().toISOString();
+  const meta = JSON.stringify({ deploymentId, sandboxId: deploymentId, source: 'npm-daemon' });
+  appendFileSync(DAEMON_LOG, `[${ts}] [INFO] npm-daemon started ${meta}\n`);
 }
 
 function writePidFiles(deploymentId: string): void {
@@ -102,13 +125,37 @@ export function getOrCreateDeploymentId(): string {
     if (uid) return uid;
   }
 
-  // No persisted UUID yet — generate a fresh random one for this machine.
-  // Do NOT derive from the API key: same key on two machines would produce
-  // identical deployment IDs, causing the backend to split commands between
-  // daemons (files on one machine, folders on another).
-  const uid = randomUUID();
-  writeFileSync(STANDALONE_UUID_FILE, uid);
-  return uid;
+  // No persisted UUID yet — concurrency-safe via temp-file + linkSync.
+  // The candidate is written into a temp file with content already in place,
+  // then linked atomically. linkSync fails if the target exists, so a loser
+  // re-reads the winner's content. This avoids the window where a plain
+  // O_EXCL create would let other processes observe an empty file before
+  // the winner finishes writing.
+  const candidate = randomUUID();
+  let tmpPath: string | null = null;
+  try {
+    const tmpDir = mkdtempSync(`${STANDALONE_UUID_FILE}-tmp-`);
+    tmpPath = `${tmpDir}/uuid`;
+    writeFileSync(tmpPath, candidate, { mode: 0o600 });
+    try {
+      linkSync(tmpPath, STANDALONE_UUID_FILE);
+      return candidate;
+    } catch (e: unknown) {
+      if ((e as NodeJS.ErrnoException)?.code === 'EEXIST') {
+        // Loser of the race — read the winner's value.
+        try {
+          const existing = readFileSync(STANDALONE_UUID_FILE, 'utf8').trim();
+          if (existing) return existing;
+        } catch { /* fall through to candidate */ }
+      }
+      return candidate;
+    } finally {
+      try { unlinkSync(tmpPath); } catch { /* ignore */ }
+      try { require('fs').rmdirSync(tmpDir); } catch { /* ignore */ }
+    }
+  } catch {
+    return candidate;
+  }
 }
 
 /**
@@ -166,7 +213,7 @@ export function registerThreadWorkspace(threadId: string, workspace: string): vo
   _ensureSharedWorkspacesLoaded();
   _sharedThreadWorkspaces[threadId] = workspace;
   saveThreadWorkspaces(_sharedThreadWorkspaces);
-  console.error(`[registerThreadWorkspace] tid=${threadId} workspace=${workspace}`);
+  if (_logger) _logger.info('registerThreadWorkspace', { threadId, workspace });
 }
 
 export function saveThreadWorkspaces(workspaces: Record<string, string>): void {
@@ -253,9 +300,9 @@ async function checkAndPauseStale(token: string): Promise<void> {
         10_000,
       );
       setThreadStatus(tid, 'PAUSED');
-      console.error(`[daemon] Auto-paused stale task ${tid} (was ${status}, age > ${timeoutMs / 3_600_000}h)`);
+      if (_logger) _logger.info('Auto-paused stale task', { tid, previousStatus: status, ageHours: timeoutMs / 3_600_000 });
     } catch (err) {
-      console.error(`[daemon] Could not auto-pause stale task ${tid}:`, err);
+      if (_logger) _logger.warn('Could not auto-pause stale task', { tid, error: String(err) });
     }
   }
 }
@@ -314,7 +361,7 @@ export async function sendResponse(depId: string, token: string, response: Recor
         await sleep(delayMs);
         delayMs *= 2; // 500ms → 1000ms
       } else {
-        console.error(`[sendResponse] Failed after 3 attempts for request_id=${response['request_id'] ?? '?'}:`, err);
+        if (_logger) _logger.error('sendResponse failed after 3 attempts', { request_id: response['request_id'] ?? null, error: String(err) });
       }
     }
   }
@@ -337,11 +384,15 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
   writePidFiles(depId);
   writeSandboxLog(depId);
 
-  console.error('Neo daemon ready');
-  console.error(`  deployment_id : ${depId}`);
-  console.error(`  workspace     : ${workspace}`);
-  console.error(`  backend       : ${NEO_API_URL}`);
-  console.error(`  pid           : ${process.pid}`);
+  // Initialise the runtime logger now that we know deploymentId. Every line
+  // it writes carries deploymentId in the meta automatically.
+  const logger = getLogger(depId);
+  setExecutorLogger(logger);
+  logger.info('Neo daemon ready', {
+    workspace,
+    backend: NEO_API_URL,
+    pid: process.pid,
+  });
 
   // Use the module-level shared dict so registrations made by the MCP server
   // (in the same process) are immediately visible here without any file reload.
@@ -369,7 +420,7 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
     } catch (e) {
       if (e instanceof AuthError) {
         // Mirrors Python BackendPoller UNAUTHORIZED handling — stop the daemon.
-        console.error(`[daemon] ${e.message} Stopping daemon.`);
+        logger.error('Auth rejected — stopping daemon', { message: e.message });
         stop();
         return;
       }
@@ -427,7 +478,7 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
         // Still nothing — log a warning so the user can diagnose misrouted files.
         // Do NOT persist the fallback: if the registration arrives later we want
         // the next command to pick up the real workspace, not a cached default.
-        console.error(`[daemon] workspace not registered for thread ${tid} — using default: ${workspace}`);
+        logger.warn('workspace not registered for thread — using default', { tid, default: workspace });
       }
       const resolvedWs = ws ?? workspace;
 
@@ -436,7 +487,7 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
       // commands that arrive after neo_stop_task was called.
       if (tid && !shouldAccept(tid)) {
         const currentStatus = _threadStatuses.get(tid) ?? 'UNKNOWN';
-        console.error(`[daemon] Rejecting command for ${currentStatus} thread ${tid}`);
+        logger.warn('Rejecting command for terminated thread', { tid, status: currentStatus });
         const errorResp: Record<string, unknown> = {
           request_id: cmd.request_id,
           status: 'error',
@@ -449,7 +500,7 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
       }
 
       // Semaphore: limit concurrent handlers — mirrors Python _cmd_semaphore(32)
-      console.error(`[daemon] dispatching action=${cmd.action} tid=${tid ?? 'none'} dep=${depId}`);
+      logger.info('dispatching command', { action: cmd.action, tid: tid ?? null });
       await _cmdSemaphore.acquire();
       let result: Record<string, unknown>;
       try {

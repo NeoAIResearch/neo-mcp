@@ -17,6 +17,7 @@ Run with: python3 -m pytest python/tests/test_system.py -v
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -4125,6 +4126,205 @@ class TestNewProviders(unittest.TestCase):
         from neo_mcp.integrations.manager import _validate_no_credentials
         with self.assertRaises(RuntimeError):
             _validate_no_credentials('secret_access_key ' + 'A' * 42)
+
+
+class TestSettingsFile(unittest.TestCase):
+    """Tests ~/.neo/settings.json {"env": ...} → API_URL precedence."""
+
+    def setUp(self):
+        from neo_mcp import paths
+        self.settings_path = paths.SETTINGS_FILE
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.settings_path.exists():
+            self.settings_path.unlink()
+        self._env_backup = {
+            k: os.environ.get(k)
+            for k in ("NEO_ENVIRONMENT", "NEO_ENV", "NEO_API_URL")
+        }
+        for k in ("NEO_ENVIRONMENT", "NEO_ENV", "NEO_API_URL"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        if self.settings_path.exists():
+            self.settings_path.unlink()
+        for k, v in self._env_backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _resolve(self) -> str:
+        from neo_mcp.config import _resolve_api_url
+        return _resolve_api_url()
+
+    def test_staging_via_settings(self):
+        self.settings_path.write_text('{"env": "staging"}')
+        self.assertEqual(self._resolve(), "https://alpha.heyneo.com")
+
+    def test_prod_via_settings(self):
+        self.settings_path.write_text('{"env": "prod"}')
+        self.assertEqual(self._resolve(), "https://master.heyneo.com")
+
+    def test_settings_overrides_env_var(self):
+        self.settings_path.write_text('{"env": "staging"}')
+        os.environ["NEO_ENVIRONMENT"] = "prod"
+        self.assertEqual(self._resolve(), "https://alpha.heyneo.com")
+
+    def test_missing_settings_falls_back_to_env(self):
+        os.environ["NEO_ENVIRONMENT"] = "staging"
+        self.assertEqual(self._resolve(), "https://alpha.heyneo.com")
+
+    def test_malformed_settings_falls_back(self):
+        self.settings_path.write_text('{not json')
+        os.environ["NEO_ENVIRONMENT"] = "staging"
+        self.assertEqual(self._resolve(), "https://alpha.heyneo.com")
+
+    def test_unknown_env_value_falls_through(self):
+        self.settings_path.write_text('{"env": "weird"}')
+        os.environ["NEO_ENVIRONMENT"] = "prod"
+        self.assertEqual(self._resolve(), "https://master.heyneo.com")
+
+    def test_default_is_prod_dot_com(self):
+        self.assertEqual(self._resolve(), "https://master.heyneo.com")
+
+    def test_neo_api_url_used_when_no_settings_or_env(self):
+        os.environ["NEO_API_URL"] = "https://custom.example.com"
+        self.assertEqual(self._resolve(), "https://custom.example.com")
+
+    def test_settings_beats_neo_api_url(self):
+        self.settings_path.write_text('{"env": "staging"}')
+        os.environ["NEO_API_URL"] = "https://custom.example.com"
+        self.assertEqual(self._resolve(), "https://alpha.heyneo.com")
+
+
+class TestRotatingDaemonHandler(unittest.TestCase):
+    """Tests for log_utils.RotatingDaemonHandler — extension-format daemon logger."""
+
+    def setUp(self):
+        import re
+        self._tmp = tempfile.mkdtemp(prefix="neo-log-")
+        self._log_file = Path(self._tmp) / "neo-mcp.log"
+        # Format: [<ISO>] [<LEVEL>] <message> {<json meta>}
+        self._line_re = re.compile(
+            r"^\[(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\] "
+            r"\[(?P<level>INFO|WARN|WARNING|ERROR|DEBUG)\] "
+            r"(?P<msg>.+?) "
+            r"(?P<meta>\{.*\})$"
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        # Reset root logger to avoid bleed into other tests.
+        root = __import__("logging").getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+
+    def _make_handler(self, **kw):
+        from neo_mcp.log_utils import RotatingDaemonHandler
+        return RotatingDaemonHandler(self._log_file, "dep-uuid-1234", **kw)
+
+    def test_format_matches_extension(self):
+        import logging as _logging
+        h = self._make_handler()
+        rec = _logging.LogRecord("test.logger", _logging.INFO, "f", 1, "hello world", None, None)
+        h.emit(rec)
+        line = self._log_file.read_text().splitlines()[-1]
+        m = self._line_re.match(line)
+        self.assertIsNotNone(m, f"line did not match format: {line!r}")
+        self.assertEqual(m["msg"], "hello world")
+        self.assertEqual(m["level"], "INFO")
+        meta = json.loads(m["meta"])
+        self.assertEqual(meta["deploymentId"], "dep-uuid-1234")
+        self.assertEqual(meta["logger"], "test.logger")
+
+    def test_deployment_id_in_every_line(self):
+        import logging as _logging
+        h = self._make_handler()
+        for i in range(5):
+            h.emit(_logging.LogRecord("x", _logging.INFO, "f", 1, f"msg-{i}", None, None))
+        for line in self._log_file.read_text().splitlines():
+            self.assertIn('"deploymentId": "dep-uuid-1234"', line)
+
+    def test_rotation_triggers_when_aged(self):
+        import logging as _logging
+        h = self._make_handler(rotation_age_seconds=0.01)
+        h.emit(_logging.LogRecord("x", _logging.INFO, "f", 1, "first", None, None))
+        # Force birth marker into the past so the next emit rotates.
+        birth = self._log_file.parent / (self._log_file.name + ".birth")
+        birth.write_text(str(time.time() - 3600))
+        h.emit(_logging.LogRecord("x", _logging.INFO, "f", 1, "after-rotate", None, None))
+        # After rotation: .1 holds the original line; current holds the new line.
+        archive = self._log_file.parent / (self._log_file.name + ".1")
+        self.assertTrue(archive.exists(), "rotation did not produce .1 archive")
+        self.assertIn("first", archive.read_text())
+        self.assertIn("after-rotate", self._log_file.read_text())
+
+    def test_max_rotated_cap(self):
+        import logging as _logging
+        h = self._make_handler(rotation_age_seconds=0.0, max_rotated=2)
+        birth = self._log_file.parent / (self._log_file.name + ".birth")
+        # Force 4 rotations; with max_rotated=2 only .1 and .2 should remain.
+        for i in range(5):
+            h.emit(_logging.LogRecord("x", _logging.INFO, "f", 1, f"line-{i}", None, None))
+            birth.write_text(str(time.time() - 3600))
+        self.assertTrue((self._log_file.parent / (self._log_file.name + ".1")).exists())
+        self.assertTrue((self._log_file.parent / (self._log_file.name + ".2")).exists())
+        self.assertFalse((self._log_file.parent / (self._log_file.name + ".3")).exists())
+
+    def test_setup_daemon_logging_installs_handler(self):
+        import logging as _logging
+        from neo_mcp.log_utils import setup_daemon_logging, RotatingDaemonHandler
+        setup_daemon_logging("dep-uuid-XYZ", self._log_file)
+        _logging.getLogger("test").info("hello via setup")
+        text = self._log_file.read_text()
+        self.assertIn("hello via setup", text)
+        self.assertIn('"deploymentId": "dep-uuid-XYZ"', text)
+        # Verify root has exactly one RotatingDaemonHandler.
+        root = _logging.getLogger()
+        rdh_count = sum(1 for h in root.handlers if isinstance(h, RotatingDaemonHandler))
+        self.assertEqual(rdh_count, 1)
+
+
+class TestSharedDeploymentIdAtomic(unittest.TestCase):
+    """Concurrent get_or_create_deployment_id calls must converge to one UUID."""
+
+    def setUp(self):
+        from neo_mcp import paths
+        self._uuid_file = paths.STANDALONE_UUID_FILE
+        self._uuid_file.parent.mkdir(parents=True, exist_ok=True)
+        if self._uuid_file.exists():
+            self._uuid_file.unlink()
+        self._env_backup = {
+            k: os.environ.get(k) for k in ("NEO_DEPLOYMENT_ID", "NEO_DEPLOYMENT_ID_MODE")
+        }
+        for k in self._env_backup:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        if self._uuid_file.exists():
+            self._uuid_file.unlink()
+        for k, v in self._env_backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_concurrent_calls_return_same_uuid(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from neo_mcp.auth import get_or_create_deployment_id
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            results = list(ex.map(lambda _: get_or_create_deployment_id(""), range(8)))
+        self.assertEqual(len(set(results)), 1, f"got divergent UUIDs: {set(results)}")
+        # File contains exactly one valid UUID.
+        on_disk = self._uuid_file.read_text().strip()
+        self.assertEqual(on_disk, results[0])
+        uuid.UUID(on_disk)  # raises if not a valid UUID
+
+    def test_pre_existing_file_wins(self):
+        existing = "11111111-2222-3333-4444-555555555555"
+        self._uuid_file.write_text(existing)
+        from neo_mcp.auth import get_or_create_deployment_id
+        self.assertEqual(get_or_create_deployment_id(""), existing)
 
 
 if __name__ == "__main__":

@@ -1766,3 +1766,149 @@ describe('thread status gate', () => {
     expect(commandExecuted).toBe(true);
   });
 });
+
+// ===========================================================================
+// PART 22 — DaemonLogger (extension-format runtime logger)
+// ===========================================================================
+
+describe('DaemonLogger', () => {
+  let tmpDir: string;
+  let logFile: string;
+  let birthFile: string;
+  // [<ISO>] [<LEVEL>] <msg> {<json meta>}
+  const LINE_RE = /^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\] \[(INFO|WARN|ERROR|DEBUG)\] (.+?) (\{.*\})$/;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'neo-log-'));
+    logFile = join(tmpDir, 'neo-mcp.log');
+    birthFile = `${logFile}.birth`;
+  });
+  afterEach(() => { rmSync(tmpDir, { recursive: true, force: true }); });
+
+  it('emits extension-format lines with deploymentId', async () => {
+    const { DaemonLogger } = await import('../src/logger.js');
+    const log = new DaemonLogger(logFile, 'dep-1234', true);
+    log.info('hello world', { extra: 1 });
+    log.close();
+
+    const line = readFileSync(logFile, 'utf-8').trim().split('\n').pop()!;
+    const m = line.match(LINE_RE);
+    expect(m).toBeTruthy();
+    expect(m![3]).toBe('hello world');
+    expect(m![2]).toBe('INFO');
+    const meta = JSON.parse(m![4]);
+    expect(meta.deploymentId).toBe('dep-1234');
+    expect(meta.extra).toBe(1);
+  });
+
+  it('rotates when file is older than rotationAgeMs', async () => {
+    const { DaemonLogger } = await import('../src/logger.js');
+    const log = new DaemonLogger(logFile, 'dep', true, 1 /* 1 ms threshold */);
+    log.info('first');
+    // Force birth marker into the past so the next write rotates.
+    writeFileSync(birthFile, String(Date.now() - 60_000));
+    log.info('after-rotate');
+    log.close();
+
+    expect(existsSync(`${logFile}.1`)).toBe(true);
+    expect(readFileSync(`${logFile}.1`, 'utf-8')).toContain('first');
+    expect(readFileSync(logFile, 'utf-8')).toContain('after-rotate');
+  });
+
+  it('caps rotated archives at maxRotated', async () => {
+    const { DaemonLogger } = await import('../src/logger.js');
+    const log = new DaemonLogger(logFile, 'dep', true, 1, 2 /* maxRotated */);
+    for (let i = 0; i < 5; i++) {
+      log.info(`line-${i}`);
+      writeFileSync(birthFile, String(Date.now() - 60_000));
+    }
+    log.close();
+
+    expect(existsSync(`${logFile}.1`)).toBe(true);
+    expect(existsSync(`${logFile}.2`)).toBe(true);
+    expect(existsSync(`${logFile}.3`)).toBe(false);
+  });
+
+  it('every level prefixes line correctly', async () => {
+    const { DaemonLogger } = await import('../src/logger.js');
+    const log = new DaemonLogger(logFile, 'dep', true);
+    log.info('i'); log.warn('w'); log.error('e'); log.debug('d');
+    log.close();
+    const lines = readFileSync(logFile, 'utf-8').trim().split('\n');
+    expect(lines[0]).toContain('[INFO]');
+    expect(lines[1]).toContain('[WARN]');
+    expect(lines[2]).toContain('[ERROR]');
+    expect(lines[3]).toContain('[DEBUG]');
+  });
+});
+
+// ===========================================================================
+// PART 21 — settings.json env switch
+// ===========================================================================
+
+describe('settings.json env switch', () => {
+  let tmpHome: string;
+  let settingsPath: string;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), 'neo-settings-'));
+    settingsPath = join(tmpHome, 'settings.json');
+  });
+  afterEach(() => { rmSync(tmpHome, { recursive: true, force: true }); });
+
+  async function resolve(env: NodeJS.ProcessEnv): Promise<{ url: string; env: string }> {
+    const { resolveApiUrl } = await import('../src/config.js');
+    return resolveApiUrl({ settingsFile: settingsPath, env });
+  }
+
+  it('staging via settings.json', async () => {
+    writeFileSync(settingsPath, '{"env": "staging"}');
+    const r = await resolve({});
+    expect(r.url).toBe('https://alpha.heyneo.com');
+  });
+
+  it('prod via settings.json', async () => {
+    writeFileSync(settingsPath, '{"env": "prod"}');
+    const r = await resolve({});
+    expect(r.url).toBe('https://master.heyneo.com');
+  });
+
+  it('settings.json overrides NEO_ENVIRONMENT', async () => {
+    writeFileSync(settingsPath, '{"env": "staging"}');
+    const r = await resolve({ NEO_ENVIRONMENT: 'prod' });
+    expect(r.url).toBe('https://alpha.heyneo.com');
+  });
+
+  it('missing settings.json falls back to NEO_ENVIRONMENT', async () => {
+    const r = await resolve({ NEO_ENVIRONMENT: 'staging' });
+    expect(r.url).toBe('https://alpha.heyneo.com');
+  });
+
+  it('malformed settings.json falls back to env', async () => {
+    writeFileSync(settingsPath, '{not json');
+    const r = await resolve({ NEO_ENVIRONMENT: 'staging' });
+    expect(r.url).toBe('https://alpha.heyneo.com');
+  });
+
+  it('unknown env value falls through', async () => {
+    writeFileSync(settingsPath, '{"env": "weird"}');
+    const r = await resolve({ NEO_ENVIRONMENT: 'prod' });
+    expect(r.url).toBe('https://master.heyneo.com');
+  });
+
+  it('default is prod .com when nothing is set', async () => {
+    const r = await resolve({});
+    expect(r.url).toBe('https://master.heyneo.com');
+  });
+
+  it('NEO_API_URL used only when settings + NEO_ENVIRONMENT unset', async () => {
+    const r = await resolve({ NEO_API_URL: 'https://custom.example.com' });
+    expect(r.url).toBe('https://custom.example.com');
+  });
+
+  it('settings.json beats NEO_API_URL', async () => {
+    writeFileSync(settingsPath, '{"env": "staging"}');
+    const r = await resolve({ NEO_API_URL: 'https://custom.example.com' });
+    expect(r.url).toBe('https://alpha.heyneo.com');
+  });
+});
