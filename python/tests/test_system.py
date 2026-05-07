@@ -4327,5 +4327,43 @@ class TestSharedDeploymentIdAtomic(unittest.TestCase):
         self.assertEqual(get_or_create_deployment_id(""), existing)
 
 
+class TestListTasksMixedTimestamps(unittest.TestCase):
+    """Regression for ``_list_tasks`` crashing on int/str mix in updated_at.
+
+    The thread-workspaces file can carry ISO8601 strings (Python daemon) and
+    Unix-seconds ints (npm daemon) on the same machine. A naive sort then
+    blows up with ``TypeError: '<' not supported between instances of 'int' and 'str'``.
+    """
+
+    def test_sort_key_handles_int_str_and_empty(self):
+        from neo_mcp.server import _updated_at_sort_key
+        # Mixed values must all coerce to a comparable float.
+        values = [1719938400, "2026-05-07T09:38:22", "", None, 1720000000.5, "garbage"]
+        keys = [_updated_at_sort_key(v) for v in values]
+        # No crash, no exceptions.
+        self.assertTrue(all(isinstance(k, float) for k in keys))
+        # int/float and parseable string come back > 0; junk → 0.
+        self.assertGreater(keys[0], 0)
+        self.assertGreater(keys[1], 0)
+        self.assertEqual(keys[2], 0.0)
+        self.assertEqual(keys[3], 0.0)
+        self.assertGreater(keys[4], 0)
+        self.assertEqual(keys[5], 0.0)
+
+    def test_sort_does_not_crash_on_mixed_list(self):
+        from neo_mcp.server import _updated_at_sort_key
+        items = [
+            {"updated_at": 1719938400},
+            {"updated_at": "2026-05-07T09:38:22"},
+            {"updated_at": ""},
+        ]
+        # The line that previously crashed.
+        ordered = sorted(items, key=lambda t: _updated_at_sort_key(t["updated_at"]), reverse=True)
+        self.assertEqual(len(ordered), 3)
+        # Latest should sort first — 2026-05 > 2024-07 (epoch 1719938400) > empty
+        self.assertEqual(ordered[0]["updated_at"], "2026-05-07T09:38:22")
+        self.assertEqual(ordered[-1]["updated_at"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1034,9 +1034,32 @@ async def _list_tasks(client: BackendClient) -> dict:
     results = await asyncio.gather(
         *[fetch_status(tid, ws) for tid, ws in workspaces.items()]
     )
-    # Sort newest-first by updated_at (ISO string comparison works correctly)
-    tasks = sorted(results, key=lambda t: t["updated_at"], reverse=True)
+    # Sort newest-first. updated_at can be either an ISO8601 string (Python
+    # daemon format) or a Unix-seconds int (npm daemon format) — both can
+    # appear in the same file when both daemons have run on this machine.
+    # Normalise to a float so sorted() doesn't crash on mixed types.
+    tasks = sorted(results, key=lambda t: _updated_at_sort_key(t["updated_at"]), reverse=True)
     return {"tasks": tasks, "count": len(tasks)}
+
+
+def _updated_at_sort_key(value: Any) -> float:
+    """Coerce an `updated_at` value to a float (seconds since epoch) for sorting.
+
+    Accepts: Unix-seconds int/float, ISO8601 string, empty/missing.
+    Returns 0.0 for unparseable input so those entries sort last.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value:
+        try:
+            from datetime import datetime
+            # Python's fromisoformat accepts ...Z in 3.11+ via .replace, but be
+            # defensive: strip a trailing Z and treat as UTC.
+            s = value.rstrip("Z")
+            return datetime.fromisoformat(s).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
