@@ -1,10 +1,10 @@
 # neo-mcp (npm)
 
-Node.js MCP server for [Neo](https://heyneo.so) — submit AI/ML tasks, poll status, read output, and control task lifecycle from any AI editor. No Python required.
+Node.js MCP server for [Neo](https://heyneo.com) — submit AI/ML tasks, poll status, read output, and control task lifecycle from any AI editor. No Python required.
 
 Install it, set your API key, register with your editor — that's it. Everything else is handled automatically.
 
-Get your API key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.
+Get your API key at [heyneo.com/dashboard](https://heyneo.com/dashboard?section=settings#access-keys) → Settings → API Keys.
 
 ---
 
@@ -194,7 +194,7 @@ Restart Windsurf after editing.
 | `neo_test_integration` | Call the provider's API to confirm a stored key is still valid. |
 | `neo_remove_integration` | Delete a stored key from this machine. |
 
-> **Integration tools** store credentials locally (file `0o600` under `~/.neo/integrations/`, or OS keyring with `NEO_INTEGRATIONS_BACKEND=keyring`). Keys never leave your machine. See the full guide at [docs/INTEGRATIONS.md](https://github.com/heyneo/neo-mcp/blob/main/docs/INTEGRATIONS.md).
+> **Integration tools** store credentials locally (file `0o600` under `~/.neo/integrations/`, or OS keyring with `NEO_INTEGRATIONS_BACKEND=keyring`). Keys never leave your machine. See the full guide at [docs/INTEGRATIONS.md](https://github.com/NeoAIResearch/neo-mcp/blob/main/docs/INTEGRATIONS.md).
 
 ---
 
@@ -202,7 +202,7 @@ Restart Windsurf after editing.
 
 | Variable | Required | Description |
 |---|---|---|
-| `NEO_SECRET_KEY` | **Yes** | Your Neo API key (`sk-v1-...`) from [app.heyneo.so](https://app.heyneo.so) |
+| `NEO_SECRET_KEY` | **Yes** | Your Neo API key (`sk-v1-...`) from [heyneo.com/dashboard](https://heyneo.com/dashboard?section=settings#access-keys) |
 | `NEO_DEPLOYMENT_ID` | No | Pin a specific deployment UUID (auto-generated and persisted by default) |
 
 ---
@@ -212,7 +212,7 @@ Restart Windsurf after editing.
 | Symptom | Fix |
 |---|---|
 | Tools don't appear after registering | Open a **new session** — MCP tools load at session start, not mid-session |
-| `Invalid API key` (401) | Re-check your key at app.heyneo.so → Settings → API Keys |
+| `Invalid API key` (401) | Re-check your key at heyneo.com/dashboard → Settings → API Keys |
 | `Trial or quota ended` (403) | Top up at the Neo dashboard |
 | Task submitted but no files written | Ensure `NEO_SECRET_KEY` is set correctly and the project is open in your editor |
 | Status stuck on RUNNING | Call `neo_task_status` to check current progress |

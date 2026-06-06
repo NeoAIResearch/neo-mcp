@@ -268,7 +268,7 @@ The MCP server also exposes four local-only tools for managing user API keys:
 | `neo_test_integration` | Verify a stored key still works. |
 | `neo_remove_integration` | Delete a stored key. |
 
-Wire them into your agent's MCP server tools the same way as the task tools; `neo_add_integration` takes `{ provider, credentials }`, the others take `{ provider }`. Full behavioural spec: [docs/INTEGRATIONS.md](https://github.com/heyneo/neo-mcp/blob/main/docs/INTEGRATIONS.md).
+Wire them into your agent's MCP server tools the same way as the task tools; `neo_add_integration` takes `{ provider, credentials }`, the others take `{ provider }`. Full behavioural spec: [docs/INTEGRATIONS.md](https://github.com/NeoAIResearch/neo-mcp/blob/main/docs/INTEGRATIONS.md).
 
 ---
 
@@ -288,4 +288,4 @@ If Neo starts drifting from the user's intent mid-run, prefer `neo_send_feedback
   1. **Neo VS Code/Cursor extension** — handles everything automatically, zero setup
   2. **Agent auto-start** — agents with terminal access run `npx --yes neo-mcp-daemon /workspace &` automatically; user clicks Allow once
 - Files land in the `workspace` passed to `neo_submit_task` — infer from current project directory.
-- Get your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.
+- Get your key at [heyneo.com/dashboard](https://heyneo.com/dashboard?section=settings#access-keys) → Settings → API Keys.

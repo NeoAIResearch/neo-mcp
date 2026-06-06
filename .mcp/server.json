@@ -1,16 +1,42 @@
 {
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.NeoAIResearch/neo-mcp",
-  "description": "AI and ML engineering MCP server for Neo. Submit tasks, monitor execution, retrieve outputs, and access AI engineering workflows through the Model Context Protocol.",
+  "title": "Neo — AI/ML Engineering",
+  "description": "AI/ML engineering MCP server for Neo — submit tasks, track execution, and retrieve outputs.",
   "version": "0.5.4",
+  "websiteUrl": "https://heyneo.com",
   "repository": {
     "url": "https://github.com/NeoAIResearch/neo-mcp",
-    "source": "github"
+    "source": "github",
+    "subfolder": "python"
   },
   "packages": [
     {
-      "registry_name": "pypi",
-      "name": "neo-mcp",
-      "version": "0.5.4"
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "neo-mcp",
+      "version": "0.5.4",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "NEO_SECRET_KEY",
+          "description": "Your Neo API secret key (starts with sk-v1-). Get one at https://heyneo.com.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "NEO_ENVIRONMENT",
+          "description": "Neo backend environment: 'production' (default) or 'staging'.",
+          "default": "production"
+        },
+        {
+          "name": "NEO_WORKSPACE_DIR",
+          "description": "Project root where Neo tasks read and write files. Must be the git/project root."
+        }
+      ]
     }
   ]
 }

@@ -1,0 +1,86 @@
+{
+  "manifest_version": "0.4",
+  "name": "neo-mcp",
+  "display_name": "Neo — AI/ML Engineering",
+  "version": "0.5.4",
+  "description": "Submit AI/ML engineering tasks to Neo, monitor execution, retrieve outputs, and manage third-party credentials — all from your editor.",
+  "long_description": "Neo is an autonomous AI engineer for ML, LLM, GenAI and data workflows. This MCP server lets an assistant submit tasks to Neo, poll their status, stream back results, control task lifecycle (pause/resume/stop), and register third-party credentials (GitHub, HuggingFace, Anthropic, OpenRouter, OpenAI, AWS S3, Weights & Biases, Kaggle) so Neo tasks inherit them automatically. A local daemon writes the resulting code, models, metrics, and reports straight into your repo — execution happens on your machine.",
+  "author": {
+    "name": "Neo AI Research",
+    "url": "https://heyneo.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NeoAIResearch/neo-mcp"
+  },
+  "homepage": "https://heyneo.com",
+  "documentation": "https://docs.heyneo.com/neo-mcp",
+  "support": "https://github.com/NeoAIResearch/neo-mcp/issues",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai",
+    "machine-learning",
+    "llm",
+    "agents",
+    "neo"
+  ],
+  "icon": "icon.png",
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.11,<4.0"
+    }
+  },
+  "server": {
+    "type": "uv",
+    "entry_point": "src/neo_mcp/__main__.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "python", "-m", "neo_mcp"],
+      "env": {
+        "NEO_SECRET_KEY": "${user_config.neo_secret_key}",
+        "NEO_ENVIRONMENT": "${user_config.neo_environment}",
+        "NEO_WORKSPACE_DIR": "${user_config.workspace_directory}"
+      }
+    }
+  },
+  "user_config": {
+    "neo_secret_key": {
+      "type": "string",
+      "title": "Neo Secret Key",
+      "description": "Your Neo API secret key (starts with sk-v1-). Get one at https://heyneo.com.",
+      "sensitive": true,
+      "required": true
+    },
+    "workspace_directory": {
+      "type": "directory",
+      "title": "Workspace Directory",
+      "description": "Project root where Neo reads and writes files. Pick your git/project root — not a subdirectory, and not your home folder.",
+      "required": true
+    },
+    "neo_environment": {
+      "type": "string",
+      "title": "Environment",
+      "description": "Neo backend environment: 'production' (default) or 'staging'.",
+      "default": "production",
+      "required": false
+    }
+  },
+  "tools": [
+    { "name": "neo_submit_task", "description": "Submit an AI/ML engineering task to Neo" },
+    { "name": "neo_task_status", "description": "Check the status of a running task" },
+    { "name": "neo_get_messages", "description": "Retrieve messages and output from a task" },
+    { "name": "neo_send_feedback", "description": "Send feedback or a follow-up to a running task" },
+    { "name": "neo_pause_task", "description": "Pause a running task" },
+    { "name": "neo_resume_task", "description": "Resume a paused task" },
+    { "name": "neo_stop_task", "description": "Stop and clean up a task" },
+    { "name": "neo_list_tasks", "description": "List recent tasks" },
+    { "name": "neo_list_integrations", "description": "List configured third-party credentials (names only)" },
+    { "name": "neo_add_integration", "description": "Register a third-party credential" },
+    { "name": "neo_remove_integration", "description": "Remove a stored credential" },
+    { "name": "neo_test_integration", "description": "Test a stored credential against its provider" }
+  ],
+  "tools_generated": false
+}

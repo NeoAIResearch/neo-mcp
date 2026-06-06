@@ -18,7 +18,7 @@ npm install -g neo-mcp   # copies skills to ~/.claude/skills/ automatically
 
 **Install manually** (pip or manual update):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/heyneo/neo-mcp/main/skills/claude-code/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/NeoAIResearch/neo-mcp/main/skills/claude-code/SKILL.md \
   -o ~/.claude/skills/neo.md
 ```
 
@@ -38,6 +38,6 @@ All integrations hit: `https://mcpserver.heyneo.com/mcp` with `Authorization: Be
 
 ---
 
-Get your key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.
+Get your key at [heyneo.com/dashboard](https://heyneo.com/dashboard?section=settings#access-keys) → Settings → API Keys.
 
 **Full authoring guide:** [`docs/SKILLS.md`](../docs/SKILLS.md)

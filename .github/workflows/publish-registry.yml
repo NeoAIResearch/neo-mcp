@@ -1,0 +1,46 @@
+name: Publish to MCP Registry
+
+# Publishes .mcp/server.json to registry.modelcontextprotocol.io on a v* tag.
+# Auth uses GitHub OIDC (no secrets) — valid because this repo lives under the
+# NeoAIResearch org, which owns the io.github.NeoAIResearch/* namespace.
+#
+# The registry validates that the referenced PyPI package + version exists and
+# carries the `mcp-name: io.github.NeoAIResearch/neo-mcp` token, so this job
+# first waits for the matching PyPI release (published by publish-pypi.yml).
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish-registry:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for github-oidc login
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for the matching PyPI release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Waiting for neo-mcp==$VERSION on PyPI..."
+          for i in $(seq 1 40); do
+            if curl -sf "https://pypi.org/pypi/neo-mcp/$VERSION/json" >/dev/null; then
+              echo "neo-mcp $VERSION is live on PyPI."; exit 0
+            fi
+            echo "  not yet ($i/40); sleeping 15s"; sleep 15
+          done
+          echo "Timed out waiting for neo-mcp $VERSION on PyPI"; exit 1
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar xz mcp-publisher
+
+      - name: Login (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json
+        run: ./mcp-publisher publish .mcp/server.json

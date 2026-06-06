@@ -1,6 +1,6 @@
 # Neo MCP — Client Setup Guide
 
-Get your secret key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.
+Get your secret key at [heyneo.com/dashboard](https://heyneo.com/dashboard?section=settings#access-keys) → Settings → API Keys.
 
 ---
 
@@ -293,7 +293,7 @@ neo-mcp setup --secret-key sk-v1-... --editor claude --scope project
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Invalid API key` (401) | Wrong or missing secret key | Re-check your key at app.heyneo.so → Settings → API Keys |
+| `Invalid API key` (401) | Wrong or missing secret key | Re-check your key at heyneo.com/dashboard → Settings → API Keys |
 | `Trial or quota ended` (403) | Out of credits | Top up at the Neo dashboard |
 | `neo-mcp` command not found | Install incomplete or PATH issue | Re-run `pip install neo-mcp`; verify with `which neo-mcp` |
 | Tools don't appear after restart | Config path wrong or JSON syntax error | Validate the JSON and check the file location for your editor |
