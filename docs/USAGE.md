@@ -4,7 +4,7 @@
 
 ## Prerequisites
 
-- Neo account with a secret key (`sk-v1-...`) — from [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys
+- Neo account with a secret key (`sk-v1-...`) — from [heyneo.com/dashboard](https://heyneo.com/dashboard?section=settings#access-keys) → Settings → API Keys
 - Neo MCP connected to your editor — see [CLIENTS.md](CLIENTS.md) for setup instructions
 - For local task execution: either the Neo VS Code/Cursor extension (zero setup), or the npm daemon (`npx --yes neo-mcp-daemon /workspace &`) — if no daemon is found your agent will offer to start one automatically
 

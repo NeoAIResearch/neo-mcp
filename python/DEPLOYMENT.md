@@ -152,7 +152,7 @@ docker build -t neo-mcp .
 | `NEO_WORKSPACE_DIR` | No | Override the working directory. Defaults to `/tmp/neo-workspace` in the image (constrains any writes to a throw-away temp dir). |
 | `NEO_DEPLOYMENT_ID` | No | Pin a specific VS Code extension sandbox ID |
 | `NEO_READ_ONLY` | No | `true` = expose only status/plan/message tools |
-| `NEO_PUBLIC_URL` | No | Base URL for OAuth discovery payloads (default `https://mcp.heyneo.so`) |
+| `NEO_PUBLIC_URL` | No | Base URL for OAuth discovery payloads (default `https://mcp.heyneo.com`) |
 
 ---
 

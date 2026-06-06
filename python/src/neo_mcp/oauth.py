@@ -59,7 +59,7 @@ async def oauth_protected_resource(_request: Any) -> Any:
         "authorization_servers": [_BASE_URL],
         "bearer_methods_supported": ["header"],
         "scopes_supported": ["neo:tasks"],
-        "resource_documentation": "https://github.com/NeoResearchAI/MCPServer",
+        "resource_documentation": "https://github.com/NeoAIResearch/neo-mcp",
     })
 
 

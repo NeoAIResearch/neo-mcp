@@ -163,6 +163,25 @@ def _remove_deployment_pid(deployment_id: str) -> None:
     except OSError:
         pass
 
+
+def _resolve_deployment_id(secret_key: Optional[str]) -> str:
+    """Best-effort deployment ID for lifecycle commands (stop/restart/uninstall).
+
+    Prefer the canonical resolution when a secret is present; otherwise fall
+    back to the persisted standalone UUID so teardown works without creds.
+    """
+    if secret_key:
+        try:
+            return get_or_create_deployment_id(secret_key)
+        except Exception:  # noqa: BLE001
+            pass
+    if STANDALONE_UUID_FILE.exists():
+        try:
+            return STANDALONE_UUID_FILE.read_text().strip()
+        except OSError:
+            pass
+    return ""
+
 def _pid_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -1191,40 +1210,41 @@ async def _test_integration(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 async def run(secret_key: str, workspace: str) -> None:
-    """Build MCP server, start poller, run stdio transport until EOF."""
+    """Run the MCP stdio server as a THIN CLIENT — it does NOT poll inline.
+
+    This process is spawned by the interactive editor (Claude Code / Cursor / …)
+    and shares its controlling terminal and process group. Running the backend
+    poll loop here would tie it to that interactive session: a Ctrl-Z (SIGTSTP)
+    on the editor, or an SSH drop, suspends/kills the whole process group and
+    silently stops the sandbox (the 2026-06-02 outage — see service.py). So the
+    poll loop lives in a *detached* daemon instead; here we only ensure such a
+    daemon exists, then serve MCP tools over stdio.
+    """
     logger.info("neo-mcp %s starting (workspace=%s)", _package_version(), workspace)
     asyncio.create_task(_check_for_pypi_update(), name="pypi-update-check")
 
-    server, client, poller = build_server(secret_key=secret_key, workspace=workspace)
+    server, client, _poller = build_server(secret_key=secret_key, workspace=workspace)
 
-    pid = os.getpid()
-    poller_task: Optional[asyncio.Task] = None
     deployment_id = get_or_create_deployment_id(secret_key)
     if _poller_already_running(deployment_id):
-        logger.warning(
-            "Another daemon is already running for deployment %s. "
-            "MCP server will start without a local poller.",
+        logger.info(
+            "Backend daemon already running for deployment %s — serving as thin client.",
             deployment_id,
         )
     else:
-        _write_lock(pid)
-        DAEMON_DIR.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text(str(pid))
-        _write_deployment_pid(deployment_id, pid)
-        poller_task = asyncio.create_task(poller.run(), name="backend-poller")
-        logger.info(
-            "Poller started (pid=%d deployment=%s)",
-            pid,
-            deployment_id,
-        )
+        from .service import spawn_detached_daemon
+        if spawn_detached_daemon(secret_key, deployment_id, workspace=workspace):
+            logger.info("Spawned detached backend daemon for deployment %s.", deployment_id)
+        else:
+            logger.warning(
+                "Could not spawn a detached backend daemon for deployment %s — sandbox "
+                "command execution may be unavailable. Start one with "
+                "`neo-mcp install-service` (preferred) or `neo-mcp daemon`.",
+                deployment_id,
+            )
 
     def _shutdown(signum: int, frame: Any) -> None:
-        logger.info("Received signal %d — shutting down", signum)
-        if poller_task and not poller_task.done():
-            poller_task.cancel()
-        poller.stop()
-        _remove_deployment_pid(deployment_id)
-        _remove_lock()
+        logger.info("Received signal %d — MCP stdio server shutting down", signum)
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -1238,16 +1258,8 @@ async def run(secret_key: str, workspace: str) -> None:
                 server.create_initialization_options(),
             )
     finally:
-        if poller_task and not poller_task.done():
-            poller_task.cancel()
-            try:
-                await poller_task
-            except asyncio.CancelledError:
-                pass
         await client.aclose()
-        _remove_deployment_pid(deployment_id)
-        _remove_lock()
-        logger.info("Server shut down cleanly")
+        logger.info("MCP stdio server shut down cleanly")
 
 
 def _setup_logging() -> None:
@@ -1609,7 +1621,10 @@ def main() -> None:
     _install_skill_silently()
 
     args = sys.argv[1:]
-    known = {"setup", "doctor", "status", "list", "logs", "tail", "self-test", "daemon"}
+    known = {
+        "setup", "doctor", "status", "list", "logs", "tail", "self-test", "daemon",
+        "stop", "restart", "uninstall", "install-service",
+    }
 
     if args and args[0] == "setup":
         from .setup import run_setup
@@ -1686,6 +1701,33 @@ def main() -> None:
             sys.exit(1)
         anyio.run(run_daemon, secret_key, workspace, dep_override)
         return
+
+    if args and args[0] == "stop":
+        from . import service
+        n = service.stop_daemon(_resolve_deployment_id(secret_key))
+        print(f"Stopped {n} daemon process(es).")
+        return
+
+    if args and args[0] == "restart":
+        from . import service
+        sys.exit(service.restart(secret_key or "", _resolve_deployment_id(secret_key)))
+
+    if args and args[0] == "uninstall":
+        from . import service
+        purge = "--purge" in args[1:]
+        sys.exit(service.uninstall(_resolve_deployment_id(secret_key), purge=purge))
+
+    if args and args[0] == "install-service":
+        if not secret_key:
+            sys.stderr.write("Error: NEO_SECRET_KEY is required for install-service.\n")
+            sys.exit(1)
+        from . import service
+        svc_args = args[1:]
+        ws: Optional[str] = None
+        for i, a in enumerate(svc_args):
+            if a == "--workspace" and i + 1 < len(svc_args):
+                ws = os.path.abspath(svc_args[i + 1])
+        sys.exit(service.install_service(secret_key, get_or_create_deployment_id(secret_key), ws))
 
     # Default mode: stdio MCP server (legacy behavior preserved).
     # First non-command positional argument is treated as workspace.

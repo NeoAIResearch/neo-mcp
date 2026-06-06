@@ -1,0 +1,38 @@
+# Smithery configuration — https://smithery.ai/docs
+# stdio install: Smithery launches the published PyPI package locally via uvx.
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - neoSecretKey
+    properties:
+      neoSecretKey:
+        type: string
+        title: Neo Secret Key
+        description: Your Neo API secret key (starts with sk-v1-). Get one at https://heyneo.com.
+      neoEnvironment:
+        type: string
+        title: Environment
+        description: "Neo backend environment: 'production' (default) or 'staging'."
+        default: production
+        enum:
+          - production
+          - staging
+      neoWorkspaceDir:
+        type: string
+        title: Workspace Directory
+        description: Project root where Neo tasks read and write files. Must be the git/project root.
+  commandFunction: |-
+    (config) => ({
+      command: 'uvx',
+      args: ['neo-mcp'],
+      env: {
+        NEO_SECRET_KEY: config.neoSecretKey,
+        NEO_ENVIRONMENT: config.neoEnvironment || 'production',
+        ...(config.neoWorkspaceDir ? { NEO_WORKSPACE_DIR: config.neoWorkspaceDir } : {})
+      }
+    })
+  exampleConfig:
+    neoSecretKey: sk-v1-your-secret-key
+    neoEnvironment: production

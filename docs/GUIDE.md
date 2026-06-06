@@ -4,7 +4,7 @@ Neo MCP connects your AI editor to Neo's remote execution backend. Submit AI/ML 
 
 **All you need:** a Neo API key and either Python or Node.js.
 
-Get your API key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys.
+Get your API key at [heyneo.com/dashboard](https://heyneo.com/dashboard?section=settings#access-keys) → Settings → API Keys.
 
 ---
 
@@ -466,7 +466,7 @@ claude mcp logs neo
 
 | Variable | Required | Description |
 |---|---|---|
-| `NEO_SECRET_KEY` | **Yes** | Your API key (`sk-v1-...`) from [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys |
+| `NEO_SECRET_KEY` | **Yes** | Your API key (`sk-v1-...`) from [heyneo.com/dashboard](https://heyneo.com/dashboard?section=settings#access-keys) → Settings → API Keys |
 | `NEO_DEPLOYMENT_ID` | No | Pin a specific daemon UUID. Auto-generated and persisted to `~/.neo/daemon/standalone_deployment_id` by default. |
 | `NEO_WORKSPACE_DIR` | No | Override the default workspace directory (useful in Docker or CI). |
 | `NEO_READ_ONLY` | No | Set to `true` to expose only status/message tools — disables submit, stop, and pause. |
@@ -482,7 +482,7 @@ claude mcp logs neo
 | `✗ Failed to connect` in `claude mcp list` | MCP server crashing on startup | Run `claude mcp logs neo` to see the error. Most common cause: `NEO_SECRET_KEY` not set. |
 | Neo tools don't appear after adding the server | Session not restarted | Open a **new session** — tools load at session start, not mid-session |
 | `neo` being confused with Neovim or a CLI tool | MCP tools not loaded | The MCP server isn't connecting — check `claude mcp list` and `claude mcp logs neo` |
-| `Invalid API key` (401) | Wrong or expired key | Re-check your key at app.heyneo.so → Settings → API Keys |
+| `Invalid API key` (401) | Wrong or expired key | Re-check your key at heyneo.com/dashboard → Settings → API Keys |
 | `Trial or quota ended` (403) | Out of credits | Top up at the Neo dashboard |
 | `No healthy deployments available` (400) | No daemon running | Daemon failed to auto-start — re-run `neo-mcp` (pip) or `neo-mcp-daemon --mcp` (npm) and try again |
 | Task submitted but no files written locally | Daemon stopped or crashed | Check `neo-mcp status` — restart if not running |

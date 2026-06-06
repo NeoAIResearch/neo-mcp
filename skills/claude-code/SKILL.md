@@ -43,24 +43,28 @@ Always follow this sequence. Do not skip steps.
 
 ---
 
+## One task per workspace — merge, never split
+
+**Bundle all related work for a project into a SINGLE `neo_submit_task`, and never run more than one Neo task at a time in the same workspace/project directory.**
+
+- If a request has several parts (e.g. "build the API, add tests, and write a Dockerfile"), put the entire scope in ONE task prompt — Neo handles multi-step work within a single thread. Splitting it into back-to-back submissions in the same directory makes the tasks collide on the shared workspace (and `.tmp`), duplicate effort, and stay blind to each other's state.
+- If a task is already running for the workspace and the user adds or changes scope, extend it with `neo_send_feedback` — do NOT submit a second task.
+- Submit a separate task only for genuinely independent work in a *different* project/workspace.
+
+---
+
 ## Daemon auto-start — your responsibility
 
-If `neo_submit_task` returns a `DAEMON_NOT_RUNNING` message, **start the daemon automatically and retry without involving the user**:
+The MCP server already auto-spawns a **detached** daemon on startup, so this should be rare. If `neo_submit_task` still returns `DAEMON_NOT_RUNNING`, start a **detached** daemon yourself and retry — without involving the user:
 
 ```bash
-# Primary: npm daemon (auto-starts silently)
-NEO_SECRET_KEY=$NEO_SECRET_KEY npx --yes neo-mcp-daemon /path/to/workspace &
+# pip — detached, immune to terminal/Ctrl-Z:
+setsid neo-mcp daemon >/dev/null 2>&1 < /dev/null &
+# npm equivalent:
+setsid npx --yes neo-mcp-daemon /path/to/workspace >/dev/null 2>&1 < /dev/null &
 ```
 
-If npx is unavailable, Python fallback:
-
-```bash
-neo-mcp daemon
-```
-
-Then immediately retry `neo_submit_task`. Do not hand this back to the user — handle it yourself.
-
-> The MCP server attempts to auto-start the daemon on first submission. This message means it failed — restart it and proceed.
+**Never** run `neo-mcp daemon` in the foreground (it blocks forever) or with a bare `&` (it stays attached to your shell session and gets suspended/killed when the editor is backgrounded or its session ends). For a permanent, reboot-surviving daemon the user can run `neo-mcp install-service`. Then immediately retry `neo_submit_task` — handle this yourself, don't hand it back to the user.
 
 ---
 
