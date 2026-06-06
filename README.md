@@ -1,5 +1,7 @@
 # Neo MCP
 
+<!-- mcp-name: io.github.NeoAIResearch/neo-mcp -->
+
 Connect your AI editor to Neo's remote execution backend. Describe an AI/ML task in plain language — Neo trains the model, builds the pipeline, or runs the workload on its backend, then writes all output files directly to your local machine.
 
 Works with Claude Code, Cursor, Windsurf, VS Code (GitHub Copilot), Zed, Continue.dev, and OpenAI Codex CLI.
