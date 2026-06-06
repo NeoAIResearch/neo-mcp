@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.com`, or `https://alpha.heyneo.com` when staging is selected via `~/.neo/settings.json` `{"env": "staging"}` or `NEO_ENVIRONMENT=staging`). It exposes 12 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, control task lifecycle, and register third-party credentials (GitHub, HuggingFace, Anthropic, OpenRouter, OpenAI, AWS S3, Weights & Biases, Kaggle) — via stdio transport.
 
-Current pip version: **0.5.4**. Current npm version: **1.1.27**.
+Current pip version: **0.5.5**. Current npm version: **1.1.27**.
 
 ## Project structure
 

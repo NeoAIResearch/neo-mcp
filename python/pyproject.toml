@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neo-mcp"
-version = "0.5.4"
+version = "0.5.5"
 description = "Neo MCP server — bring Neo, the autonomous AI engineer for ML, LLM, GenAI & data workflows, into Claude Code, Cursor, Codex & other editors. Describe a task; Neo builds it and writes results to your repo."
 readme = "README.md"
 license = { text = "MIT" }
