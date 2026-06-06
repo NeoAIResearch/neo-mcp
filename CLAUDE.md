@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python MCP server that wraps the Neo ML backend (`https://master.heyneo.com`, or `https://alpha.heyneo.com` when staging is selected via `~/.neo/settings.json` `{"env": "staging"}` or `NEO_ENVIRONMENT=staging`). It exposes 12 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, control task lifecycle, and register third-party credentials (GitHub, HuggingFace, Anthropic, OpenRouter, OpenAI, AWS S3, Weights & Biases, Kaggle) — via stdio transport.
+A Python MCP server that wraps the Neo ML backend. It exposes 12 tools to Claude Code so users can submit ML/AI tasks, poll status, read output, control task lifecycle, and register third-party credentials (GitHub, HuggingFace, Anthropic, OpenRouter, OpenAI, AWS S3, Weights & Biases, Kaggle) — via stdio transport.
 
 Current pip version: **0.5.5**. Current npm version: **1.1.27**.
 
@@ -30,9 +30,7 @@ neo-mcp/
 │   │   └── test_connection.py             # connectivity smoke test (needs key)
 │   ├── scripts/start-daemon.sh     # standalone daemon launcher (bash)
 │   ├── pyproject.toml              # package metadata + entry points
-│   ├── requirements.txt            # runtime deps
-│   ├── Dockerfile                  # HTTP-mode container (used by CI → ECR)
-│   └── DEPLOYMENT.md               # Docker deployment guide
+│   └── requirements.txt            # runtime deps
 │
 ├── npm/                            # npm daemon package (neo-mcp-daemon)
 │   ├── src/
@@ -60,7 +58,9 @@ neo-mcp/
 │   └── WEB_CONNECTOR.md            # Web connector implementation notes
 │
 ├── .github/workflows/
-│   └── publish-mcp.yml             # CI: builds python/Dockerfile → ECR on push to main
+│   ├── publish-pypi.yml            # CI: publish to PyPI on v* tags
+│   ├── publish-npm.yml             # CI: publish npm daemon on npm-v* tags
+│   └── publish-registry.yml        # CI: publish to the MCP registry on v* tags
 ├── README.md                       # Top-level overview + quick start
 └── CLAUDE.md                       # This file
 ```
@@ -334,10 +334,8 @@ When adding new features to `executor.ts` or `daemon.ts` — add tests to `npm/t
 - Workspace must always be the project/git root. Subdirectories cause duplicate nested folder creation (e.g. `test_2/test_2/`) due to path remapping logic.
 - `test_server.py` tests an older monolithic server API and is no longer accurate — do not rely on it as a reference.
 
-## Docker / CI
+## CI / Releases
 
-`Dockerfile` is in `python/`. The GitHub Actions workflow at `.github/workflows/publish-mcp.yml` builds and pushes to the internal ECR registry on every push to `main`. The public Docker image (`ghcr.io/heyneo/neo-mcp-server`) is maintained separately.
-
-Docker security: container runs as non-root user (uid 1000), workspace is restricted to `/tmp/neo-workspace`.
-
-PyPI releases trigger automatically on `v*` version tags.
+PyPI releases trigger automatically on `v*` version tags (`publish-pypi.yml`), which
+also drives the MCP-registry publish (`publish-registry.yml`). The npm daemon publishes
+on `npm-v*` tags (`publish-npm.yml`).

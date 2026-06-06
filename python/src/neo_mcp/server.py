@@ -1216,7 +1216,7 @@ async def run(secret_key: str, workspace: str) -> None:
     and shares its controlling terminal and process group. Running the backend
     poll loop here would tie it to that interactive session: a Ctrl-Z (SIGTSTP)
     on the editor, or an SSH drop, suspends/kills the whole process group and
-    silently stops the sandbox (the 2026-06-02 outage — see service.py). So the
+    silently stops the sandbox (see service.py). So the
     poll loop lives in a *detached* daemon instead; here we only ensure such a
     daemon exists, then serve MCP tools over stdio.
     """
