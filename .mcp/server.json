@@ -1,0 +1,16 @@
+{
+  "name": "io.github.NeoAIResearch/neo-mcp",
+  "description": "AI and ML engineering MCP server for Neo. Submit tasks, monitor execution, retrieve outputs, and access AI engineering workflows through the Model Context Protocol.",
+  "version": "0.5.4",
+  "repository": {
+    "url": "https://github.com/NeoAIResearch/neo-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registry_name": "pypi",
+      "name": "neo-mcp",
+      "version": "0.5.4"
+    }
+  ]
+}
