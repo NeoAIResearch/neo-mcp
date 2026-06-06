@@ -4,12 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neo-mcp"
-version = "0.4.49"
-description = "MCP server for the Neo AI/ML backend — submit tasks, poll status, read output"
+version = "0.5.4"
+description = "Neo MCP server — bring Neo, the autonomous AI engineer for ML, LLM, GenAI & data workflows, into Claude Code, Cursor, Codex & other editors. Describe a task; Neo builds it and writes results to your repo."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
-keywords = ["mcp", "ai", "ml", "neo", "llm", "claude"]
+keywords = [
+    "mcp", "model-context-protocol", "mcp-server", "neo",
+    "claude-code", "cursor", "codex", "windsurf",
+    "ai", "ml", "machine-learning", "deep-learning", "data-science",
+    "llm", "generative-ai", "rag", "ai-agent", "fine-tuning",
+    "computer-vision", "pytorch", "huggingface", "anthropic",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -39,10 +45,10 @@ keyring = [
 testpaths = ["tests"]
 
 [project.urls]
-Homepage = "https://heyneo.so"
-Repository = "https://github.com/NeoResearchAI/MCPServer"
-Documentation = "https://github.com/NeoResearchAI/MCPServer/blob/main/docs/CLIENTS.md"
-"Bug Tracker" = "https://github.com/NeoResearchAI/MCPServer/issues"
+Homepage = "https://heyneo.com"
+Repository = "https://github.com/NeoAIResearch/neo-mcp"
+Documentation = "https://docs.heyneo.com/neo-mcp"
+"Bug Tracker" = "https://github.com/NeoAIResearch/neo-mcp/issues"
 
 [project.scripts]
 neo-mcp = "neo_mcp.server:main"

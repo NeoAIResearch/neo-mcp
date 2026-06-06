@@ -118,7 +118,7 @@ Then in a new session ask: *"What Neo tools do you have available?"* — should 
 | `neo-mcp: command not found` | Re-run `pip install neo-mcp`, verify with `which neo-mcp` |
 | `✗ Failed to connect` in `claude mcp list` | Run `claude mcp logs neo` — most likely `NEO_SECRET_KEY` not set |
 | Neo tools don't appear | Open a **new session** — tools load at session start |
-| `Invalid API key` (401) | Re-check key at [app.heyneo.so](https://app.heyneo.so) → Settings → API Keys |
+| `Invalid API key` (401) | Re-check key at [heyneo.com/dashboard](https://heyneo.com/dashboard?section=settings#access-keys) → Settings → API Keys |
 | `No healthy deployments available` (400) | Daemon failed to auto-start — restart the MCP server |
 | Files not written locally | Daemon stopped — check `neo-mcp status` and restart |
 

@@ -1,0 +1,7 @@
+# Excluded from the packed .mcpb (defensive — build.sh already copies a clean tree)
+.venv/
+**/__pycache__/
+**/*.pyc
+*.egg-info/
+.pytest_cache/
+uv.lock
