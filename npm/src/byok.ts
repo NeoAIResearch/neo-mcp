@@ -1,6 +1,6 @@
 /**
  * BYOK ("bring your own key") for the npm MCP server — parity with the Python
- * neo_mcp.byok package and the VS Code extension's src/llm/ modules.
+ * neo_mcp.byok package.
  *
  * A profile is a named (provider, model) pair with an API key. Profile metadata
  * (id, name, provider, model) is persisted to ~/.neo/settings.json — alongside
@@ -39,7 +39,7 @@ const BYOK_DIR = join(NEO_HOME, 'integrations');
 const PROFILES_KEY = 'byok_profiles';
 const ACTIVE_KEY = 'active_byok_profile_id';
 
-// Curated fallbacks, kept in sync with the extension's FALLBACK_MODELS.
+// Curated per-provider fallback model lists (parity with the Python package).
 export const FALLBACK_MODELS: Record<LLMProvider, string[]> = {
   anthropic: [
     'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001',
@@ -62,8 +62,7 @@ export function isSupportedProvider(p: string): p is LLMProvider {
  * Hyphenate dotted version numbers — Anthropic only (e.g. claude-opus-4.7 →
  * claude-opus-4-7). OpenAI and OpenRouter are left untouched: both have real
  * ids containing dots (gpt-4.1, anthropic/claude-opus-4.7) that hyphenation
- * would corrupt. Intentionally diverges from the extension's normalizeModelId,
- * which also hyphenates OpenAI (a latent bug for dotted OpenAI ids).
+ * would corrupt.
  */
 export function normalizeModelId(provider: LLMProvider, modelId: string): string {
   if (provider === 'anthropic') return modelId.replace(/\./g, '-');
@@ -299,7 +298,7 @@ export class ByokManager {
 }
 
 // ---------------------------------------------------------------------------
-// Credential testing — port of byokCredentialsTester.ts
+// Credential testing — validate a key/model against the provider before saving.
 // ---------------------------------------------------------------------------
 
 const TEST_TIMEOUT_MS = 22_000;
@@ -397,7 +396,7 @@ export async function testByokCredentials(
 }
 
 // ---------------------------------------------------------------------------
-// Model fetching — port of modelFetcher.ts
+// Model fetching — a provider's model list, with a curated fallback.
 // ---------------------------------------------------------------------------
 
 const OPENAI_EXCLUDE_PREFIXES = [

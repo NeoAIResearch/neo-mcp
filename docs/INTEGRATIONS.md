@@ -222,3 +222,72 @@ ANTHROPIC_API_KEY, OPENROUTER_API_KEY,
 HF_TOKEN, HUGGING_FACE_HUB_TOKEN,
 GITHUB_TOKEN, GH_TOKEN
 ```
+
+---
+
+## BYOK — running Neo's brain on your own LLM key
+
+Integrations (above) give **your tasks** API keys as environment variables.
+**BYOK** ("bring your own key") is different: it changes the LLM that powers
+**Neo's orchestrator itself** — the agent's brain that plans and writes the work.
+With a BYOK profile active, Neo runs on *your* Anthropic / OpenAI / OpenRouter
+credits instead of Neo's, by sending your key to the backend as the `x-llm-*`
+headers on task submit and feedback only.
+
+### The 30-second version
+
+1. Create a profile once, naming a provider + model + key:
+
+   > "Use my Anthropic key `sk-ant-...` with model `claude-opus-4-7` for Neo (BYOK)."
+
+   Claude calls:
+
+   ```
+   neo_add_byok_profile {
+     name: "My Opus",
+     provider: "anthropic",
+     model: "claude-opus-4-7",
+     api_key: "sk-ant-..."
+   }
+   ```
+
+   The key/model is validated against the provider before the profile is saved —
+   a bad key is rejected immediately. The profile becomes active by default.
+
+2. From then on, every `neo_submit_task` and `neo_send_feedback` runs on your key.
+
+3. Turn it off any time:
+
+   > "Stop using my own key for Neo."  → `neo_set_byok_profile { profile_id: null }`
+
+### Where your key lives
+
+- Profile metadata (name, provider, model) → `~/.neo/settings.json`.
+- The **key** → the same secure store as integrations
+  (`~/.neo/integrations/byok-<id>.env` at `0o600`, or your OS keyring when
+  `NEO_INTEGRATIONS_BACKEND=keyring`). It is **never** written to settings.json
+  and never shown back to you (tools return a masked hint like `••••••••WXYZ`).
+
+### Zero-config via environment variables
+
+For headless / CI setups you can skip profiles entirely and set:
+
+```bash
+export NEO_BYOK_PROVIDER=anthropic
+export NEO_BYOK_MODEL=claude-opus-4-7
+export NEO_BYOK_KEY=sk-ant-...
+```
+
+An active profile always takes precedence over these env vars.
+
+### BYOK tools
+
+```
+neo_list_byok_profiles                                   # list + show active (masked keys)
+neo_add_byok_profile  { name, provider, model, api_key } # validate + save (active by default)
+neo_set_byok_profile  { profile_id | null }              # switch active, or null to clear
+neo_remove_byok_profile { profile_id }                   # delete profile + key
+neo_list_byok_models  { provider, api_key? }             # discover valid model ids
+```
+
+Providers: `anthropic`, `openai`, `openrouter`.

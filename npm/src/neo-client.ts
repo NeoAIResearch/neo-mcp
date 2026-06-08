@@ -70,8 +70,8 @@ export interface ByokProviderRow {
 }
 
 export async function fetchByokProviders(token: string): Promise<ByokProviderRow[]> {
-  // GET /v2/thread/fetch-byok-providers — BYOK provider/model catalog. Mirrors
-  // V2Client.fetchByokProviders in the extension and the Python client.
+  // GET /v2/thread/fetch-byok-providers — BYOK provider/model catalog
+  // (parity with the Python client).
   const res = await fetchWithTimeout(`${NEO_API_URL}/v2/thread/fetch-byok-providers`, {
     headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
   });

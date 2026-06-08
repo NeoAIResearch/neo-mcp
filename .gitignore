@@ -12,6 +12,7 @@ test_project/
 neo_artifacts/
 node_modules/
 *.pid
+CLAUDE.md
 
 # Local build artifacts
 neo-agent/neo-agent

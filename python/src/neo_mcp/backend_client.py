@@ -147,6 +147,7 @@ class BackendClient:
         deployment_id: str,
         workspace: Optional[str] = None,
         wrapper_hint: Optional[str] = None,
+        byok_headers: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         """POST /v2/thread/init-chat-direct — submit a new task.
 
@@ -156,8 +157,13 @@ class BackendClient:
         ``BackendPoller.register_thread_wrapper`` so wrapper-stripping is in
         place before the very first command arrives. Backends that don't know
         the field ignore it — this is forward-compat only.
+
+        ``byok_headers`` (optional) carries the ``x-llm-*`` BYOK headers so the
+        backend runs the orchestrator on the user's own LLM key. Attached to
+        exactly init-chat-direct and feedback.
         """
         url = f"{self._base_url}/v2/thread/init-chat-direct"
+        headers = {**self._headers(), **(byok_headers or {})}
         payload: dict[str, Any] = {
             "message": message,
             "deployment_id": deployment_id,
@@ -177,7 +183,7 @@ class BackendClient:
         last_exc: Optional[Exception] = None
         for attempt in range(2):
             try:
-                resp = await self._http.post(url, json=payload, headers=self._headers())
+                resp = await self._http.post(url, json=payload, headers=headers)
                 last_exc = None
                 break
             except (httpx.RemoteProtocolError, httpx.TimeoutException) as exc:
@@ -265,13 +271,23 @@ class BackendClient:
 
         return resp.json()
 
-    async def send_feedback(self, thread_id: str, message: str) -> None:
-        """POST /v2/thread/feedback/{thread_id}"""
+    async def send_feedback(
+        self,
+        thread_id: str,
+        message: str,
+        byok_headers: Optional[dict[str, str]] = None,
+    ) -> None:
+        """POST /v2/thread/feedback/{thread_id}
+
+        ``byok_headers`` (optional) carries the ``x-llm-*`` BYOK headers — same
+        as init_chat — so feedback turns also run on the user's own LLM key.
+        """
         url = f"{self._base_url}/v2/thread/feedback/{thread_id}"
+        headers = {**self._headers(), **(byok_headers or {})}
 
         try:
             resp = await self._http.post(
-                url, json={"input": message}, headers=self._headers()
+                url, json={"input": message}, headers=headers
             )
         except httpx.TimeoutException as exc:
             raise RuntimeError(f"send_feedback timed out: {exc}") from exc
@@ -317,3 +333,24 @@ class BackendClient:
         if not resp.is_success:
             body = resp.json() if resp.content else {}
             raise RuntimeError(body.get("error") or f"HTTP {resp.status_code}")
+
+    async def fetch_byok_providers(self) -> list[dict[str, Any]]:
+        """GET /v2/thread/fetch-byok-providers — BYOK provider/model catalog.
+
+        Each row is
+        ``{provider, supported_models, base_url?, test_url?}``. Returns [] on a
+        non-list body so callers can fall back to the hardcoded model lists.
+        """
+        url = f"{self._base_url}/v2/thread/fetch-byok-providers"
+        try:
+            resp = await self._http.get(url, headers=self._headers())
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"fetch_byok_providers network error: {exc}") from exc
+
+        if resp.status_code == 401:
+            raise RuntimeError("UNAUTHORIZED")
+        if not resp.is_success:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        return data if isinstance(data, list) else []

@@ -40,6 +40,13 @@ from .system_info import build_context_prefix
 from .auth import derive_deployment_id, get_or_create_deployment_id, get_secret_key
 from .backend_client import BackendClient
 from .backend_poller import BackendPoller
+from .byok import (
+    ByokError,
+    ByokProfileManager,
+    PROVIDERS as BYOK_PROVIDERS,
+    fetch_models as fetch_byok_models,
+    test_byok_credentials,
+)
 from .integrations import IntegrationManager, PROVIDERS, ValidationError
 from .integrations.secret_store import get_secret_store
 from .job_manager import JobManager
@@ -321,6 +328,7 @@ def build_server(
     thread_wrappers = _load_thread_wrappers()
 
     client = BackendClient(auth_token=secret_key)
+    byok = ByokProfileManager()
     job_manager = JobManager()
     handlers = ActionHandlers(
         job_manager=job_manager,
@@ -766,6 +774,164 @@ def build_server(
                     openWorldHint=True,
                 ),
             ),
+            types.Tool(
+                name="neo_list_byok_profiles",
+                description=(
+                    "List the configured BYOK ('bring your own key') LLM profiles "
+                    "and show which one is active. A BYOK profile makes Neo run its "
+                    "orchestrator on the USER's own LLM key (Anthropic / OpenAI / "
+                    "OpenRouter) instead of Neo's credits. Returns profile id, name, "
+                    "provider, model, a masked key hint, and the active flag. "
+                    "Never returns the raw key."
+                ),
+                inputSchema={"type": "object", "properties": {}, "required": []},
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+            ),
+            types.Tool(
+                name="neo_add_byok_profile",
+                description=(
+                    "USE THIS TOOL when the user wants Neo to run on their own LLM "
+                    "key — phrasings like \"use my Anthropic key for Neo's brain\", "
+                    "\"run Neo on my own OpenAI key\", \"bring my own key\", \"BYOK\". "
+                    "This is DIFFERENT from neo_add_integration: integrations give a "
+                    "task subprocess credentials (env vars); a BYOK profile changes "
+                    "which LLM powers Neo's orchestrator itself (sent as the x-llm-* "
+                    "headers on task submit + feedback). "
+                    "The key/model is validated against the provider before saving; "
+                    "an invalid key is rejected. By default the new profile becomes "
+                    "active. After it succeeds, relay the 'safety' message verbatim "
+                    "and never echo the key."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Friendly profile name, e.g. 'My Claude Opus'.",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "enum": list(BYOK_PROVIDERS),
+                            "description": "LLM provider for the orchestrator.",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Model id valid for the provider's own API, e.g. "
+                                "'claude-opus-4-7' (anthropic), 'gpt-4o' (openai), "
+                                "'anthropic/claude-opus-4.7' (openrouter). Use "
+                                "neo_list_byok_models to discover valid ids."
+                            ),
+                        },
+                        "api_key": {
+                            "type": "string",
+                            "description": "The provider API key. Stored locally only.",
+                        },
+                        "set_active": {
+                            "type": "boolean",
+                            "description": "Make this the active profile (default true).",
+                        },
+                    },
+                    "required": ["name", "provider", "model", "api_key"],
+                },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=False,
+                    openWorldHint=True,
+                ),
+            ),
+            types.Tool(
+                name="neo_set_byok_profile",
+                description=(
+                    "Select which BYOK profile is active, or clear it. Pass a "
+                    "profile_id (from neo_list_byok_profiles) to activate that "
+                    "profile, or null to deactivate BYOK so Neo uses its own default "
+                    "LLM credentials again. The active profile's key is attached to "
+                    "every subsequent neo_submit_task and neo_send_feedback."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "profile_id": {
+                            "type": ["string", "null"],
+                            "description": "Profile id to activate, or null to clear.",
+                        },
+                    },
+                    "required": ["profile_id"],
+                },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+            ),
+            types.Tool(
+                name="neo_remove_byok_profile",
+                description=(
+                    "Delete a BYOK profile and its stored key. Irreversible — the "
+                    "user must re-add it via neo_add_byok_profile to use it again. If "
+                    "the deleted profile was active, BYOK is cleared (Neo falls back "
+                    "to its own LLM credentials)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "profile_id": {
+                            "type": "string",
+                            "description": "Profile id to delete (from neo_list_byok_profiles).",
+                        },
+                    },
+                    "required": ["profile_id"],
+                },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=True,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+            ),
+            types.Tool(
+                name="neo_list_byok_models",
+                description=(
+                    "List the model ids a BYOK provider supports. Prefers Neo's own "
+                    "catalog (the authority on what task submit will accept); if that "
+                    "is unavailable, falls back to the provider's live model API "
+                    "(with an api_key) or a curated list. The response 'source' field "
+                    "says which was used. Use before neo_add_byok_profile to pick a "
+                    "valid model id."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "enum": list(BYOK_PROVIDERS),
+                            "description": "Provider to list models for.",
+                        },
+                        "api_key": {
+                            "type": "string",
+                            "description": (
+                                "Optional API key to fetch the account's live model "
+                                "list. Omit to get the curated fallback."
+                            ),
+                        },
+                    },
+                    "required": ["provider"],
+                },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=True,
+                ),
+            ),
         ]
 
     # ----------------------------------------------------------------
@@ -780,13 +946,13 @@ def build_server(
 
         try:
             if name == "neo_submit_task":
-                result = await _submit_task(client, deployment_id, poller, workspace, args)
+                result = await _submit_task(client, deployment_id, poller, workspace, byok, args)
             elif name == "neo_task_status":
                 result = await _task_status(client, args)
             elif name == "neo_get_messages":
                 result = await _get_messages(client, args)
             elif name == "neo_send_feedback":
-                result = await _send_feedback(client, args)
+                result = await _send_feedback(client, byok, args)
             elif name == "neo_pause_task":
                 result = await _pause_task(client, args)
             elif name == "neo_resume_task":
@@ -803,8 +969,20 @@ def build_server(
                 result = _remove_integration(args)
             elif name == "neo_test_integration":
                 result = await _test_integration(args)
+            elif name == "neo_list_byok_profiles":
+                result = _list_byok_profiles(byok)
+            elif name == "neo_add_byok_profile":
+                result = await _add_byok_profile(byok, args)
+            elif name == "neo_set_byok_profile":
+                result = _set_byok_profile(byok, args)
+            elif name == "neo_remove_byok_profile":
+                result = _remove_byok_profile(byok, args)
+            elif name == "neo_list_byok_models":
+                result = await _list_byok_models(client, args)
             else:
                 result = {"error": f"Unknown tool: {name}"}
+        except ByokError as exc:
+            result = {"error": str(exc)}
         except ValidationError as exc:
             result = {"error": str(exc)}
         except RuntimeError as exc:
@@ -879,6 +1057,7 @@ async def _submit_task(
     deployment_id: str,
     poller: BackendPoller,
     default_workspace: str,
+    byok: ByokProfileManager,
     args: dict,
 ) -> dict:
     message = args["message"]
@@ -938,6 +1117,13 @@ async def _submit_task(
                     f"because the workspace mount is /app/project/."
                 )
             }
+    # BYOK: resolve the active profile's x-llm-* headers BEFORE doing any
+    # context-building work. An active profile with no key is an error (don't
+    # silently fall back to Neo's credentials).
+    byok_headers, byok_error = byok.resolve_active_headers()
+    if byok_error:
+        return {"error": byok_error}
+
     context_prefix = await build_context_prefix(ws)
     try:
         integrations_xml = IntegrationManager().format_integrations_xml()
@@ -953,6 +1139,7 @@ async def _submit_task(
         deployment_id=deployment_id,
         workspace=ws,
         wrapper_hint=wrapper_hint,
+        byok_headers=byok_headers,
     )
     thread_id = data.get("thread_id")
     if thread_id:
@@ -982,7 +1169,9 @@ async def _get_messages(client: BackendClient, args: dict) -> dict:
     )
 
 
-async def _send_feedback(client: BackendClient, args: dict) -> dict:
+async def _send_feedback(
+    client: BackendClient, byok: ByokProfileManager, args: dict
+) -> dict:
     message = args["message"]
     try:
         integrations_xml = IntegrationManager().format_integrations_xml()
@@ -990,7 +1179,13 @@ async def _send_feedback(client: BackendClient, args: dict) -> dict:
             message = f"{message}\n\n{integrations_xml}"
     except Exception as exc:
         logger.warning("format_integrations_xml failed on feedback: %s", exc)
-    await client.send_feedback(thread_id=args["thread_id"], message=message)
+    # BYOK: same headers as init_chat so feedback turns run on the user's key.
+    byok_headers, byok_error = byok.resolve_active_headers()
+    if byok_error:
+        return {"error": byok_error}
+    await client.send_feedback(
+        thread_id=args["thread_id"], message=message, byok_headers=byok_headers
+    )
     return {"status": "ok", "thread_id": args["thread_id"]}
 
 
@@ -1203,6 +1398,129 @@ async def _test_integration(args: dict) -> dict:
         raise ValidationError("Missing required field: provider")
     mgr = IntegrationManager()
     return await mgr.test(provider)
+
+
+# ---------------------------------------------------------------------------
+# BYOK profile tools — run Neo's orchestrator on the user's own LLM key
+# ---------------------------------------------------------------------------
+
+_BYOK_SAFETY = (
+    "Your LLM API key is stored only on this device (mode 0o600, or the OS "
+    "keyring when NEO_INTEGRATIONS_BACKEND=keyring) — never written to "
+    "settings.json. When this profile is active, the key is sent to Neo's "
+    "backend ONLY as the x-llm-key header so Neo runs the orchestrator on your "
+    "own LLM credits. Use a dedicated key with a spending limit. Remove it with "
+    "neo_remove_byok_profile."
+)
+
+
+def _list_byok_profiles(byok: ByokProfileManager) -> dict:
+    profiles = byok.list_profiles()
+    active_id = byok.get_active_profile_id()
+    rows = [
+        {**p, "key_hint": byok.key_hint(p["id"]), "active": p["id"] == active_id}
+        for p in profiles
+    ]
+    return {"count": len(rows), "active_profile_id": active_id, "profiles": rows}
+
+
+async def _add_byok_profile(byok: ByokProfileManager, args: dict) -> dict:
+    name = args.get("name")
+    provider = args.get("provider")
+    model = args.get("model")
+    api_key = args.get("api_key")
+    set_active = args.get("set_active", True)
+    if not name:
+        raise ByokError("Missing required field: name")
+    if provider not in BYOK_PROVIDERS:
+        raise ByokError(
+            f"Unsupported provider {provider!r}. Supported: {', '.join(BYOK_PROVIDERS)}."
+        )
+    if not model:
+        raise ByokError("Missing required field: model")
+    if not api_key:
+        raise ByokError("Missing required field: api_key")
+
+    # Validate the key/model against the provider before persisting.
+    ok, message = await test_byok_credentials(provider, model, api_key)
+    if not ok:
+        return {"status": "rejected", "ok": False, "error": message}
+
+    saved = byok.save_profile(
+        name=name,
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        set_active=bool(set_active),
+    )
+    return {
+        "status": "added",
+        "ok": True,
+        "profile": {**saved, "key_hint": byok.key_hint(saved["id"])},
+        "active": bool(set_active),
+        "safety": _BYOK_SAFETY,
+        "assistant_instruction": (
+            "Relay the 'safety' message to the user verbatim. Never echo the key."
+        ),
+    }
+
+
+def _set_byok_profile(byok: ByokProfileManager, args: dict) -> dict:
+    # Accept null/empty to clear the active profile (fall back to Neo defaults).
+    profile_id = args.get("profile_id")
+    if profile_id in ("", "null", "none"):
+        profile_id = None
+    byok.set_active(profile_id)
+    active = byok.get_active_profile()
+    return {
+        "status": "ok",
+        "active_profile_id": profile_id,
+        "active_profile": active,
+    }
+
+
+def _remove_byok_profile(byok: ByokProfileManager, args: dict) -> dict:
+    profile_id = args.get("profile_id")
+    if not profile_id:
+        raise ByokError("Missing required field: profile_id")
+    byok.delete_profile(profile_id)
+    return {"status": "removed", "profile_id": profile_id}
+
+
+async def _list_byok_models(client: BackendClient, args: dict) -> dict:
+    provider = args.get("provider")
+    if provider not in BYOK_PROVIDERS:
+        raise ByokError(
+            f"Unsupported provider {provider!r}. Supported: {', '.join(BYOK_PROVIDERS)}."
+        )
+    api_key = args.get("api_key") or None
+
+    # The Neo backend is the authority on which models BYOK submit will accept,
+    # so prefer its catalog. Fall back to the provider's own list (live with a
+    # key, else curated) if the backend call fails.
+    backend_models: list[str] = []
+    try:
+        for row in await client.fetch_byok_providers():
+            if row.get("provider") == provider:
+                backend_models = list(row.get("supported_models") or [])
+                break
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fetch_byok_providers failed, using provider list: %s", exc)
+
+    if backend_models:
+        return {
+            "provider": provider,
+            "source": "neo-backend",
+            "count": len(backend_models),
+            "models": backend_models,
+        }
+    provider_models = await fetch_byok_models(provider, api_key)
+    return {
+        "provider": provider,
+        "source": "provider",
+        "count": len(provider_models),
+        "models": provider_models,
+    }
 
 
 # ---------------------------------------------------------------------------

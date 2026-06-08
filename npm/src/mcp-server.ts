@@ -124,7 +124,7 @@ export async function runMcpServer(opts: {
       try {
         const effectiveWs = ws || workspace;
         // BYOK: an active profile with no key is an error (don't silently fall
-        // back to Neo's credentials) — mirrors the extension's ChatController.
+        // back to Neo's credentials).
         const { headers: byokHeaders, error: byokError } = byok.resolveActiveHeaders();
         if (byokError) return ok({ error: byokError });
         const result = await submitTask(token, deploymentId, message, effectiveWs, byokHeaders ?? undefined);

@@ -49,6 +49,17 @@ def make_ws() -> str:
     return tempfile.mkdtemp(prefix="neo-test-")
 
 
+def _byok_noop():
+    """A ByokProfileManager stand-in that resolves to no BYOK headers.
+
+    Used by _submit_task / _send_feedback tests that predate BYOK and only
+    exercise workspace validation / header plumbing.
+    """
+    m = MagicMock()
+    m.resolve_active_headers.return_value = (None, None)
+    return m
+
+
 def make_handlers(
     workspace: str | None = None,
     thread_workspaces: dict[str, str] | None = None,
@@ -1918,7 +1929,7 @@ class TestWorkspaceSelfGuard(unittest.TestCase):
         poller = MagicMock()
 
         result = asyncio.run(
-            _submit_task(client, "dep-id", poller, self._tmp, {"message": "hi", "workspace": self._tmp})
+            _submit_task(client, "dep-id", poller, self._tmp, _byok_noop(), {"message": "hi", "workspace": self._tmp})
         )
         self.assertIn("error", result)
         self.assertIn("neo-mcp server's own source tree", result["error"])
@@ -3326,7 +3337,7 @@ class TestWorkspaceValidation(unittest.TestCase):
         client.init_chat = AsyncMock()
         poller = MagicMock()
         result = asyncio.run(_submit_task(
-            client, "dep-id", poller, self.td,
+            client, "dep-id", poller, self.td, _byok_noop(),
             {"message": "hi", "workspace": "/tmp/neo-absolutely-not-there-98765"},
         ))
         self.assertIn("error", result)
@@ -3341,7 +3352,7 @@ class TestWorkspaceValidation(unittest.TestCase):
         client.init_chat = AsyncMock(return_value={"thread_id": "t-norm"})
         poller = MagicMock()
         asyncio.run(_submit_task(
-            client, "dep-id", poller, self.td,
+            client, "dep-id", poller, self.td, _byok_noop(),
             {"message": "hi", "workspace": self.td + "/"},
         ))
         # init_chat was called with the normalized (no trailing slash) form.
@@ -3451,7 +3462,7 @@ class TestRelativePathRejectionOrder(unittest.IsolatedAsyncioTestCase):
         td = make_ws()
         try:
             result = await _submit_task(
-                client, "dep-id", poller, td,
+                client, "dep-id", poller, td, _byok_noop(),
                 {"message": "hi", "workspace": "relative/path"},
             )
             self.assertIn("error", result)
@@ -3475,7 +3486,7 @@ class TestRelativePathRejectionOrder(unittest.IsolatedAsyncioTestCase):
             # just verify that a tilde input doesn't trip the relative-path
             # check (it falls through to the does-not-exist error).
             result = await _submit_task(
-                client, "dep-id", poller, td,
+                client, "dep-id", poller, td, _byok_noop(),
                 {"message": "hi", "workspace": "~/this-dir-does-not-exist"},
             )
             self.assertIn("error", result)
@@ -3494,7 +3505,7 @@ class TestRelativePathRejectionOrder(unittest.IsolatedAsyncioTestCase):
         td = make_ws()
         try:
             result = await _submit_task(
-                client, "dep-id", poller, td,
+                client, "dep-id", poller, td, _byok_noop(),
                 {"message": "hi", "workspace": td},
             )
             self.assertEqual(result.get("thread_id"), "t-abs")
@@ -4362,6 +4373,217 @@ class TestListTasksMixedTimestamps(unittest.TestCase):
         # Latest should sort first — 2026-05 > 2024-07 (epoch 1719938400) > empty
         self.assertEqual(ordered[0]["updated_at"], "2026-05-07T09:38:22")
         self.assertEqual(ordered[-1]["updated_at"], "")
+
+
+# ---------------------------------------------------------------------------
+# BYOK ("bring your own key") — profiles, header injection, env fallback
+# ---------------------------------------------------------------------------
+
+def _byok_manager(tmp: str):
+    """Build a ByokProfileManager isolated to a tmp settings file + file store."""
+    from neo_mcp.byok import ByokProfileManager
+    from neo_mcp.integrations.secret_store import FileStore
+
+    settings = Path(tmp) / "settings.json"
+    store = FileStore(directory=Path(tmp) / "secrets")
+    return ByokProfileManager(settings_file=settings, store=store), settings
+
+
+class TestByokProfileManager(unittest.TestCase):
+    def setUp(self):
+        self.tmp = make_ws()
+        self.mgr, self.settings = _byok_manager(self.tmp)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_save_list_get_roundtrip(self):
+        p = self.mgr.save_profile("Opus", "anthropic", "claude-opus-4-7", "sk-ant-abcd1234")
+        self.assertEqual(p["provider"], "anthropic")
+        listed = self.mgr.list_profiles()
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(self.mgr.get_profile(p["id"])["name"], "Opus")
+
+    def test_model_id_normalized_on_save(self):
+        p = self.mgr.save_profile("O", "anthropic", "claude-opus-4.7", "sk-ant-x12345")
+        self.assertEqual(p["model"], "claude-opus-4-7")  # dots → hyphens
+        # OpenRouter keeps dots
+        p2 = self.mgr.save_profile("R", "openrouter", "anthropic/claude-opus-4.7", "sk-or-x12345")
+        self.assertEqual(p2["model"], "anthropic/claude-opus-4.7")
+
+    def test_key_stored_in_secret_store_not_settings_json(self):
+        self.mgr.save_profile("Opus", "anthropic", "claude-opus-4-7", "sk-ant-SECRET-9999")
+        raw = self.settings.read_text()
+        self.assertNotIn("sk-ant-SECRET-9999", raw)
+        self.assertIn("byok_profiles", raw)
+
+    def test_key_hint_masks(self):
+        p = self.mgr.save_profile("Opus", "anthropic", "claude-opus-4-7", "sk-ant-abcdEFGH")
+        hint = self.mgr.key_hint(p["id"])
+        self.assertTrue(hint.endswith("EFGH"))
+        self.assertNotIn("sk-ant", hint)
+
+    def test_set_active_and_resolve_headers(self):
+        p = self.mgr.save_profile("Opus", "anthropic", "claude-opus-4-7", "sk-ant-abcd1234", set_active=True)
+        headers, err = self.mgr.resolve_active_headers()
+        self.assertIsNone(err)
+        self.assertEqual(headers["x-llm-key"], "sk-ant-abcd1234")
+        self.assertEqual(headers["x-llm-provider"], "anthropic")
+        self.assertEqual(headers["x-llm-model"], "claude-opus-4-7")
+        self.assertEqual(self.mgr.get_active_profile_id(), p["id"])
+
+    def test_clear_active_returns_no_headers(self):
+        self.mgr.save_profile("Opus", "anthropic", "claude-opus-4-7", "sk-ant-abcd1234", set_active=True)
+        self.mgr.set_active(None)
+        headers, err = self.mgr.resolve_active_headers()
+        self.assertIsNone(headers)
+        self.assertIsNone(err)
+
+    def test_active_but_missing_key_is_error(self):
+        from neo_mcp.byok.profile_manager import _secret_provider
+        p = self.mgr.save_profile("Opus", "anthropic", "claude-opus-4-7", "sk-ant-abcd1234", set_active=True)
+        # Simulate a key that vanished from the store while metadata remains.
+        self.mgr._store().delete(_secret_provider(p["id"]), ("api_key",))
+        headers, err = self.mgr.resolve_active_headers()
+        self.assertIsNone(headers)
+        self.assertIsNotNone(err)
+        self.assertIn("no API key", err)
+
+    def test_delete_removes_metadata_and_key(self):
+        p = self.mgr.save_profile("Opus", "anthropic", "claude-opus-4-7", "sk-ant-abcd1234", set_active=True)
+        self.mgr.delete_profile(p["id"])
+        self.assertEqual(self.mgr.list_profiles(), [])
+        self.assertIsNone(self.mgr.get_api_key(p["id"]))
+        # Deleting the active profile clears the active selection.
+        self.assertIsNone(self.mgr.get_active_profile_id())
+
+    def test_unsupported_provider_rejected(self):
+        from neo_mcp.byok import ByokError
+        with self.assertRaises(ByokError):
+            self.mgr.save_profile("X", "gemini", "g-1", "key123")
+
+    def test_settings_env_key_preserved(self):
+        # Pre-existing unrelated settings (e.g. backend env) must survive writes.
+        self.settings.parent.mkdir(parents=True, exist_ok=True)
+        self.settings.write_text(json.dumps({"env": "staging"}))
+        self.mgr.save_profile("Opus", "anthropic", "claude-opus-4-7", "sk-ant-abcd1234")
+        data = json.loads(self.settings.read_text())
+        self.assertEqual(data["env"], "staging")
+        self.assertIn("byok_profiles", data)
+
+    def test_malformed_settings_not_clobbered(self):
+        from neo_mcp.byok import ByokError
+        # A malformed settings.json must NOT be silently overwritten — that would
+        # wipe the user's env and other keys.
+        self.settings.parent.mkdir(parents=True, exist_ok=True)
+        self.settings.write_text('{"env": "staging", OOPS not json')
+        with self.assertRaises(ByokError):
+            self.mgr.save_profile("Opus", "anthropic", "claude-opus-4-7", "sk-ant-abcd1234")
+        # File left untouched.
+        self.assertIn("OOPS not json", self.settings.read_text())
+
+    def test_key_stored_as_env_file_filestore_format(self):
+        # Interop contract: the key lives in <dir>/byok-<id>.env as `api_key=...`,
+        # the exact FileStore format the Python and npm servers share.
+        p = self.mgr.save_profile("Opus", "anthropic", "claude-opus-4-7", "sk-ant-INTEROP-5678")
+        kf = Path(self.tmp) / "secrets" / f"byok-{p['id']}.env"
+        self.assertTrue(kf.exists())
+        self.assertEqual(kf.read_text().strip(), "api_key=sk-ant-INTEROP-5678")
+        self.assertEqual(self.mgr.get_api_key(p["id"]), "sk-ant-INTEROP-5678")
+
+
+class _FakeResp:
+    def __init__(self, status=200, payload=None):
+        self.status_code = status
+        self.is_success = 200 <= status < 300
+        self._payload = payload if payload is not None else {"thread_id": "t1"}
+        self.content = b"{}"
+        self.text = "{}"
+
+    def json(self):
+        return self._payload
+
+
+class TestByokHeaderInjection(unittest.TestCase):
+    def _client(self):
+        from neo_mcp.backend_client import BackendClient
+        c = BackendClient(auth_token="tok", base_url="http://backend.test")
+        c._http = MagicMock()
+        c._http.post = AsyncMock(return_value=_FakeResp())
+        c._http.get = AsyncMock(return_value=_FakeResp(payload=[]))
+        return c
+
+    def test_init_chat_includes_byok_headers(self):
+        c = self._client()
+        headers = {"x-llm-key": "sk-ant-x", "x-llm-provider": "anthropic", "x-llm-model": "claude-opus-4-7"}
+        arun(c.init_chat("hi", "dep", byok_headers=headers))
+        sent = c._http.post.call_args.kwargs["headers"]
+        self.assertEqual(sent["x-llm-key"], "sk-ant-x")
+        self.assertEqual(sent["x-llm-provider"], "anthropic")
+        self.assertEqual(sent["x-llm-model"], "claude-opus-4-7")
+        self.assertEqual(sent["Authorization"], "Bearer tok")
+
+    def test_init_chat_without_byok_has_no_llm_headers(self):
+        c = self._client()
+        arun(c.init_chat("hi", "dep"))
+        sent = c._http.post.call_args.kwargs["headers"]
+        self.assertNotIn("x-llm-key", sent)
+
+    def test_send_feedback_includes_byok_headers(self):
+        c = self._client()
+        headers = {"x-llm-key": "sk-ant-x", "x-llm-provider": "anthropic", "x-llm-model": "claude-opus-4-7"}
+        arun(c.send_feedback("t1", "more", byok_headers=headers))
+        sent = c._http.post.call_args.kwargs["headers"]
+        self.assertEqual(sent["x-llm-key"], "sk-ant-x")
+
+    def test_poll_does_not_carry_byok_headers(self):
+        c = self._client()
+        arun(c.poll_deployment("dep"))
+        sent = c._http.get.call_args.kwargs["headers"]
+        self.assertNotIn("x-llm-key", sent)
+
+
+class TestByokEnvFallback(unittest.TestCase):
+    def setUp(self):
+        self.tmp = make_ws()
+        self.mgr, _ = _byok_manager(self.tmp)
+        self._saved_env = {k: os.environ.get(k) for k in
+                           ("NEO_BYOK_KEY", "NEO_BYOK_PROVIDER", "NEO_BYOK_MODEL")}
+
+    def tearDown(self):
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_env_vars_produce_headers_when_no_active_profile(self):
+        os.environ["NEO_BYOK_KEY"] = "sk-ant-envkey"
+        os.environ["NEO_BYOK_PROVIDER"] = "anthropic"
+        os.environ["NEO_BYOK_MODEL"] = "claude-opus-4.7"
+        headers, err = self.mgr.resolve_active_headers()
+        self.assertIsNone(err)
+        self.assertEqual(headers["x-llm-key"], "sk-ant-envkey")
+        self.assertEqual(headers["x-llm-model"], "claude-opus-4-7")  # normalized
+
+    def test_active_profile_wins_over_env(self):
+        os.environ["NEO_BYOK_KEY"] = "sk-ant-envkey"
+        os.environ["NEO_BYOK_PROVIDER"] = "anthropic"
+        os.environ["NEO_BYOK_MODEL"] = "claude-opus-4-7"
+        self.mgr.save_profile("Prof", "openai", "gpt-4o", "sk-openai-profilekey", set_active=True)
+        headers, err = self.mgr.resolve_active_headers()
+        self.assertIsNone(err)
+        self.assertEqual(headers["x-llm-key"], "sk-openai-profilekey")
+        self.assertEqual(headers["x-llm-provider"], "openai")
+
+    def test_env_ignored_when_provider_invalid(self):
+        os.environ["NEO_BYOK_KEY"] = "sk-x"
+        os.environ["NEO_BYOK_PROVIDER"] = "gemini"
+        os.environ["NEO_BYOK_MODEL"] = "g-1"
+        headers, err = self.mgr.resolve_active_headers()
+        self.assertIsNone(headers)
+        self.assertIsNone(err)
 
 
 if __name__ == "__main__":
