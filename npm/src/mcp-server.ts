@@ -1,10 +1,12 @@
 /**
  * neo-mcp MCP server — stdio transport.
  *
- * Exposes 8 tools identical to the Python neo-mcp package:
+ * Exposes 13 tools identical to the Python neo-mcp package:
  *   neo_submit_task, neo_task_status, neo_get_messages,
  *   neo_send_feedback, neo_pause_task, neo_resume_task, neo_stop_task,
- *   neo_list_tasks
+ *   neo_list_tasks,
+ *   neo_list_byok_profiles, neo_add_byok_profile, neo_set_byok_profile,
+ *   neo_remove_byok_profile, neo_list_byok_models
  *
  * Also starts the Neo daemon polling loop in the background so tasks
  * actually execute locally — mirrors the Python server's BackendPoller.
@@ -22,9 +24,13 @@ import { z } from 'zod';
 import { getAuthToken } from './auth';
 import { getOrCreateDeploymentId, loadThreadWorkspaces, loadThreadWorkspacesWithMeta, registerThreadWorkspace, runDaemon, setThreadStatus } from './daemon';
 import {
-  controlThread, getMessages, getTaskStatus,
+  controlThread, fetchByokProviders, getMessages, getTaskStatus,
   sendFeedback, stopThread, submitTask,
 } from './neo-client';
+import {
+  BYOK_PROVIDERS, ByokManager, fetchModels, isSupportedProvider,
+  testByokCredentials, type LLMProvider,
+} from './byok';
 
 // Return helpers.
 // Note: explicit return-type annotations are intentionally omitted on handlers to avoid
@@ -58,6 +64,13 @@ export async function runMcpServer(opts: {
 
   const deploymentId = opts.deploymentId ?? getOrCreateDeploymentId();
   const workspace = opts.workspace;
+  const byok = new ByokManager();
+
+  const BYOK_SAFETY =
+    'Your LLM API key is stored only on this device (mode 0o600) — never written ' +
+    'to settings.json. When this profile is active, the key is sent to Neo\'s backend ' +
+    'ONLY as the x-llm-key header so Neo runs the orchestrator on your own LLM credits. ' +
+    'Use a dedicated key with a spending limit. Remove it with neo_remove_byok_profile.';
 
   // Start daemon polling in the background so tasks actually execute locally.
   const abort = new AbortController();
@@ -110,7 +123,11 @@ export async function runMcpServer(opts: {
     async ({ message, workspace: ws }: { message: string; workspace: string }) => {
       try {
         const effectiveWs = ws || workspace;
-        const result = await submitTask(token, deploymentId, message, effectiveWs);
+        // BYOK: an active profile with no key is an error (don't silently fall
+        // back to Neo's credentials) — mirrors the extension's ChatController.
+        const { headers: byokHeaders, error: byokError } = byok.resolveActiveHeaders();
+        if (byokError) return ok({ error: byokError });
+        const result = await submitTask(token, deploymentId, message, effectiveWs, byokHeaders ?? undefined);
         // Register thread→workspace NOW — before any poll commands arrive.
         // The in-process daemon reloads thread-workspaces.json on first command
         // for a new thread_id, so writing here ensures it uses the right path.
@@ -233,7 +250,9 @@ export async function runMcpServer(opts: {
     },
     async ({ thread_id, message }: { thread_id: string; message: string }) => {
       try {
-        await sendFeedback(token, thread_id, message);
+        const { headers: byokHeaders, error: byokError } = byok.resolveActiveHeaders();
+        if (byokError) return ok({ error: byokError });
+        await sendFeedback(token, thread_id, message, byokHeaders ?? undefined);
         return ok({ status: 'ok', thread_id });
       } catch (e) {
         return toolErr(e);
@@ -388,6 +407,166 @@ export async function runMcpServer(opts: {
         tasks.sort((a, b) => toMs(b.updated_at) - toMs(a.updated_at));
 
         return ok({ tasks, count: tasks.length });
+      } catch (e) {
+        return toolErr(e);
+      }
+    },
+  );
+
+  // ----------------------------------------------------------------
+  // BYOK profile tools — run Neo's orchestrator on the user's own LLM key
+  // ----------------------------------------------------------------
+  server.registerTool(
+    'neo_list_byok_profiles',
+    {
+      title: 'List BYOK Profiles',
+      description:
+        "List the configured BYOK ('bring your own key') LLM profiles and show which " +
+        "one is active. A BYOK profile makes Neo run its orchestrator on the USER's own " +
+        'LLM key (Anthropic / OpenAI / OpenRouter) instead of Neo\'s credits. Returns id, ' +
+        'name, provider, model, a masked key hint, and the active flag. Never returns the raw key.',
+      inputSchema: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async () => {
+      try {
+        const activeId = byok.getActiveProfileId();
+        const profiles = byok.listProfiles().map((p) => ({
+          ...p, key_hint: byok.keyHint(p.id), active: p.id === activeId,
+        }));
+        return ok({ count: profiles.length, active_profile_id: activeId, profiles });
+      } catch (e) {
+        return toolErr(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    'neo_add_byok_profile',
+    {
+      title: 'Add BYOK Profile',
+      description:
+        "USE THIS TOOL when the user wants Neo to run on their own LLM key — phrasings like " +
+        '"use my Anthropic key for Neo\'s brain", "run Neo on my own OpenAI key", "BYOK". ' +
+        'This is DIFFERENT from neo_add_integration: integrations give a task subprocess ' +
+        'credentials (env vars); a BYOK profile changes which LLM powers Neo\'s orchestrator ' +
+        'itself (sent as the x-llm-* headers on submit + feedback). The key/model is validated ' +
+        'against the provider before saving; an invalid key is rejected. By default the new ' +
+        'profile becomes active. After it succeeds, relay the \'safety\' message verbatim and ' +
+        'never echo the key.',
+      inputSchema: {
+        name: z.string().describe("Friendly profile name, e.g. 'My Claude Opus'."),
+        provider: z.enum(['anthropic', 'openai', 'openrouter']).describe('LLM provider for the orchestrator.'),
+        model: z.string().describe(
+          "Model id valid for the provider's own API, e.g. 'claude-opus-4-7' (anthropic), " +
+          "'gpt-4o' (openai), 'anthropic/claude-opus-4.7' (openrouter). Use neo_list_byok_models to discover ids.",
+        ),
+        api_key: z.string().describe('The provider API key. Stored locally only.'),
+        set_active: z.boolean().optional().describe('Make this the active profile (default true).'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ name, provider, model, api_key, set_active }: {
+      name: string; provider: LLMProvider; model: string; api_key: string; set_active?: boolean;
+    }) => {
+      try {
+        const setActive = set_active ?? true;
+        const test = await testByokCredentials(provider, model, api_key);
+        if (!test.ok) return ok({ status: 'rejected', ok: false, error: test.message });
+        const saved = byok.saveProfile({ name, provider, model, apiKey: api_key, setActive });
+        return ok({
+          status: 'added', ok: true,
+          profile: { ...saved, key_hint: byok.keyHint(saved.id) },
+          active: setActive,
+          safety: BYOK_SAFETY,
+          assistant_instruction: "Relay the 'safety' message to the user verbatim. Never echo the key.",
+        });
+      } catch (e) {
+        return toolErr(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    'neo_set_byok_profile',
+    {
+      title: 'Set Active BYOK Profile',
+      description:
+        'Select which BYOK profile is active, or clear it. Pass a profile_id (from ' +
+        'neo_list_byok_profiles) to activate that profile, or null to deactivate BYOK so Neo ' +
+        'uses its own default LLM credentials again. The active profile\'s key is attached to ' +
+        'every subsequent neo_submit_task and neo_send_feedback.',
+      inputSchema: {
+        profile_id: z.string().nullable().describe('Profile id to activate, or null to clear.'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ profile_id }: { profile_id: string | null }) => {
+      try {
+        const id = (profile_id === '' || profile_id === 'null' || profile_id === 'none') ? null : profile_id;
+        byok.setActive(id);
+        return ok({ status: 'ok', active_profile_id: id, active_profile: byok.getActiveProfile() });
+      } catch (e) {
+        return toolErr(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    'neo_remove_byok_profile',
+    {
+      title: 'Remove BYOK Profile',
+      description:
+        'Delete a BYOK profile and its stored key. Irreversible — the user must re-add it via ' +
+        'neo_add_byok_profile to use it again. If the deleted profile was active, BYOK is cleared ' +
+        '(Neo falls back to its own LLM credentials).',
+      inputSchema: {
+        profile_id: z.string().describe('Profile id to delete (from neo_list_byok_profiles).'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ profile_id }: { profile_id: string }) => {
+      try {
+        byok.deleteProfile(profile_id);
+        return ok({ status: 'removed', profile_id });
+      } catch (e) {
+        return toolErr(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    'neo_list_byok_models',
+    {
+      title: 'List BYOK Models',
+      description:
+        "List the model ids a BYOK provider supports. Prefers Neo's own catalog (the authority " +
+        'on what task submit will accept); if that is unavailable, falls back to the provider\'s ' +
+        'live model API (with an api_key) or a curated list. The response \'source\' field says ' +
+        'which was used. Use before neo_add_byok_profile to pick a valid model id.',
+      inputSchema: {
+        provider: z.enum(['anthropic', 'openai', 'openrouter']).describe('Provider to list models for.'),
+        api_key: z.string().optional().describe('Optional API key to fetch the live model list.'),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ provider, api_key }: { provider: LLMProvider; api_key?: string }) => {
+      try {
+        if (!isSupportedProvider(provider)) {
+          return ok({ error: `Unsupported provider '${provider}'. Supported: ${BYOK_PROVIDERS.join(', ')}.` });
+        }
+        // Prefer the Neo backend catalog (authority on submit-time acceptance);
+        // fall back to the provider's own list if that call fails.
+        let backendModels: string[] = [];
+        try {
+          const rows = await fetchByokProviders(token);
+          backendModels = rows.find((r) => r.provider === provider)?.supported_models ?? [];
+        } catch { /* fall back to provider list */ }
+        if (backendModels.length) {
+          return ok({ provider, source: 'neo-backend', count: backendModels.length, models: backendModels });
+        }
+        const models = await fetchModels(provider, api_key);
+        return ok({ provider, source: 'provider', count: models.length, models });
       } catch (e) {
         return toolErr(e);
       }

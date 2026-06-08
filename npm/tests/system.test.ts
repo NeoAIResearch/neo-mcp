@@ -25,7 +25,7 @@
  * 20. thread status gate   — TERMINATED rejected, RUNNING/PAUSED/unknown accepted
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync,
   symlinkSync, unlinkSync, writeFileSync,
@@ -53,6 +53,10 @@ import {
   DAEMON_LOG, WORKSPACES_FILE, DAEMON_DIR,
   pidFileForDeployment,
 } from '../src/paths.js';
+import {
+  ByokManager, normalizeModelId, isSupportedProvider, BYOK_PROVIDERS,
+} from '../src/byok.js';
+import { submitTask, sendFeedback } from '../src/neo-client.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1910,5 +1914,216 @@ describe('settings.json env switch', () => {
     writeFileSync(settingsPath, '{"env": "staging"}');
     const r = await resolve({ NEO_API_URL: 'https://custom.example.com' });
     expect(r.url).toBe('https://alpha.heyneo.com');
+  });
+});
+
+// ===========================================================================
+// PART 21 — BYOK: profiles, header injection, env fallback
+//   Mirrors python/tests/test_system.py TestByok* classes.
+// ===========================================================================
+
+function makeByok(): { mgr: ByokManager; settings: string; dir: string } {
+  const root = mkdtempSync(join(tmpdir(), 'neo-byok-'));
+  const settings = join(root, 'settings.json');
+  const dir = join(root, 'secrets');
+  return { mgr: new ByokManager(settings, dir), settings, dir };
+}
+
+describe('BYOK ByokManager', () => {
+  let mgr: ByokManager;
+  let settings: string;
+
+  beforeEach(() => {
+    ({ mgr, settings } = makeByok());
+  });
+
+  it('save/list/get roundtrip', () => {
+    const p = mgr.saveProfile({ name: 'Opus', provider: 'anthropic', model: 'claude-opus-4-7', apiKey: 'sk-ant-abcd1234' });
+    expect(mgr.listProfiles()).toHaveLength(1);
+    expect(mgr.getProfile(p.id)?.name).toBe('Opus');
+  });
+
+  it('normalizes model id on save (dots → hyphens, openrouter keeps dots)', () => {
+    const a = mgr.saveProfile({ name: 'A', provider: 'anthropic', model: 'claude-opus-4.7', apiKey: 'sk-ant-x12345' });
+    expect(a.model).toBe('claude-opus-4-7');
+    const r = mgr.saveProfile({ name: 'R', provider: 'openrouter', model: 'anthropic/claude-opus-4.7', apiKey: 'sk-or-x12345' });
+    expect(r.model).toBe('anthropic/claude-opus-4.7');
+  });
+
+  it('key stored in secret file, not settings.json', () => {
+    mgr.saveProfile({ name: 'Opus', provider: 'anthropic', model: 'claude-opus-4-7', apiKey: 'sk-ant-SECRET-9999' });
+    const raw = readFileSync(settings, 'utf-8');
+    expect(raw).not.toContain('sk-ant-SECRET-9999');
+    expect(raw).toContain('byok_profiles');
+  });
+
+  it('key hint masks the key', () => {
+    const p = mgr.saveProfile({ name: 'Opus', provider: 'anthropic', model: 'claude-opus-4-7', apiKey: 'sk-ant-abcdEFGH' });
+    const hint = mgr.keyHint(p.id);
+    expect(hint.endsWith('EFGH')).toBe(true);
+    expect(hint).not.toContain('sk-ant');
+  });
+
+  it('set active + resolve headers', () => {
+    const p = mgr.saveProfile({ name: 'Opus', provider: 'anthropic', model: 'claude-opus-4-7', apiKey: 'sk-ant-abcd1234', setActive: true });
+    const { headers, error } = mgr.resolveActiveHeaders();
+    expect(error).toBeNull();
+    expect(headers).toEqual({
+      'x-llm-key': 'sk-ant-abcd1234',
+      'x-llm-provider': 'anthropic',
+      'x-llm-model': 'claude-opus-4-7',
+    });
+    expect(mgr.getActiveProfileId()).toBe(p.id);
+  });
+
+  it('clearing active yields no headers', () => {
+    mgr.saveProfile({ name: 'Opus', provider: 'anthropic', model: 'claude-opus-4-7', apiKey: 'sk-ant-abcd1234', setActive: true });
+    mgr.setActive(null);
+    expect(mgr.resolveActiveHeaders()).toEqual({ headers: null, error: null });
+  });
+
+  it('active profile with missing key is an error', () => {
+    const p = mgr.saveProfile({ name: 'Opus', provider: 'anthropic', model: 'claude-opus-4-7', apiKey: 'sk-ant-abcd1234', setActive: true });
+    rmSync(join((mgr as unknown as { byokDir: string }).byokDir, `byok-${p.id}.env`), { force: true });
+    const { headers, error } = mgr.resolveActiveHeaders();
+    expect(headers).toBeNull();
+    expect(error).toContain('no API key');
+  });
+
+  it('delete removes metadata, key, and active selection', () => {
+    const p = mgr.saveProfile({ name: 'Opus', provider: 'anthropic', model: 'claude-opus-4-7', apiKey: 'sk-ant-abcd1234', setActive: true });
+    mgr.deleteProfile(p.id);
+    expect(mgr.listProfiles()).toHaveLength(0);
+    expect(mgr.getApiKey(p.id)).toBeNull();
+    expect(mgr.getActiveProfileId()).toBeNull();
+  });
+
+  it('unsupported provider rejected', () => {
+    // @ts-expect-error testing runtime guard with an invalid provider
+    expect(() => mgr.saveProfile({ name: 'X', provider: 'gemini', model: 'g-1', apiKey: 'key123' })).toThrow();
+  });
+
+  it('preserves unrelated settings (env) across writes', () => {
+    mkdirSync(join(settings, '..'), { recursive: true });
+    writeFileSync(settings, JSON.stringify({ env: 'staging' }));
+    mgr.saveProfile({ name: 'Opus', provider: 'anthropic', model: 'claude-opus-4-7', apiKey: 'sk-ant-abcd1234' });
+    const data = JSON.parse(readFileSync(settings, 'utf-8'));
+    expect(data.env).toBe('staging');
+    expect(data.byok_profiles).toBeDefined();
+  });
+
+  it('does not clobber a malformed settings.json', () => {
+    mkdirSync(join(settings, '..'), { recursive: true });
+    writeFileSync(settings, '{"env": "staging", OOPS');
+    expect(() => mgr.saveProfile({ name: 'Opus', provider: 'anthropic', model: 'claude-opus-4-7', apiKey: 'sk-ant-abcd1234' })).toThrow();
+    expect(readFileSync(settings, 'utf-8')).toContain('OOPS');
+  });
+
+  it('stores key in FileStore .env format (interop with Python)', () => {
+    const dir = (mgr as unknown as { byokDir: string }).byokDir;
+    const p = mgr.saveProfile({ name: 'Opus', provider: 'anthropic', model: 'claude-opus-4-7', apiKey: 'sk-ant-INTEROP-5678' });
+    const kf = join(dir, `byok-${p.id}.env`);
+    expect(existsSync(kf)).toBe(true);
+    expect(readFileSync(kf, 'utf-8').trim()).toBe('api_key=sk-ant-INTEROP-5678');
+  });
+
+  it('reads a key written in Python FileStore .env format', () => {
+    const dir = (mgr as unknown as { byokDir: string }).byokDir;
+    const p = mgr.saveProfile({ name: 'X', provider: 'anthropic', model: 'claude-opus-4-7', apiKey: 'placeholder' });
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `byok-${p.id}.env`), 'api_key=sk-ant-FROM-PYTHON\n', { mode: 0o600 });
+    expect(mgr.getApiKey(p.id)).toBe('sk-ant-FROM-PYTHON');
+  });
+
+  it('helpers: normalizeModelId / isSupportedProvider', () => {
+    expect(normalizeModelId('anthropic', 'claude-opus-4.7')).toBe('claude-opus-4-7');
+    expect(normalizeModelId('openrouter', 'x/y-1.2')).toBe('x/y-1.2');
+    expect(isSupportedProvider('openai')).toBe(true);
+    expect(isSupportedProvider('gemini')).toBe(false);
+    expect(BYOK_PROVIDERS).toContain('anthropic');
+  });
+});
+
+describe('BYOK header injection (neo-client)', () => {
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchSpy = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ thread_id: 't1' }),
+      text: async () => '{}',
+    }));
+    vi.stubGlobal('fetch', fetchSpy);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('submitTask includes x-llm-* headers when given', async () => {
+    const headers = { 'x-llm-key': 'sk-ant-x', 'x-llm-provider': 'anthropic', 'x-llm-model': 'claude-opus-4-7' };
+    await submitTask('tok', 'dep', 'hi', '/ws', headers);
+    const sent = fetchSpy.mock.calls[0][1].headers;
+    expect(sent['x-llm-key']).toBe('sk-ant-x');
+    expect(sent['x-llm-provider']).toBe('anthropic');
+    expect(sent['Authorization']).toBe('Bearer tok');
+  });
+
+  it('submitTask without byok has no llm headers', async () => {
+    await submitTask('tok', 'dep', 'hi', '/ws');
+    const sent = fetchSpy.mock.calls[0][1].headers;
+    expect(sent['x-llm-key']).toBeUndefined();
+  });
+
+  it('sendFeedback includes x-llm-* headers when given', async () => {
+    const headers = { 'x-llm-key': 'sk-ant-x', 'x-llm-provider': 'anthropic', 'x-llm-model': 'claude-opus-4-7' };
+    await sendFeedback('tok', 't1', 'more', headers);
+    const sent = fetchSpy.mock.calls[0][1].headers;
+    expect(sent['x-llm-key']).toBe('sk-ant-x');
+  });
+});
+
+describe('BYOK env fallback', () => {
+  let mgr: ByokManager;
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    ({ mgr } = makeByok());
+    for (const k of ['NEO_BYOK_KEY', 'NEO_BYOK_PROVIDER', 'NEO_BYOK_MODEL']) saved[k] = process.env[k];
+  });
+
+  afterEach(() => {
+    for (const k of ['NEO_BYOK_KEY', 'NEO_BYOK_PROVIDER', 'NEO_BYOK_MODEL']) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  it('env vars produce headers when no active profile', () => {
+    process.env['NEO_BYOK_KEY'] = 'sk-ant-envkey';
+    process.env['NEO_BYOK_PROVIDER'] = 'anthropic';
+    process.env['NEO_BYOK_MODEL'] = 'claude-opus-4.7';
+    const { headers, error } = mgr.resolveActiveHeaders();
+    expect(error).toBeNull();
+    expect(headers?.['x-llm-key']).toBe('sk-ant-envkey');
+    expect(headers?.['x-llm-model']).toBe('claude-opus-4-7');
+  });
+
+  it('active profile wins over env', () => {
+    process.env['NEO_BYOK_KEY'] = 'sk-ant-envkey';
+    process.env['NEO_BYOK_PROVIDER'] = 'anthropic';
+    process.env['NEO_BYOK_MODEL'] = 'claude-opus-4-7';
+    mgr.saveProfile({ name: 'P', provider: 'openai', model: 'gpt-4o', apiKey: 'sk-openai-profilekey', setActive: true });
+    const { headers } = mgr.resolveActiveHeaders();
+    expect(headers?.['x-llm-key']).toBe('sk-openai-profilekey');
+    expect(headers?.['x-llm-provider']).toBe('openai');
+  });
+
+  it('env ignored when provider invalid', () => {
+    process.env['NEO_BYOK_KEY'] = 'sk-x';
+    process.env['NEO_BYOK_PROVIDER'] = 'gemini';
+    process.env['NEO_BYOK_MODEL'] = 'g-1';
+    expect(mgr.resolveActiveHeaders()).toEqual({ headers: null, error: null });
   });
 });

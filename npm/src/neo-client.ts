@@ -37,6 +37,7 @@ export async function submitTask(
   deploymentId: string,
   message: string,
   workspace: string,
+  byokHeaders?: Record<string, string>,
 ): Promise<Record<string, unknown>> {
   // Retry once on network/stale-connection errors — mirrors Python init_chat which retries once
   // on RemoteProtocolError (httpx raises this when a keep-alive connection is already closed).
@@ -45,7 +46,9 @@ export async function submitTask(
     try {
       const res = await fetchWithTimeout(`${NEO_API_URL}/v2/thread/init-chat-direct`, {
         method: 'POST',
-        headers: authHeaders(token),
+        // BYOK x-llm-* headers (when present) tell the backend to run the
+        // orchestrator on the user's own LLM key. Same set as feedback.
+        headers: { ...authHeaders(token), ...(byokHeaders ?? {}) },
         body: JSON.stringify({ message, deployment_id: deploymentId, deployment_type: 'vscode', workspace }),
       });
       if (!res.ok) throw new Error(handleError(res.status));
@@ -57,6 +60,24 @@ export async function submitTask(
     }
   }
   throw lastErr;
+}
+
+export interface ByokProviderRow {
+  provider: string;
+  supported_models: string[];
+  base_url?: string;
+  test_url?: string;
+}
+
+export async function fetchByokProviders(token: string): Promise<ByokProviderRow[]> {
+  // GET /v2/thread/fetch-byok-providers — BYOK provider/model catalog. Mirrors
+  // V2Client.fetchByokProviders in the extension and the Python client.
+  const res = await fetchWithTimeout(`${NEO_API_URL}/v2/thread/fetch-byok-providers`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+  });
+  if (!res.ok) throw new Error(handleError(res.status));
+  const data = await res.json();
+  return Array.isArray(data) ? data as ByokProviderRow[] : [];
 }
 
 export async function getTaskStatus(token: string, threadId: string): Promise<Record<string, unknown>> {
@@ -82,11 +103,16 @@ export async function getMessages(
   return res.json() as Promise<Record<string, unknown>>;
 }
 
-export async function sendFeedback(token: string, threadId: string, message: string): Promise<void> {
+export async function sendFeedback(
+  token: string,
+  threadId: string,
+  message: string,
+  byokHeaders?: Record<string, string>,
+): Promise<void> {
   // Backend expects { "input": message } — mirrors Python send_feedback: json={"input": message}
   const res = await fetchWithTimeout(`${NEO_API_URL}/v2/thread/feedback/${threadId}`, {
     method: 'POST',
-    headers: authHeaders(token),
+    headers: { ...authHeaders(token), ...(byokHeaders ?? {}) },
     body: JSON.stringify({ input: message }),
   });
   if (!res.ok) throw new Error(handleError(res.status));
