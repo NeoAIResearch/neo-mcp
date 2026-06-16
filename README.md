@@ -17,9 +17,9 @@ Because Neo is purpose-optimized for AI engineering — not a general-purpose co
 
 ## See it in action
 
-<video src="https://heyneo-content.s3.us-east-2.amazonaws.com/documents/public/codex-neo-mcp-demo.mp4" autoplay muted loop controls playsinline width="100%"></video>
+[![Neo MCP demo — Codex + Neo in action](artifacts/neo-mcp-demo.gif)](https://heyneo-content.s3.us-east-2.amazonaws.com/documents/public/codex-neo-mcp-demo.mp4)
 
-[Watch the demo](https://heyneo-content.s3.us-east-2.amazonaws.com/documents/public/codex-neo-mcp-demo.mp4) if the player doesn't load.
+*Click to watch the full demo with sound.*
 
 ## What MCP unlocks
 
