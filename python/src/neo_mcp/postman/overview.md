@@ -1,6 +1,13 @@
 # Neo MCP Overview
 
-Neo MCP is the [Model Context Protocol](https://modelcontextprotocol.io) server that connects Neo — an autonomous AI engineer for ML, LLM, and data workflows — to your editor or MCP client.
+Neo MCP connects Neo — an autonomous AI engineer for ML, LLM, GenAI, and data workflows — to MCP clients like Postman.
+
+## AI engineering use cases
+
+- **RAG** and semantic search over documents
+- **LLM fine-tuning** (Llama, Qwen, Gemma) and prompt benchmarking
+- **AI agents** with tools and eval hooks
+- **Classical ML**, computer vision, and EDA pipelines
 
 ## What Neo does
 
