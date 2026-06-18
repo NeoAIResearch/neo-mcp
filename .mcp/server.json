@@ -3,7 +3,7 @@
   "name": "io.github.NeoAIResearch/neo-mcp",
   "title": "Neo — AI/ML Engineering",
   "description": "AI/ML engineering MCP server for Neo — submit tasks, track execution, and retrieve outputs.",
-  "version": "0.5.5",
+  "version": "0.5.8",
   "websiteUrl": "https://heyneo.com",
   "repository": {
     "url": "https://github.com/NeoAIResearch/neo-mcp",
@@ -15,7 +15,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "neo-mcp",
-      "version": "0.5.5",
+      "version": "0.5.8",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -34,7 +34,8 @@
         },
         {
           "name": "NEO_WORKSPACE_DIR",
-          "description": "Project root where Neo tasks read and write files. Must be the git/project root."
+          "description": "Absolute path to your project/git root where Neo writes files. Required for Postman and recommended for all clients.",
+          "isRequired": true
         }
       ]
     }

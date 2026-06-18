@@ -1,8 +1,8 @@
 {
   "manifest_version": "0.4",
   "name": "neo-mcp",
-  "display_name": "NEO - Autonomous AI Engineering Agent",
-  "version": "0.5.5",
+  "display_name": "Neo — AI/ML Engineering",
+  "version": "0.5.8",
   "description": "Submit AI/ML engineering tasks to Neo, monitor execution, retrieve outputs, and manage third-party credentials — all from your editor.",
   "long_description": "Neo is an autonomous AI engineer for ML, LLM, GenAI and data workflows. This MCP server lets an assistant submit tasks to Neo, poll their status, stream back results, control task lifecycle (pause/resume/stop), and register third-party credentials (GitHub, HuggingFace, Anthropic, OpenRouter, OpenAI, AWS S3, Weights & Biases, Kaggle) so Neo tasks inherit them automatically. A local daemon writes the resulting code, models, metrics, and reports straight into your repo — execution happens on your machine.",
   "author": {
@@ -11,35 +11,20 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/NeoAIResearch/neo-mcp"
+    "url": "https://github.com/NeoResearchAI/MCPServer"
   },
   "homepage": "https://heyneo.com",
   "documentation": "https://docs.heyneo.com/neo-mcp",
-  "support": "https://github.com/NeoAIResearch/neo-mcp/issues",
+  "support": "https://github.com/NeoResearchAI/MCPServer/issues",
   "license": "MIT",
   "keywords": [
     "mcp",
     "model-context-protocol",
-    "mcp-server",
-    "neo",
-    "claude-code",
-    "cursor",
-    "codex",
-    "windsurf",
     "ai",
-    "ml",
     "machine-learning",
-    "deep-learning",
-    "data-science",
     "llm",
-    "generative-ai",
-    "rag",
-    "ai-agent",
-    "fine-tuning",
-    "computer-vision",
-    "pytorch",
-    "huggingface",
-    "anthropic"
+    "agents",
+    "neo"
   ],
   "icon": "icon.png",
   "compatibility": {
