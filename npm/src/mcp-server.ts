@@ -31,6 +31,7 @@ import {
   BYOK_PROVIDERS, ByokManager, fetchModels, isSupportedProvider,
   testByokCredentials, type LLMProvider,
 } from './byok';
+import { registerPostmanCapabilities } from './postman-capabilities.js';
 
 // Return helpers.
 // Note: explicit return-type annotations are intentionally omitted on handlers to avoid
@@ -98,11 +99,18 @@ export async function runMcpServer(opts: {
         'Files are never stored remotely. Neo\'s output may reference /app/project/src/model.py — the daemon ' +
         'automatically remaps this to <workspace>/src/model.py on the local disk.\n\n' +
         'Returns {thread_id, status, workspace} immediately. ' +
-        'Next: neo_task_status to poll, neo_get_messages when COMPLETED.',
+        'Next: neo_task_status to poll, neo_get_messages when COMPLETED.\n\n' +
+        'Model and ID fidelity: if the user names a model, API, package, dataset, or other ' +
+        'discrete ID, copy it verbatim into message. Do NOT substitute, upgrade, downgrade, ' +
+        'shorten, or normalize to a different model (e.g. do not replace "gemini 3.1 pro" ' +
+        'with gpt-4o, claude-sonnet, or an older variant). Do NOT call neo_list_byok_models ' +
+        'or guess IDs when the user already specified one. When helpful, include in message: ' +
+        '"Use exactly <user\'s id> — do not substitute a different model."',
       inputSchema: {
         message: z.string().describe(
           'Full task description. Be specific: state the goal, relevant file paths, and constraints. ' +
-          'Example: "Train a sentiment classifier on data/reviews.csv, save to models/sentiment.pkl, target F1 > 0.85"',
+          'Example: "Train a sentiment classifier on data/reviews.csv, save to models/sentiment.pkl, target F1 > 0.85". ' +
+          'If the user named a model or external ID, include the exact string they used — never a substitute or "equivalent" model.',
         ),
         workspace: z.string().describe(
           'Absolute path to the PROJECT ROOT (git repository root or top-level project folder). ' +
@@ -123,8 +131,6 @@ export async function runMcpServer(opts: {
     async ({ message, workspace: ws }: { message: string; workspace: string }) => {
       try {
         const effectiveWs = ws || workspace;
-        // BYOK: an active profile with no key is an error (don't silently fall
-        // back to Neo's credentials).
         const { headers: byokHeaders, error: byokError } = byok.resolveActiveHeaders();
         if (byokError) return ok({ error: byokError });
         const result = await submitTask(token, deploymentId, message, effectiveWs, byokHeaders ?? undefined);
@@ -233,12 +239,16 @@ export async function runMcpServer(opts: {
         'Only call when neo_task_status returns WAITING_FOR_FEEDBACK — Neo has paused and ' +
         'needs a decision or clarification before continuing. ' +
         'After sending, call neo_task_status again to confirm the task resumed.\n\n' +
-        'Do NOT use to submit a new task — use neo_submit_task for that.',
+        'Do NOT use to submit a new task — use neo_submit_task for that.\n\n' +
+        'Model and ID fidelity: when correcting or clarifying which model or external ID to use, ' +
+        "pass the user's exact wording in message. Do not override a user-specified model with a " +
+        "default or 'better' alternative.",
       inputSchema: {
         thread_id: z.string().describe('Thread ID of the waiting task.'),
         message: z.string().describe(
           "Your reply to Neo's question, or additional instructions. " +
-          'Example: "Yes, use PyTorch. Target accuracy is 90%."',
+          'Example: "Yes, use PyTorch. Target accuracy is 90%." ' +
+          "If clarifying a model or external ID, use the user's exact wording — never substitute a different model.",
         ),
       },
       annotations: {
@@ -458,8 +468,10 @@ export async function runMcpServer(opts: {
         name: z.string().describe("Friendly profile name, e.g. 'My Claude Opus'."),
         provider: z.enum(['anthropic', 'openai', 'openrouter']).describe('LLM provider for the orchestrator.'),
         model: z.string().describe(
-          "Model id valid for the provider's own API, e.g. 'claude-opus-4-7' (anthropic), " +
-          "'gpt-4o' (openai), 'anthropic/claude-opus-4.7' (openrouter). Use neo_list_byok_models to discover ids.",
+          "Model id valid for the provider's own API — pass the user's exact discrete ID verbatim. " +
+          "Do NOT substitute example models like 'claude-opus-4-7' or 'gpt-4o' when the user named " +
+          'something else. Call neo_list_byok_models only when the user did not specify a model; ' +
+          'never pick the first list entry over an explicit user ID.',
         ),
         api_key: z.string().describe('The provider API key. Stored locally only.'),
         set_active: z.boolean().optional().describe('Make this the active profile (default true).'),
@@ -543,7 +555,8 @@ export async function runMcpServer(opts: {
         "List the model ids a BYOK provider supports. Prefers Neo's own catalog (the authority " +
         'on what task submit will accept); if that is unavailable, falls back to the provider\'s ' +
         'live model API (with an api_key) or a curated list. The response \'source\' field says ' +
-        'which was used. Use before neo_add_byok_profile to pick a valid model id.',
+        'which was used. Discovery only when the user did NOT name a model — never pick the first ' +
+        'list entry over an explicit user ID.',
       inputSchema: {
         provider: z.enum(['anthropic', 'openai', 'openrouter']).describe('Provider to list models for.'),
         api_key: z.string().optional().describe('Optional API key to fetch the live model list.'),
@@ -572,6 +585,8 @@ export async function runMcpServer(opts: {
       }
     },
   );
+
+  registerPostmanCapabilities(server);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

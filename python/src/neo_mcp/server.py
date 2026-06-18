@@ -28,7 +28,9 @@ import tempfile
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
+
+from pydantic import AnyUrl
 
 import anyio
 import mcp.types as types
@@ -368,6 +370,33 @@ def build_server(
                     "\n\n"
                     "Returns {thread_id, status, workspace} immediately. "
                     "Next: neo_task_status to poll, neo_get_messages when COMPLETED."
+                    "\n\n"
+                    "Do NOT run multiple Neo tasks concurrently in the same workspace — they "
+                    "write to the same files and will clobber each other; wait for the active "
+                    "task to finish (or pause/stop it) before submitting another for that path."
+                    "\n\n"
+                    "Model and ID fidelity: if the user names a model, API, package, dataset, "
+                    "or other discrete ID, copy it verbatim into message. Do NOT substitute, "
+                    "upgrade, downgrade, shorten, or normalize to a different model (e.g. do "
+                    "not replace 'gemini 3.1 pro' with gpt-4o, claude-sonnet, or an older "
+                    "variant). Do NOT call neo_list_byok_models or guess IDs when the user "
+                    "already specified one. When helpful, include in message: 'Use exactly "
+                    "<user's id> — do not substitute a different model.'"
+                    "\n\n"
+                    "Open-ended tasks: if the user did NOT name a model, provider, version, or "
+                    "dataset, do NOT invent one or fall back to a default from your own "
+                    "knowledge (which may be outdated — e.g. gpt-4o, claude-3-5-sonnet). Keep "
+                    "message open-ended: state the goal and let Neo research and select a "
+                    "current, verified option. A stale or unverified id is worse than none. "
+                    "\n\n"
+                    "Faithful paraphrase: pass what the user said — never add models, versions, "
+                    "endpoints, datasets, file names, or constraints they did not mention. "
+                    "Retain every specific detail they DID give (version pins, numeric targets "
+                    "like F1>0.85, exact paths, provider, quantization) verbatim. "
+                    "\n\n"
+                    "Defer verification: if a user-given id looks unfamiliar or wrong, still "
+                    "pass it exactly — Neo verifies availability. Never normalize a user id to "
+                    "a familiar-but-different one."
                 ),
                 inputSchema={
                     "type": "object",
@@ -375,10 +404,16 @@ def build_server(
                         "message": {
                             "type": "string",
                             "description": (
-                                "Full task description. Be specific: state the goal, "
-                                "relevant file paths, and constraints. "
+                                "Full task description. Be specific where the user was "
+                                "specific — state the goal, relevant file paths, and "
+                                "constraints they gave — but do NOT manufacture specifics "
+                                "(model ids, paths, versions) they did not provide. "
                                 "Example: 'Train a sentiment classifier on data/reviews.csv, "
-                                "save to models/sentiment.pkl, target F1 > 0.85'"
+                                "save to models/sentiment.pkl, target F1 > 0.85'. "
+                                "If the user named a model or external ID, include the exact "
+                                "string they used — never a substitute or 'equivalent' model. "
+                                "If they named none, leave model choice open for Neo to "
+                                "research — do not insert a default from memory."
                             ),
                         },
                         "workspace": {
@@ -504,6 +539,12 @@ def build_server(
                     "After sending, call neo_task_status again to confirm the task resumed. "
                     "\n\n"
                     "Do NOT use to submit a new task — use neo_submit_task for that."
+                    "\n\n"
+                    "Model and ID fidelity: when correcting or clarifying which model or "
+                    "external ID to use, pass the user's exact wording in message. Do not "
+                    "override a user-specified model with a default or 'better' alternative. "
+                    "If the user left the choice open, keep it open — do not inject a model "
+                    "id from your own (possibly outdated) knowledge; let Neo pick a verified one."
                 ),
                 inputSchema={
                     "type": "object",
@@ -516,7 +557,9 @@ def build_server(
                             "type": "string",
                             "description": (
                                 "Your reply to Neo's question or additional instructions. "
-                                "Example: 'Use PyTorch, target accuracy 90%, save to models/'"
+                                "Example: 'Use PyTorch, target accuracy 90%, save to models/'. "
+                                "If clarifying a model or external ID, use the user's exact "
+                                "wording — never substitute a different model."
                             ),
                         },
                     },
@@ -822,10 +865,12 @@ def build_server(
                         "model": {
                             "type": "string",
                             "description": (
-                                "Model id valid for the provider's own API, e.g. "
-                                "'claude-opus-4-7' (anthropic), 'gpt-4o' (openai), "
-                                "'anthropic/claude-opus-4.7' (openrouter). Use "
-                                "neo_list_byok_models to discover valid ids."
+                                "Model id valid for the provider's own API — pass the user's "
+                                "exact discrete ID verbatim. Do NOT substitute example models "
+                                "like 'claude-opus-4-7' or 'gpt-4o' when the user named "
+                                "something else. Call neo_list_byok_models only when the "
+                                "user did not specify a model; never pick the first list entry "
+                                "over an explicit user ID."
                             ),
                         },
                         "api_key": {
@@ -904,8 +949,8 @@ def build_server(
                     "catalog (the authority on what task submit will accept); if that "
                     "is unavailable, falls back to the provider's live model API "
                     "(with an api_key) or a curated list. The response 'source' field "
-                    "says which was used. Use before neo_add_byok_profile to pick a "
-                    "valid model id."
+                    "says which was used. Discovery only when the user did NOT name a "
+                    "model — never pick the first list entry over an explicit user ID."
                 ),
                 inputSchema={
                     "type": "object",
@@ -933,6 +978,30 @@ def build_server(
                 ),
             ),
         ]
+
+    # ----------------------------------------------------------------
+    # Prompts and resources (Postman + MCP clients)
+    # ----------------------------------------------------------------
+
+    from . import postman_capabilities as _postman
+
+    @server.list_prompts()
+    async def list_prompts() -> list[types.Prompt]:
+        return _postman.list_prompts()
+
+    @server.get_prompt()
+    async def get_prompt(
+        name: str, arguments: dict[str, str] | None
+    ) -> types.GetPromptResult:
+        return _postman.get_prompt(name, arguments)
+
+    @server.list_resources()
+    async def list_resources() -> list[types.Resource]:
+        return _postman.list_resources()
+
+    @server.read_resource()
+    async def read_resource(uri: AnyUrl) -> Iterable[types.TextResourceContents]:
+        return _postman.read_resource_url(uri)
 
     # ----------------------------------------------------------------
     # Tool call handler
@@ -1534,7 +1603,7 @@ async def run(secret_key: str, workspace: str) -> None:
     and shares its controlling terminal and process group. Running the backend
     poll loop here would tie it to that interactive session: a Ctrl-Z (SIGTSTP)
     on the editor, or an SSH drop, suspends/kills the whole process group and
-    silently stops the sandbox (see service.py). So the
+    silently stops the sandbox (the 2026-06-02 outage — see service.py). So the
     poll loop lives in a *detached* daemon instead; here we only ensure such a
     daemon exists, then serve MCP tools over stdio.
     """
@@ -2053,6 +2122,11 @@ def main() -> None:
     if args and args[0] not in known:
         workspace_arg = args[0]
     workspace = os.path.abspath(workspace_arg or os.environ.get("NEO_WORKSPACE_DIR", os.getcwd()))
+    if not os.environ.get("NEO_WORKSPACE_DIR") and not workspace_arg:
+        sys.stderr.write(
+            "Warning: NEO_WORKSPACE_DIR is not set — using cwd as workspace. "
+            "Set NEO_WORKSPACE_DIR to your project/git root (required for Postman).\n"
+        )
     if not os.path.isdir(workspace):
         sys.stderr.write(f"Error: workspace '{workspace}' is not a directory.\n")
         sys.exit(1)

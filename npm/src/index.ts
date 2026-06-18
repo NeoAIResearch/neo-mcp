@@ -41,6 +41,12 @@ const envWorkspaceDir = process.env['NEO_WORKSPACE_DIR'];
 if (mcp) {
   // MCP server mode: expose Neo tools to Claude Code and run daemon in background.
   // Usage: claude mcp add --scope user neo -e NEO_SECRET_KEY=sk-v1-... -- npx neo-mcp-daemon --mcp
+  if (!envWorkspaceDir && !workspace) {
+    process.stderr.write(
+      'Warning: NEO_WORKSPACE_DIR is not set — using cwd as workspace. ' +
+        'Set NEO_WORKSPACE_DIR to your project/git root (required for Postman).\n',
+    );
+  }
   const effectiveWorkspace = resolve(workspace ?? envWorkspaceDir ?? process.cwd());
   runMcpServer({ workspace: effectiveWorkspace, deploymentId }).catch((e: unknown) => {
     process.stderr.write(`Fatal MCP server error: ${e}\n`);

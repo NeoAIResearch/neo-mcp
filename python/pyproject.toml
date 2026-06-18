@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neo-mcp"
-version = "0.5.5"
+version = "0.5.8"
 description = "Neo MCP server — bring Neo, the autonomous AI engineer for ML, LLM, GenAI & data workflows, into Claude Code, Cursor, Codex & other editors. Describe a task; Neo builds it and writes results to your repo."
 readme = "README.md"
 license = { text = "MIT" }
@@ -46,9 +46,9 @@ testpaths = ["tests"]
 
 [project.urls]
 Homepage = "https://heyneo.com"
-Repository = "https://github.com/NeoAIResearch/neo-mcp"
+Repository = "https://github.com/NeoResearchAI/MCPServer"
 Documentation = "https://docs.heyneo.com/neo-mcp"
-"Bug Tracker" = "https://github.com/NeoAIResearch/neo-mcp/issues"
+"Bug Tracker" = "https://github.com/NeoResearchAI/MCPServer/issues"
 
 [project.scripts]
 neo-mcp = "neo_mcp.server:main"
@@ -57,4 +57,4 @@ neo-mcp = "neo_mcp.server:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-neo_mcp = ["skills/*.md"]
+neo_mcp = ["skills/*.md", "postman/*.md"]
