@@ -3,7 +3,7 @@
   "name": "io.github.NeoAIResearch/neo-mcp",
   "title": "Neo — AI/ML Engineering",
   "description": "AI/ML engineering MCP server for Neo — submit tasks, track execution, and retrieve outputs.",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "websiteUrl": "https://heyneo.com",
   "repository": {
     "url": "https://github.com/NeoAIResearch/neo-mcp",
@@ -15,7 +15,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "neo-mcp",
-      "version": "0.5.8",
+      "version": "0.5.9",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

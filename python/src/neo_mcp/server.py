@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from pydantic import AnyUrl
 
 import anyio
@@ -1000,7 +1001,7 @@ def build_server(
         return _postman.list_resources()
 
     @server.read_resource()
-    async def read_resource(uri: AnyUrl) -> Iterable[types.TextResourceContents]:
+    async def read_resource(uri: AnyUrl) -> Iterable[ReadResourceContents]:
         return _postman.read_resource_url(uri)
 
     # ----------------------------------------------------------------
