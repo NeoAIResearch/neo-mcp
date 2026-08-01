@@ -36,9 +36,9 @@ Links: https://heyneo.com · https://docs.heyneo.com/neo-mcp
 | neo_list_tasks | List running and recent tasks |
 | neo_task_status | Check RUNNING / COMPLETED / WAITING_FOR_FEEDBACK |
 | neo_get_messages | Read output when COMPLETED |
-| neo_send_feedback | Reply when WAITING_FOR_FEEDBACK |
+| neo_send_feedback | Reply when WAITING_FOR_FEEDBACK (also the status after neo_pause_task), or hand it new instructions — resumes + delivers in one call |
 | neo_pause_task | Pause a running task |
-| neo_resume_task | Resume a paused task |
+| neo_resume_task | Resume a WAITING_FOR_FEEDBACK task unchanged (no new instructions) |
 | neo_stop_task | Stop and clean up permanently |
 `,
   },
@@ -48,7 +48,9 @@ Links: https://heyneo.com · https://docs.heyneo.com/neo-mcp
 
 neo_submit_task → neo_task_status (poll) → neo_get_messages
 
-When WAITING_FOR_FEEDBACK: neo_send_feedback → neo_task_status again.
+When WAITING_FOR_FEEDBACK, with new instructions: neo_send_feedback → neo_task_status again.
+(This is also the status reported after neo_pause_task.)
+When WAITING_FOR_FEEDBACK, with nothing new to say: neo_resume_task instead.
 `,
   },
   'neo://docs/env': {

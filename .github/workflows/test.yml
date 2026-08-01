@@ -1,0 +1,83 @@
+name: Test
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package with dev deps
+        run: pip install -e ".[dev]"
+
+      - name: Confirm mcp on 1.28–1.x support line
+        run: |
+          python - <<'PY'
+          from importlib.metadata import version
+          from packaging.version import Version
+          v = Version(version("mcp"))
+          assert v >= Version("1.28"), f"mcp resolved to {v}, expected >=1.28"
+          assert v < Version("2"), f"mcp resolved to {v}, expected <2"
+          print(f"mcp=={v}")
+          for pkg in ("httpx", "anyio", "pydantic", "typing_inspection"):
+              print(f"{pkg}=={version(pkg)}")
+          PY
+
+      - name: Run pytest
+        run: python -m pytest tests/ -v
+
+      - name: Smoke self-test
+        run: neo-mcp self-test
+
+      # doctor exits non-zero when NEO_SECRET_KEY is unset — still a valid smoke
+      # as long as it emits parseable JSON (proves the CLI + deps loaded).
+      - name: Smoke doctor
+        run: |
+          set +e
+          out=$(neo-mcp doctor --json 2>/dev/null)
+          rc=$?
+          set -e
+          echo "$out" | python -c "import json,sys; d=json.load(sys.stdin); assert 'checks' in d, d"
+          echo "doctor exited $rc (nonzero without secret key is expected)"
+
+  npm:
+    name: npm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: npm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: npm/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build

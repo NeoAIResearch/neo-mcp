@@ -30,13 +30,31 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from mcp.server.lowlevel.helper_types import ReadResourceContents
-from pydantic import AnyUrl
+# Third-party imports are the chokepoint for a broken dependency closure: if
+# pydantic is installed without its own `typing_inspection` dependency (a
+# partial/resolver-skipped install), `import pydantic` raises here, the module
+# fails to load, and the stdio server exits before the MCP handshake — which the
+# editor reports only as "-32000 / Connection closed". Catch it and emit an
+# actionable message to stderr (never stdout — that would corrupt the protocol).
+try:
+    from mcp.server.lowlevel.helper_types import ReadResourceContents
+    from pydantic import AnyUrl
 
-import anyio
-import mcp.types as types
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
+    import anyio
+    import mcp.types as types
+    from mcp.server import Server
+    from mcp.server.stdio import stdio_server
+except ImportError as _import_err:  # pragma: no cover - environment guard
+    sys.stderr.write(
+        f"neo-mcp: a required dependency failed to import: {_import_err}\n"
+        "This usually means a broken/partial Python environment (e.g. pydantic "
+        "installed without its 'typing_inspection' dependency).\n"
+        "Fix it with:\n"
+        f"  {sys.executable} -m pip install --upgrade --force-reinstall "
+        "neo-mcp 'typing_inspection>=0.4.1,<1' 'pydantic>=2.11,<3'\n"
+        "Then restart the MCP connection.\n"
+    )
+    sys.exit(1)
 
 from .action_handlers import ActionHandlers
 from .system_info import build_context_prefix
@@ -463,8 +481,11 @@ def build_server(
                     "Get the current status of a Neo task. Returns one of: "
                     "RUNNING (still executing — call again; use neo_task_plan for step details), "
                     "COMPLETED (done — call neo_get_messages for output), "
-                    "WAITING_FOR_FEEDBACK (Neo has a question — call neo_send_feedback), "
-                    "PAUSED (frozen — call neo_resume_task to continue), "
+                    "WAITING_FOR_FEEDBACK (Neo is frozen, waiting on you — this is also the "
+                    "status neo_task_status reports after neo_pause_task): call "
+                    "neo_send_feedback if you have new instructions, a correction, or an "
+                    "answer (it resumes and delivers the message in one step), otherwise "
+                    "call neo_resume_task to continue unchanged, "
                     "TERMINATED or FAILED (ended — call neo_get_messages to read what happened). "
                     "\n\n"
                     "Reads from an in-memory cache backed by an adaptive background poller "
@@ -534,10 +555,24 @@ def build_server(
             types.Tool(
                 name="neo_send_feedback",
                 description=(
-                    "Reply to Neo when it is waiting for user input. "
-                    "Only call when neo_task_status returns WAITING_FOR_FEEDBACK — "
-                    "Neo has paused and needs a decision or clarification before continuing. "
-                    "After sending, call neo_task_status again to confirm the task resumed. "
+                    "Reply to Neo, or hand it new instructions before it continues. "
+                    "Call when neo_task_status returns WAITING_FOR_FEEDBACK — Neo is frozen "
+                    "and waiting on you. This is also the status reported after "
+                    "neo_pause_task. Either way, this single call delivers your message AND "
+                    "resumes the task. After sending, call neo_task_status again to confirm. "
+                    "\n\n"
+                    "State requirement: feedback is accepted when the task state is "
+                    "WAITING_FOR_FEEDBACK — not while RUNNING. To course-correct a task that "
+                    "is currently RUNNING, call neo_pause_task first, then call "
+                    "neo_send_feedback right away once neo_task_status reports "
+                    "WAITING_FOR_FEEDBACK. "
+                    "\n\n"
+                    "neo_resume_task is a different tool for a different case: use it only "
+                    "when the task is WAITING_FOR_FEEDBACK and you want it to continue "
+                    "exactly as before, with nothing new to say. If you have any "
+                    "instructions, correction, or clarification, use neo_send_feedback "
+                    "instead — calling neo_resume_task resumes silently and whatever you "
+                    "wanted to say is lost."
                     "\n\n"
                     "Do NOT use to submit a new task — use neo_submit_task for that."
                     "\n\n"
@@ -577,8 +612,12 @@ def build_server(
                 name="neo_pause_task",
                 description=(
                     "Pause a running Neo task mid-execution. "
-                    "The task freezes at its current step and can be resumed later with "
-                    "neo_resume_task. Safe to call on an already-paused task (no-op). "
+                    "The task freezes at its current step — neo_task_status will then report "
+                    "WAITING_FOR_FEEDBACK. Safe to call on an already-paused task (no-op). "
+                    "After pausing: if you have new instructions or a correction, call "
+                    "neo_send_feedback right away — it resumes the task and delivers the "
+                    "message in one step. Call neo_resume_task instead only if you want it "
+                    "to continue exactly as before, with nothing new to say. "
                     "To cancel permanently, use neo_stop_task instead."
                 ),
                 inputSchema={
@@ -601,9 +640,15 @@ def build_server(
             types.Tool(
                 name="neo_resume_task",
                 description=(
-                    "Resume a paused Neo task from where it stopped. "
+                    "Resume a paused Neo task from exactly where it stopped, with NO new "
+                    "input — use only when there is nothing to add or correct. Works after "
+                    "neo_task_status reports WAITING_FOR_FEEDBACK following the pause. "
                     "Has no effect if the task is already running. "
-                    "Only works after neo_pause_task — to start a new task use neo_submit_task."
+                    "Only works after neo_pause_task — to start a new task use neo_submit_task. "
+                    "If you have any instructions, correction, or clarification to give, use "
+                    "neo_send_feedback instead — it resumes the task AND delivers your "
+                    "message in one call; calling neo_resume_task would resume it silently "
+                    "and that message would never reach Neo."
                 ),
                 inputSchema={
                     "type": "object",

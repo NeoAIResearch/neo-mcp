@@ -12,7 +12,7 @@ import {
 } from 'fs';
 import { resolve } from 'path';
 import { deriveDeploymentId, getAuthToken } from './auth.js';
-import { NEO_API_URL, POLL_MAX_INTERVAL, POLL_MAX_MESSAGES, getTaskTimeoutMs, TASK_TIMEOUT_CHECK_INTERVAL_MS } from './config.js';
+import { NEO_API_URL, POLL_MAX_INTERVAL, POLL_MAX_MESSAGES } from './config.js';
 import { Command, dispatch, setExecutorLogger } from './executor.js';
 import { DaemonLogger } from './logger.js';
 import {
@@ -260,53 +260,6 @@ export function saveThreadWorkspaces(workspaces: Record<string, string>): void {
   renameSync(tmpFile, WORKSPACES_FILE);
 }
 
-async function checkAndPauseStale(token: string): Promise<void> {
-  const timeoutMs = getTaskTimeoutMs();
-  if (timeoutMs <= 0) return;
-
-  const cutoffMs = Date.now() - timeoutMs;
-  const meta = loadThreadWorkspacesWithMeta();
-  const stale: string[] = [];
-
-  for (const [tid, { updated_at }] of Object.entries(meta)) {
-    const ts = typeof updated_at === 'number' ? updated_at * 1_000
-      : typeof updated_at === 'string' ? Date.parse(updated_at) : NaN;
-    if (!isNaN(ts) && ts < cutoffMs) stale.push(tid);
-  }
-
-  for (const tid of stale) {
-    let status: string;
-    try {
-      const res = await fetchWithTimeout(
-        `${NEO_API_URL}/v2/thread/status/${tid}`,
-        { headers: { 'Authorization': `Bearer ${token}` } },
-        10_000,
-      );
-      if (!res.ok) continue;
-      const data = await res.json() as { status?: string };
-      status = data.status ?? '';
-    } catch {
-      continue;
-    }
-    if (status !== 'RUNNING' && status !== 'WAITING_FOR_FEEDBACK') continue;
-    try {
-      await fetchWithTimeout(
-        `${NEO_API_URL}/v2/thread/control/${tid}`,
-        {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ signal: 'PAUSE' }),
-        },
-        10_000,
-      );
-      setThreadStatus(tid, 'PAUSED');
-      if (_logger) _logger.info('Auto-paused stale task', { tid, previousStatus: status, ageHours: timeoutMs / 3_600_000 });
-    } catch (err) {
-      if (_logger) _logger.warn('Could not auto-pause stale task', { tid, error: String(err) });
-    }
-  }
-}
-
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -407,7 +360,6 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
   opts.signal?.addEventListener('abort', stop, { once: true });
 
   let lastCommandTime = 0;       // Date.now() ms, 0 = never
-  let lastTimeoutCheck = 0;      // Date.now() ms, 0 = never
 
   while (running) {
     // During active execution use wait_time=1 so the poll returns quickly after the
@@ -434,11 +386,6 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
       } else {
         await sleep(backoffMs);
         backoffMs = Math.min(Math.floor(backoffMs * 1.5), POLL_MAX_INTERVAL);
-      }
-      // Periodic stale-task auto-pause — every 5 minutes while idle
-      if (getTaskTimeoutMs() > 0 && Date.now() - lastTimeoutCheck >= TASK_TIMEOUT_CHECK_INTERVAL_MS) {
-        lastTimeoutCheck = Date.now();
-        checkAndPauseStale(token).catch(() => { /* silent — non-critical */ });
       }
       continue;
     }

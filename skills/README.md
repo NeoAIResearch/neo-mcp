@@ -18,7 +18,7 @@ npm install -g neo-mcp   # copies skills to ~/.claude/skills/ automatically
 
 **Install manually** (pip or manual update):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NeoAIResearch/neo-mcp/main/skills/claude-code/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/NeoResearchAI/MCPServer/main/skills/claude-code/SKILL.md \
   -o ~/.claude/skills/neo.md
 ```
 

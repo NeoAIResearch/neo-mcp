@@ -27,7 +27,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync,
+  existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync,
   symlinkSync, unlinkSync, writeFileSync,
 } from 'fs';
 import { tmpdir } from 'os';
@@ -63,7 +63,10 @@ import { submitTask, sendFeedback } from '../src/neo-client.js';
 // ---------------------------------------------------------------------------
 
 function makeWs(): string {
-  return mkdtempSync(join(tmpdir(), 'neo-sys-test-'));
+  // realpathSync() so the baseline matches what the implementation produces:
+  // safeResolve()/realResolve() canonicalize symlinks, and on macOS tmpdir()
+  // returns /var/folders/... which canonicalizes to /private/var/folders/...
+  return realpathSync(mkdtempSync(join(tmpdir(), 'neo-sys-test-')));
 }
 
 function makeCmd(overrides: Partial<Command>): Command {
@@ -149,7 +152,9 @@ describe('realResolve', () => {
   });
 
   it('resolves /etc which exists', () => {
-    expect(realResolve('/etc')).toBe('/etc');
+    // On macOS /etc is itself a symlink to /private/etc, so compare against the
+    // canonical form rather than the literal input.
+    expect(realResolve('/etc')).toBe(realpathSync('/etc'));
   });
 });
 
@@ -172,7 +177,9 @@ describe('safeResolve', () => {
 
   it('allows absolute /tmp path', () => {
     const r = safeResolve(ws, '/tmp/script.sh');
-    expect(r).toBe('/tmp/script.sh');
+    // /tmp is an allowed root; the result is the canonical resolution of it
+    // (/private/tmp/script.sh on macOS, /tmp/script.sh on Linux).
+    expect(r).toBe(realResolve('/tmp/script.sh'));
   });
 
   it('allows workspace root itself', () => {

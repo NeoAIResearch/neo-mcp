@@ -1,6 +1,6 @@
 # Neo MCP — AI engineering, without leaving your editor
 
-<!-- mcp-name: io.github.NeoAIResearch/neo-mcp -->
+<!-- mcp-name: io.github.NeoResearchAI/MCPServer -->
 
 [![PyPI](https://img.shields.io/pypi/v/neo-mcp.svg)](https://pypi.org/project/neo-mcp/)
 [![Python](https://img.shields.io/pypi/pyversions/neo-mcp.svg)](https://pypi.org/project/neo-mcp/)
@@ -213,7 +213,7 @@ Restart Windsurf after editing.
 | `neo_test_integration` | Call the provider's API to confirm a stored key is still valid. |
 | `neo_remove_integration` | Delete a stored key from this machine. |
 
-> **Integration tools** store credentials locally (file `0o600` under `~/.neo/integrations/`, or OS keyring with `NEO_INTEGRATIONS_BACKEND=keyring`). Keys never leave your machine. See the full guide at [docs/INTEGRATIONS.md](https://github.com/NeoAIResearch/neo-mcp/blob/main/docs/INTEGRATIONS.md).
+> **Integration tools** store credentials locally (file `0o600` under `~/.neo/integrations/`, or OS keyring with `NEO_INTEGRATIONS_BACKEND=keyring`). Keys never leave your machine. See the full guide at [docs/INTEGRATIONS.md](https://github.com/NeoResearchAI/MCPServer/blob/main/docs/INTEGRATIONS.md).
 
 ---
 

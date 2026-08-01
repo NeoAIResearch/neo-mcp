@@ -1,3 +1,8 @@
-mcp>=1.26.0
-httpx>=0.27.0
-anyio>=4.0.0
+mcp>=1.28,<2
+httpx>=0.28.0,<1
+anyio>=4.5,<5
+# Explicit so a broken closure (pydantic without typing_inspection) can't crash
+# the stdio server at import time. See pyproject.toml for the rationale.
+# Major-capped like every other direct dep — no open floors.
+pydantic>=2.11,<3
+typing_inspection>=0.4.1,<1

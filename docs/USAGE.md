@@ -43,7 +43,7 @@ neo_task_status   →  check overall status at any time
 |---|---|
 | `neo_submit_task` | Start a task. Use `wait_for_completion=true` for short tasks (< 3 min) to get output immediately. |
 | `neo_list_tasks` | Find running or recent tasks — useful after closing a window or losing track of a task. Reconnects pollers automatically. |
-| `neo_task_status` | Quick overall status check: RUNNING / COMPLETED / WAITING_FOR_FEEDBACK / PAUSED / TERMINATED. |
+| `neo_task_status` | Quick overall status check: RUNNING / COMPLETED / WAITING_FOR_FEEDBACK / TERMINATED. Pausing also reports WAITING_FOR_FEEDBACK — there is no separate status for a paused task. |
 | `neo_get_messages` | Full conversation output once COMPLETED. Caps at ~20 000 tokens. |
 | `neo_send_feedback` | Reply when Neo asks a question (WAITING_FOR_FEEDBACK). |
 | `neo_pause_task` | Pause execution mid-task. |
@@ -108,6 +108,14 @@ Pause the Neo task
 Resume the Neo task
 ```
 
+If you pause a task and then want to give it new instructions before continuing, say so naturally:
+
+```
+Pause the Neo task — actually, use LightGBM instead of XGBoost
+```
+
+The assistant calls `neo_send_feedback` (not `neo_resume_task`) — once `neo_task_status` reports `WAITING_FOR_FEEDBACK` after the pause, this single call delivers the new instructions **and** resumes execution. Use plain "resume" (`neo_resume_task`) only when there's nothing new to say.
+
 ---
 
 ## Stopping a task
@@ -150,4 +158,9 @@ For short tasks (< 3 min):
 
 ## For maintainers — publishing
 
-PyPI publish triggers automatically on version tags (`v*`). npm publish triggers automatically on `v*` tags.
+PyPI publish triggers automatically on version tags (`v*`, e.g. `v0.5.13`).
+npm publish triggers automatically on `npm-v*` tags (e.g. `npm-v1.1.31`).
+
+Before tagging PyPI, bump `version` in `python/pyproject.toml` and keep
+`.mcp/server.json` + `mcpb/manifest.json` on the same version so the MCP
+Registry publish (also on `v*`) matches the PyPI package.

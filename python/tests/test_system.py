@@ -46,7 +46,10 @@ def arun(coro):
 
 
 def make_ws() -> str:
-    return tempfile.mkdtemp(prefix="neo-test-")
+    # realpath() so the baseline matches what the implementation produces:
+    # production code canonicalizes workspaces via Path.resolve(), and on macOS
+    # tempfile.mkdtemp() returns /var/... which resolve() rewrites to /private/var/...
+    return os.path.realpath(tempfile.mkdtemp(prefix="neo-test-"))
 
 
 def _byok_noop():
@@ -1276,8 +1279,9 @@ class TestWorkspaceIsolation(unittest.TestCase):
 # ===========================================================================
 # PART 13 — BackendPoller._safe_send (retry logic)
 #
-# Why _safe_send retries: without retries, a single failed HTTP POST means the
-# backend never receives the ACK and the task can stall permanently.
+# Root cause of the Cursor RAG stuck-task incident:
+# _safe_send had no retries in the published version. One failed HTTP POST
+# meant the backend never received the ACK and stalled permanently.
 # ===========================================================================
 
 class TestSafeSend(unittest.IsolatedAsyncioTestCase):

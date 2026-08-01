@@ -99,6 +99,7 @@ When invoked as `/neo <task>`, call `neo_submit_task` with the provided text and
 - **`wait_for_completion: true`** blocks until done and returns output directly. Only use for short tasks (< 3 min). For anything longer, leave it `false` and poll with `neo_task_status`.
 - **Prefer `neo_task_status` over `neo_get_messages`** for mid-run checks — it reads from cache.
 - **Never poll in a tight loop** — call `neo_task_status` once per user turn. The background poller handles the rest.
+- **Model and ID fidelity — never substitute.** When the user names a model, API, package, dataset, or other discrete ID, copy it **verbatim into `message`** on `neo_submit_task` and `neo_send_feedback`. Do not upgrade, downgrade, shorten, or swap for a default or "similar" model (e.g. do not replace `gemini 3.1 pro` with `gpt-4o`). If the user explicitly wants Neo's brain on their own key (BYOK), use `neo_add_byok_profile` with the exact slug they named — still repeat the same ID in `message` for in-task work.
 
 ---
 
