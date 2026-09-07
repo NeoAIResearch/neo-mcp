@@ -45,7 +45,9 @@ Always follow this sequence. Do not skip steps.
 
 ## One task per workspace — merge, never split
 
-**Bundle all related work for a project into a SINGLE `neo_submit_task`, and never run more than one Neo task at a time in the same workspace/project directory.**
+**Bundle related work into one task. The server enforces one active owner per
+canonical workspace and returns `WORKSPACE_BUSY` with the owning thread when a
+second submission would collide.**
 
 - If a request has several parts (e.g. "build the API, add tests, and write a Dockerfile"), put the entire scope in ONE task prompt — Neo handles multi-step work within a single thread. Splitting it into back-to-back submissions in the same directory makes the tasks collide on the shared workspace (and `.tmp`), duplicate effort, and stay blind to each other's state.
 - If a task is already running for the workspace and the user adds or changes scope, extend it with `neo_send_feedback` — do NOT submit a second task.
@@ -78,10 +80,12 @@ When invoked as `/neo <task>`, call `neo_submit_task` with the provided text and
 
 | Tool | When to call | Notes |
 |---|---|---|
-| `neo_submit_task` | Starting any AI/ML task | Returns `thread_id` immediately; use `wait_for_completion: true` only for tasks under ~3 min |
+| `neo_submit_task` | Starting any AI/ML task | Returns `thread_id` immediately; poll with `neo_task_status` |
 | `neo_list_tasks` | User closed a window / lost track of a task | Lists all running/recent tasks; reconnects pollers automatically |
-| `neo_task_status` | Checking if still running | Reads from in-memory cache — fast, no API call if poller is active |
+| `neo_task_status` | Checking if still running | Compact live backend telemetry; not independent proof |
 | `neo_get_messages` | Reading output when COMPLETED | Paginated; capped at ~20 000 tokens |
+| `neo_get_execution_evidence` | Inspecting locally observed command/file hashes | Read-only; local provenance |
+| `neo_verify_task` | Verifying artifacts and bounded acceptance commands | Only this can produce `VERIFIED` |
 | `neo_send_feedback` | Neo is WAITING_FOR_FEEDBACK, or to course-correct a digressing task mid-run | Call `neo_task_status` after sending to confirm resume |
 | `neo_pause_task` | User asks to pause | — |
 | `neo_resume_task` | User asks to resume | — |
@@ -99,9 +103,9 @@ When invoked as `/neo <task>`, call `neo_submit_task` with the provided text and
 - **When Neo reports `/app/project/...`, the actual local path is `<workspace>/...`** — e.g. `/app/project/src/main.py` → `<workspace>/src/main.py`. Use this mapping when telling the user where their files are.
 - **Never manually recreate files from Neo's output.** The daemon writes them. Use `neo_get_messages` to read — do not copy-paste output into files yourself.
 - **`workspace` — ALWAYS pass the git/project ROOT, never a subdirectory, never ask the user.** Priority: (1) user gave an explicit path → use it; (2) project in context → use its git root (`git rev-parse --show-toplevel`); (3) fallback → `os.getcwd()`. Passing a subdirectory causes duplicate nested folders (e.g. `project/project/`).
-- **`thread_id` is optional** — the server auto-recovers the last active thread from `~/.neo/active_thread_id`. Omit it unless addressing a specific older thread.
-- **`wait_for_completion: true`** blocks until done and returns output directly. Only use for short tasks (< 3 min). For anything longer, leave it `false` and poll with `neo_task_status`.
-- **Prefer `neo_task_status` over `neo_get_messages`** for mid-run checks — it reads from cache.
+- **`thread_id` is required** for status, messages, evidence, and verification.
+- `neo_submit_task` always returns immediately. Poll with `neo_task_status`, then call `neo_get_messages` after completion.
+- **Prefer `neo_task_status` over `neo_get_messages`** for mid-run checks; it returns a compact live backend view.
 - **Never poll in a tight loop** — call `neo_task_status` once per user turn. The background poller handles the rest.
 - **Model and ID fidelity — never substitute.** When the user names a model, API, package, dataset, or other discrete ID:
   - **Default mode (no BYOK):** copy it **verbatim into `message`** on `neo_submit_task` and `neo_send_feedback`. Do not upgrade, downgrade, shorten, or swap for a "similar" or default model (e.g. do not replace `gemini 3.1 pro` with `gpt-4o` or an older gemini). Either confirm exact IDs via WebSearch / official docs first, or include this in the task prompt: *"Research and confirm every referenced ID against its canonical source before using it. Do NOT fall back to guessed, shortened, or substitute IDs. If any ID is ambiguous or unverifiable, halt and ask for clarification via WAITING_FOR_FEEDBACK — do not proceed."*

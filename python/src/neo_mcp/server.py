@@ -17,6 +17,7 @@ Tools:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +26,15 @@ import subprocess
 import sys
 import threading
 import tempfile
+import uuid
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - native Windows only
+    sys.stderr.write(
+        "neo-mcp Python supports Linux, macOS, and Windows through WSL. "
+        "Native Windows cmd.exe/PowerShell execution is not supported; run it inside WSL.\n"
+    )
+    sys.exit(1)
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -57,10 +67,12 @@ except ImportError as _import_err:  # pragma: no cover - environment guard
     sys.exit(1)
 
 from .action_handlers import ActionHandlers
+from .command_state import append_evidence, read_evidence
 from .system_info import build_context_prefix
 from .auth import derive_deployment_id, get_or_create_deployment_id, get_secret_key
-from .backend_client import BackendClient
+from .backend_client import AmbiguousSubmissionError, BackendClient
 from .backend_poller import BackendPoller
+from .thread_status import forget_thread_status, write_thread_status
 from .byok import (
     ByokError,
     ByokProfileManager,
@@ -78,7 +90,11 @@ from .paths import (
     PID_FILE,
     STANDALONE_UUID_FILE,
     THREAD_WORKSPACES_FILE,
+    daemon_guard_file,
+    deployment_ready_file,
 )
+from .workspace_leases import acquire_workspace, bind_workspace, release_workspace
+from .verification_state import get_verification, set_verification
 
 
 def _package_version() -> str:
@@ -94,6 +110,23 @@ def _package_version() -> str:
         return "unknown"
 
 logger = logging.getLogger(__name__)
+
+_READ_ONLY_TOOLS = frozenset({
+    "neo_task_status",
+    "neo_get_messages",
+    "neo_list_tasks",
+    "neo_list_integrations",
+    "neo_test_integration",
+    "neo_list_byok_profiles",
+    "neo_list_byok_models",
+    "neo_get_execution_evidence",
+})
+
+
+def _read_only_enabled() -> bool:
+    return os.environ.get("NEO_READ_ONLY", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 # ---------------------------------------------------------------------------
 # PyPI update check — fire-and-forget background task
@@ -192,6 +225,29 @@ def _remove_deployment_pid(deployment_id: str) -> None:
         pass
 
 
+def _try_acquire_daemon_guard(deployment_id: str) -> Optional[int]:
+    """Acquire this deployment's lifetime daemon lock, or return ``None``."""
+    DAEMON_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(
+        str(daemon_guard_file(deployment_id)),
+        os.O_CREAT | os.O_WRONLY,
+        0o600,
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _release_daemon_guard(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _resolve_deployment_id(secret_key: Optional[str]) -> str:
     """Best-effort deployment ID for lifecycle commands (stop/restart/uninstall).
 
@@ -244,7 +300,7 @@ def _pid_cmdline(pid: int) -> Optional[str]:
     return None
 
 
-def _pid_is_neo_daemon(pid: int) -> bool:
+def _pid_is_neo_daemon(pid: int, deployment_id: str = "") -> bool:
     """Return True if pid is alive AND its cmdline looks like a neo daemon.
 
     Guards against PID reuse: a dead daemon's PID can be recycled by the OS
@@ -252,16 +308,20 @@ def _pid_is_neo_daemon(pid: int) -> bool:
     liveness check would then misidentify that unrelated process as a live
     neo daemon and wrongly suppress our in-process poller.
 
-    If we can't read the cmdline at all (unknown platform, permission
-    denied), fall back to the liveness-only check to preserve prior behavior.
+    Unverifiable identities fail closed.
     """
     if not _pid_is_alive(pid):
         return False
     cmdline = _pid_cmdline(pid)
-    if cmdline is None:
-        return True  # can't verify — trust liveness
+    if not cmdline:
+        return False
     lowered = cmdline.lower()
-    return "neo-mcp" in lowered or "neo_mcp" in lowered
+    is_neo = "neo-mcp" in lowered or "neo_mcp" in lowered
+    return (
+        is_neo
+        and " daemon" in lowered
+        and (not deployment_id or deployment_id in cmdline)
+    )
 
 
 def _poller_already_running(deployment_id: str = "") -> bool:
@@ -281,7 +341,7 @@ def _poller_already_running(deployment_id: str = "") -> bool:
             data = json.loads(LOCK_FILE.read_text())
             pid = data.get("pid")
             if pid and int(pid) != os.getpid():
-                if _pid_is_neo_daemon(int(pid)):
+                if _pid_is_neo_daemon(int(pid), deployment_id):
                     return True
                 if _pid_is_alive(int(pid)) is False:
                     try:
@@ -309,7 +369,7 @@ def _poller_already_running(deployment_id: str = "") -> bool:
             continue
         if pid == os.getpid():
             continue
-        if _pid_is_neo_daemon(pid):
+        if _pid_is_neo_daemon(pid, deployment_id):
             logger.info("Existing daemon detected via %s (pid=%d) — skipping poller start", pid_file.name, pid)
             return True
         # Stale: either the PID is dead, or it's been reused by an unrelated
@@ -373,7 +433,7 @@ def build_server(
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
-        return [
+        tools = [
             types.Tool(
                 name="neo_submit_task",
                 description=(
@@ -465,12 +525,20 @@ def build_server(
                                 "container path the daemon sees."
                             ),
                         },
+                        "submission_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional UUID used only to retry an ambiguous submission. "
+                                "Normally generated automatically; reuse the exact ID from "
+                                "the previous timeout response."
+                            ),
+                        },
                     },
                     "required": ["message", "workspace"],
                 },
                 annotations=types.ToolAnnotations(
                     readOnlyHint=False,
-                    destructiveHint=False,
+                    destructiveHint=True,
                     idempotentHint=False,
                     openWorldHint=True,
                 ),
@@ -478,8 +546,10 @@ def build_server(
             types.Tool(
                 name="neo_task_status",
                 description=(
-                    "Get the current status of a Neo task. Returns one of: "
-                    "RUNNING (still executing — call again; use neo_task_plan for step details), "
+                    "Fetch a compact, live backend-reported status for a Neo task. "
+                    "This is remote telemetry, not independently verified execution evidence. "
+                    "Returns one of: "
+                    "RUNNING (still executing — call neo_task_status again later), "
                     "COMPLETED (done — call neo_get_messages for output), "
                     "WAITING_FOR_FEEDBACK (Neo is frozen, waiting on you — this is also the "
                     "status neo_task_status reports after neo_pause_task): call "
@@ -488,8 +558,7 @@ def build_server(
                     "call neo_resume_task to continue unchanged, "
                     "TERMINATED or FAILED (ended — call neo_get_messages to read what happened). "
                     "\n\n"
-                    "Reads from an in-memory cache backed by an adaptive background poller "
-                    "(3s–60s). Fast and safe to call once per turn. "
+                    "The response omits verbose backend plan fields and caps activity history. "
                     "Do NOT poll in a tight loop."
                 ),
                 inputSchema={
@@ -513,9 +582,8 @@ def build_server(
                 name="neo_get_messages",
                 description=(
                     "Retrieve the full conversation output from a completed Neo task. "
-                    "Only call when neo_task_status returns COMPLETED — "
-                    "for live progress while RUNNING use neo_task_plan instead "
-                    "(cheaper, shows per-step status without fetching all messages). "
+                    "Only call when neo_task_status returns COMPLETED. "
+                    "For live progress while RUNNING, call neo_task_status again later. "
                     "\n\n"
                     "Output is capped at ~80,000 characters (~20,000 tokens). "
                     "If the response is truncated, paginate backwards using the `before` "
@@ -1023,7 +1091,83 @@ def build_server(
                     openWorldHint=True,
                 ),
             ),
+            types.Tool(
+                name="neo_get_execution_evidence",
+                description=(
+                    "Read bounded, thread-scoped observations recorded by the local daemon. "
+                    "Evidence contains hashes and exit metadata, never credential values. "
+                    "Provenance is local_daemon_observed; it is not remote attestation."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "thread_id": {"type": "string"},
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 500,
+                            "default": 100,
+                        },
+                    },
+                    "required": ["thread_id"],
+                },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+            ),
+            types.Tool(
+                name="neo_verify_task",
+                description=(
+                    "Independently verify local task artifacts using caller-supplied file "
+                    "assertions and optional bounded verification commands. Backend messages "
+                    "alone never produce VERIFIED. Verification commands execute locally and "
+                    "may modify files, so this tool is unavailable in NEO_READ_ONLY mode."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "thread_id": {"type": "string"},
+                        "files": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "exists": {"type": "boolean", "default": True},
+                                    "sha256": {"type": "string"},
+                                    "exact_text": {"type": "string"},
+                                },
+                                "required": ["path"],
+                            },
+                            "default": [],
+                        },
+                        "allowed_files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "commands": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 10,
+                            "default": [],
+                        },
+                    },
+                    "required": ["thread_id"],
+                },
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=True,
+                    idempotentHint=False,
+                    openWorldHint=False,
+                ),
+            ),
         ]
+        if _read_only_enabled():
+            return [tool for tool in tools if tool.name in _READ_ONLY_TOOLS]
+        return tools
 
     # ----------------------------------------------------------------
     # Prompts and resources (Postman + MCP clients)
@@ -1056,12 +1200,32 @@ def build_server(
     @server.call_tool()
     async def call_tool(
         name: str, arguments: Optional[dict[str, Any]]
-    ) -> list[types.TextContent]:
+    ) -> types.CallToolResult:
         args = arguments or {}
+        is_error = False
+
+        if _read_only_enabled() and name not in _READ_ONLY_TOOLS:
+            result = {
+                "error": f"Tool {name!r} is disabled because NEO_READ_ONLY=true."
+            }
+            return types.CallToolResult(
+                content=[
+                    types.TextContent(type="text", text=json.dumps(result, indent=2))
+                ],
+                isError=True,
+            )
 
         try:
             if name == "neo_submit_task":
-                result = await _submit_task(client, deployment_id, poller, workspace, byok, args)
+                result = await _submit_task(
+                    client,
+                    deployment_id,
+                    poller,
+                    workspace,
+                    byok,
+                    args,
+                    require_poller_ready=True,
+                )
             elif name == "neo_task_status":
                 result = await _task_status(client, args)
             elif name == "neo_get_messages":
@@ -1094,19 +1258,35 @@ def build_server(
                 result = _remove_byok_profile(byok, args)
             elif name == "neo_list_byok_models":
                 result = await _list_byok_models(client, args)
+            elif name == "neo_get_execution_evidence":
+                result = _get_execution_evidence(args)
+            elif name == "neo_verify_task":
+                result = await _verify_task(poller, args)
             else:
                 result = {"error": f"Unknown tool: {name}"}
+                is_error = True
         except ByokError as exc:
             result = {"error": str(exc)}
+            is_error = True
         except ValidationError as exc:
             result = {"error": str(exc)}
+            is_error = True
         except RuntimeError as exc:
             result = {"error": str(exc)}
+            is_error = True
         except Exception as exc:  # noqa: BLE001
             logger.error("Tool %s failed: %s", name, exc, exc_info=True)
             result = {"error": str(exc)}
+            is_error = True
 
-        return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+        if isinstance(result, dict) and result.get("error"):
+            is_error = True
+        return types.CallToolResult(
+            content=[
+                types.TextContent(type="text", text=json.dumps(result, indent=2))
+            ],
+            isError=is_error,
+        )
 
     return server, client, poller
 
@@ -1174,6 +1354,8 @@ async def _submit_task(
     default_workspace: str,
     byok: ByokProfileManager,
     args: dict,
+    *,
+    require_poller_ready: bool = False,
 ) -> dict:
     message = args["message"]
     ws_raw = args.get("workspace") or default_workspace
@@ -1249,31 +1431,308 @@ async def _submit_task(
     parts = [p for p in (context_prefix, integrations_xml) if p]
     full_message = "\n".join(parts) + "\n\n" + message if parts else message
 
-    data = await client.init_chat(
-        message=full_message,
-        deployment_id=deployment_id,
-        workspace=ws,
-        wrapper_hint=wrapper_hint,
-        byok_headers=byok_headers,
-    )
+    submission_id = args.get("submission_id") or str(uuid.uuid4())
+    try:
+        submission_id = str(uuid.UUID(str(submission_id)))
+    except (ValueError, TypeError, AttributeError):
+        return {"error": "submission_id must be a valid UUID"}
+
+    acquired, owner = acquire_workspace(ws, submission_id, deployment_id)
+    if not acquired:
+        return {
+            "error": "WORKSPACE_BUSY",
+            "code": "WORKSPACE_BUSY",
+            "workspace": ws,
+            "owner_thread_id": owner.get("thread_id"),
+            "owner_submission_id": owner.get("submission_id"),
+            "owner_state": owner.get("state"),
+        }
+    submission_intent = f"__submission__:{submission_id}"
+    if require_poller_ready:
+        write_thread_status(submission_intent, "RUNNING")
+        if not await _wait_for_submission_ready(deployment_id, submission_intent):
+            forget_thread_status(submission_intent)
+            release_workspace(workspace=ws, submission_id=submission_id)
+            return {
+                "error": "SANDBOX_NOT_READY",
+                "code": "SANDBOX_NOT_READY",
+                "detail": (
+                    "The local daemon did not establish a backend poll connection "
+                    "within the readiness window."
+                ),
+                "submission_id": submission_id,
+            }
+    try:
+        data = await client.init_chat(
+            message=full_message,
+            deployment_id=deployment_id,
+            workspace=ws,
+            wrapper_hint=wrapper_hint,
+            byok_headers=byok_headers,
+            submission_id=submission_id,
+        )
+    except AmbiguousSubmissionError:
+        if require_poller_ready:
+            forget_thread_status(submission_intent)
+        raise
+    except Exception:
+        if require_poller_ready:
+            forget_thread_status(submission_intent)
+        release_workspace(workspace=ws, submission_id=submission_id)
+        raise
+
     thread_id = data.get("thread_id")
-    if thread_id:
-        poller.set_thread_status(thread_id, "RUNNING")
-        # Register wrapper FIRST so the very first command — even a relative
-        # `mkdir -p <slug>/...` that lands before any absolute path teaches
-        # the daemon the slug — gets stripped instead of creating a stray
-        # <slug>/ folder at workspace root.
-        if wrapper_hint:
-            poller.register_thread_wrapper(thread_id, wrapper_hint)
-        # Register workspace NOW — before any poll commands arrive.
-        # ActionHandlers._workspace_for(thread_id) reads this shared dict,
-        # so write_code / run_subprocess will use the correct local path.
-        poller.register_thread_workspace(thread_id, ws)
-    return {"thread_id": thread_id, "status": "submitted", "workspace": ws}
+    try:
+        if thread_id:
+            # Register wrapper FIRST so the very first command — even a relative
+            # `mkdir -p <slug>/...` that lands before any absolute path teaches
+            # the daemon the slug — gets stripped instead of creating a stray
+            # <slug>/ folder at workspace root.
+            if wrapper_hint:
+                poller.register_thread_wrapper(thread_id, wrapper_hint)
+            # Register workspace NOW — before any poll commands arrive.
+            # ActionHandlers._workspace_for(thread_id) reads this shared dict,
+            # so write_code / run_subprocess will use the correct local path.
+            poller.register_thread_workspace(thread_id, ws)
+            bind_workspace(ws, submission_id, thread_id)
+            poller.set_thread_status(thread_id, "RUNNING")
+    finally:
+        if require_poller_ready:
+            forget_thread_status(submission_intent)
+    return {
+        "thread_id": thread_id,
+        "status": "submitted",
+        "workspace": ws,
+        "submission_id": submission_id,
+    }
+
+
+async def _wait_for_submission_ready(
+    deployment_id: str,
+    submission_intent: str,
+) -> bool:
+    timeout = float(os.environ.get("NEO_POLLER_READY_TIMEOUT_SECONDS", "15"))
+    deadline = asyncio.get_running_loop().time() + max(0.1, timeout)
+    ready_file = deployment_ready_file(deployment_id)
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            payload = json.loads(ready_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if (
+            isinstance(payload, dict)
+            and payload.get("deployment_id") == deployment_id
+            and submission_intent in (payload.get("submission_intents") or [])
+        ):
+            return True
+        await asyncio.sleep(0.05)
+    return False
 
 
 async def _task_status(client: BackendClient, args: dict) -> dict:
-    return await client.get_thread_status(args["thread_id"])
+    thread_id = args["thread_id"]
+    raw = await client.get_thread_status(thread_id)
+    status = raw.get("status")
+    if not isinstance(status, str) or not status.strip():
+        raise RuntimeError("Malformed status response: missing string 'status'")
+
+    result: dict[str, Any] = {
+        "thread_id": thread_id,
+        "status": status,
+        "reported_status": status,
+        "provenance": "backend_reported",
+        "status_provenance": "backend_reported",
+        "verification_status": "NOT_RUN",
+    }
+    verification = get_verification(thread_id)
+    if verification:
+        result.update({
+            "verification_status": verification.get("verification_status", "NOT_RUN"),
+            "verification_provenance": verification.get("verification_provenance"),
+            "verified_at": verification.get("verified_at"),
+        })
+    phase = raw.get("processing_phase") or raw.get("phase")
+    if isinstance(phase, str) and phase:
+        result["processing_phase"] = phase[:256]
+    if isinstance(raw.get("auto_mode"), bool):
+        result["auto_mode"] = raw["auto_mode"]
+
+    activity = raw.get("executor_activity")
+    if isinstance(activity, str) and activity:
+        result["executor_activity"] = activity[:512]
+    latest_activity = raw.get("latest_activity")
+    if isinstance(latest_activity, str) and latest_activity:
+        result["latest_activity"] = latest_activity[:512]
+    elif isinstance(latest_activity, dict):
+        result["latest_activity"] = json.dumps(
+            latest_activity, sort_keys=True, default=str,
+        )[:512]
+
+    activity_log = raw.get("executor_activity_log")
+    if isinstance(activity_log, list):
+        compact = []
+        for entry in activity_log[-5:]:
+            if isinstance(entry, dict):
+                compact.append(json.dumps(entry, sort_keys=True, default=str)[:512])
+            elif isinstance(entry, (str, int, float)):
+                compact.append(str(entry)[:512])
+        if compact:
+            result["executor_activity_log"] = compact
+            result["activity_entries_omitted"] = max(0, len(activity_log) - len(compact))
+
+    if status.upper() in {
+        "COMPLETED", "FAILED", "STOPPED", "TERMINATED",
+        "CANCELLED", "WAITING_FOR_FEEDBACK",
+    } and any(
+        key in result
+        for key in ("latest_activity", "executor_activity", "executor_activity_log")
+    ):
+        result["consistency_warnings"] = [
+            "Backend activity entries are unsequenced telemetry and may be historical; "
+            "they do not override the reported status."
+        ]
+    return result
+
+
+def _get_execution_evidence(args: dict) -> dict:
+    thread_id = args["thread_id"]
+    records = read_evidence(thread_id, int(args.get("limit", 100)))
+    return {
+        "thread_id": thread_id,
+        "provenance": "local_daemon_observed",
+        "records": records,
+        "count": len(records),
+    }
+
+
+async def _verify_task(poller: BackendPoller, args: dict) -> dict:
+    thread_id = args["thread_id"]
+    workspace_raw = poller._thread_workspaces.get(thread_id)
+    if not workspace_raw:
+        workspace_raw = _load_thread_workspaces().get(thread_id)
+    if not workspace_raw:
+        return {"error": f"No local workspace registered for thread {thread_id}"}
+    workspace = Path(workspace_raw).resolve()
+    checks: list[dict[str, Any]] = []
+
+    def safe_path(raw: str) -> Path:
+        candidate = Path(raw)
+        if candidate.is_absolute():
+            raise ValueError("Verification paths must be workspace-relative")
+        resolved = (workspace / candidate).resolve()
+        if resolved != workspace and workspace not in resolved.parents:
+            raise ValueError(f"Verification path escapes workspace: {raw}")
+        return resolved
+
+    file_specs = args.get("files") or []
+    commands = args.get("commands") or []
+    allowed_files = args.get("allowed_files")
+    if not file_specs and not commands and allowed_files is None:
+        return {"error": "Provide files, allowed_files, or commands to verify"}
+
+    for spec in file_specs:
+        raw_path = str(spec.get("path") or "")
+        try:
+            path = safe_path(raw_path)
+        except ValueError as exc:
+            checks.append({"kind": "file", "path": raw_path, "ok": False, "error": str(exc)})
+            continue
+        expected_exists = bool(spec.get("exists", True))
+        exists = path.is_file()
+        check: dict[str, Any] = {
+            "kind": "file",
+            "path": raw_path,
+            "exists": exists,
+            "ok": exists == expected_exists,
+        }
+        if exists:
+            content = path.read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+            check.update({"sha256": digest, "size": len(content)})
+            if "sha256" in spec:
+                check["ok"] = check["ok"] and digest == str(spec["sha256"]).lower()
+            if "exact_text" in spec:
+                try:
+                    text = content.decode("utf-8")
+                except UnicodeDecodeError:
+                    check["ok"] = False
+                    check["error"] = "File is not valid UTF-8"
+                else:
+                    check["ok"] = check["ok"] and text == spec["exact_text"]
+        checks.append(check)
+        append_evidence(
+            poller._deployment_id,
+            {
+                "request_id": f"verification-file:{thread_id}:{len(checks) - 1}",
+                "thread_id": thread_id,
+                "action": "verification_file",
+            },
+            {
+                "request_id": f"verification-file:{thread_id}:{len(checks) - 1}",
+                "status": "success" if check.get("ok") else "error",
+                "data": {
+                    "file_path": str(path),
+                    "after_sha256": check.get("sha256"),
+                },
+            },
+            str(workspace),
+        )
+
+    if allowed_files is not None:
+        try:
+            expected = {str(safe_path(str(item)).relative_to(workspace)) for item in allowed_files}
+            actual = {
+                str(path.relative_to(workspace))
+                for path in workspace.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            }
+            checks.append({
+                "kind": "allowed_files",
+                "ok": actual <= expected,
+                "unexpected_files": sorted(actual - expected),
+                "actual_files": sorted(actual),
+            })
+        except ValueError as exc:
+            checks.append({"kind": "allowed_files", "ok": False, "error": str(exc)})
+
+    for index, command in enumerate(commands):
+        job_id = await poller._handlers._job_manager.create_job(
+            str(command), str(workspace), f"verify:{thread_id}"
+        )
+        logs = await poller._handlers._job_manager.wait_for_job(job_id)
+        ok = bool(logs and logs.get("exit_code") == 0 and not logs.get("timed_out"))
+        command_check = {
+            "kind": "command",
+            "index": index,
+            "command_sha256": hashlib.sha256(str(command).encode()).hexdigest(),
+            "ok": ok,
+            "exit_code": logs.get("exit_code") if logs else None,
+            "timed_out": logs.get("timed_out") if logs else None,
+        }
+        checks.append(command_check)
+        append_evidence(
+            poller._deployment_id,
+            {
+                "request_id": f"verification:{thread_id}:{index}",
+                "thread_id": thread_id,
+                "action": "verification_command",
+                "command": str(command),
+            },
+            {
+                "request_id": f"verification:{thread_id}:{index}",
+                "status": "success" if ok else "error",
+                "data": logs or {},
+            },
+            str(workspace),
+        )
+
+    verification_status = "VERIFIED" if checks and all(c.get("ok") for c in checks) else "FAILED"
+    persisted = set_verification(thread_id, verification_status, checks)
+    return {
+        "thread_id": thread_id,
+        "reported_status": "UNQUERIED",
+        **persisted,
+    }
 
 
 async def _get_messages(client: BackendClient, args: dict) -> dict:
@@ -1301,16 +1760,21 @@ async def _send_feedback(
     await client.send_feedback(
         thread_id=args["thread_id"], message=message, byok_headers=byok_headers
     )
+    # Wake the detached daemon — feedback resumes execution.
+    write_thread_status(args["thread_id"], "RUNNING")
     return {"status": "ok", "thread_id": args["thread_id"]}
 
 
 async def _pause_task(client: BackendClient, args: dict) -> dict:
     await client.control_thread(thread_id=args["thread_id"], signal="PAUSE")
+    # Persist so the detached daemon parks v2/poll after drain.
+    write_thread_status(args["thread_id"], "PAUSED")
     return {"status": "paused", "thread_id": args["thread_id"]}
 
 
 async def _resume_task(client: BackendClient, args: dict) -> dict:
     await client.control_thread(thread_id=args["thread_id"], signal="RESUME")
+    write_thread_status(args["thread_id"], "RUNNING")
     return {"status": "resumed", "thread_id": args["thread_id"]}
 
 
@@ -1318,11 +1782,20 @@ async def _stop_task(
     client: BackendClient, poller: BackendPoller, args: dict
 ) -> dict:
     thread_id = args["thread_id"]
+    # Gate commands and terminate local process groups before the remote
+    # cleanup request. If the request fails, fail closed in STOPPING rather
+    # than allowing local work to continue after the user requested stop.
+    write_thread_status(thread_id, "STOPPING")
+    poller.set_thread_status(thread_id, "STOPPING")
     await client.stop_thread(thread_id=thread_id)
-    # Evict from thread-workspaces.json + in-memory caches so stopped threads
-    # don't accumulate across sessions. Status cache is cleared inside
-    # forget_thread, so set_thread_status here would be redundant.
+    # Write TERMINATED to the shared file BEFORE evicting the workspace so the
+    # detached daemon (not this unused in-process poller) sees the gate.
+    write_thread_status(thread_id, "TERMINATED")
+    poller.set_thread_status(thread_id, "TERMINATED")
+    # Evict from thread-workspaces.json so stopped threads don't accumulate.
+    # Status stays TERMINATED in thread-statuses.json for the command gate.
     poller.forget_thread(thread_id)
+    release_workspace(thread_id=thread_id)
     return {"status": "stopped", "thread_id": thread_id}
 
 
@@ -1986,51 +2459,55 @@ def _cmd_self_test(json_mode: bool = False) -> int:
 
 async def run_daemon(secret_key: str, workspace: str, deployment_id: Optional[str] = None) -> None:
     dep = deployment_id or get_or_create_deployment_id(secret_key)
-    if _poller_already_running(dep):
+    guard_fd = _try_acquire_daemon_guard(dep)
+    if guard_fd is None:
         logger.warning("Another daemon is already running for deployment %s", dep)
         return
 
-    thread_workspaces = _load_thread_workspaces()
-    thread_wrappers = _load_thread_wrappers()
-    client = BackendClient(auth_token=secret_key)
-    handlers = ActionHandlers(
-        job_manager=JobManager(),
-        default_workspace=workspace,
-        thread_workspaces=thread_workspaces,
-        thread_wrappers=thread_wrappers,
-    )
-    poller = BackendPoller(
-        deployment_id=dep,
-        client=client,
-        handlers=handlers,
-        thread_workspaces=thread_workspaces,
-        thread_wrappers=thread_wrappers,
-    )
-
-    pid = os.getpid()
-    _write_lock(pid)
-    PID_FILE.write_text(str(pid))
-    _write_deployment_pid(dep, pid)
-    def _shutdown(signum: int, frame: Any) -> None:
-        logger.info("Daemon received signal %d — shutting down", signum)
-        poller.stop()
-
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
-
-    task = asyncio.create_task(poller.run(), name="backend-poller-daemon")
     try:
-        await task
+        thread_workspaces = _load_thread_workspaces()
+        thread_wrappers = _load_thread_wrappers()
+        client = BackendClient(auth_token=secret_key)
+        handlers = ActionHandlers(
+            job_manager=JobManager(),
+            default_workspace=workspace,
+            thread_workspaces=thread_workspaces,
+            thread_wrappers=thread_wrappers,
+        )
+        poller = BackendPoller(
+            deployment_id=dep,
+            client=client,
+            handlers=handlers,
+            thread_workspaces=thread_workspaces,
+            thread_wrappers=thread_wrappers,
+        )
+
+        pid = os.getpid()
+        _write_lock(pid)
+        PID_FILE.write_text(str(pid))
+        _write_deployment_pid(dep, pid)
+        def _shutdown(signum: int, frame: Any) -> None:
+            logger.info("Daemon received signal %d — shutting down", signum)
+            poller.stop()
+
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+
+        task = asyncio.create_task(poller.run(), name="backend-poller-daemon")
+        try:
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            await client.aclose()
+            _remove_deployment_pid(dep)
+            _remove_lock()
     finally:
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        await client.aclose()
-        _remove_deployment_pid(dep)
-        _remove_lock()
+        _release_daemon_guard(guard_fd)
 
 
 def _install_skill_silently() -> None:
@@ -2178,8 +2655,12 @@ def main() -> None:
         sys.exit(1)
 
     if not secret_key:
-        logger.warning("NEO_SECRET_KEY not set — MCP tools unavailable, health endpoint active")
-        threading.Event().wait()  # block forever; health server stays up
-        return
+        message = (
+            "Error: NEO_SECRET_KEY is required for MCP mode. "
+            "Set it to your sk-v1-... API key and restart the MCP connection.\n"
+        )
+        logger.error(message.strip())
+        sys.stderr.write(message)
+        sys.exit(1)
 
     anyio.run(run, secret_key, workspace)

@@ -22,6 +22,7 @@ import httpx
 
 from .config import (
     API_URL,
+    INIT_CHAT_TIMEOUT,
     POLL_MAX_MESSAGES,
     POLL_TIMEOUT,
     POLL_WAIT_TIME,
@@ -40,6 +41,10 @@ _POOL_LIMITS = httpx.Limits(
     max_keepalive_connections=20,
     keepalive_expiry=30.0,
 )
+
+
+class AmbiguousSubmissionError(RuntimeError):
+    """The backend may have created a task, but no response was received."""
 
 
 class BackendClient:
@@ -148,6 +153,7 @@ class BackendClient:
         workspace: Optional[str] = None,
         wrapper_hint: Optional[str] = None,
         byok_headers: Optional[dict[str, str]] = None,
+        submission_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """POST /v2/thread/init-chat-direct — submit a new task.
 
@@ -164,6 +170,8 @@ class BackendClient:
         """
         url = f"{self._base_url}/v2/thread/init-chat-direct"
         headers = {**self._headers(), **(byok_headers or {})}
+        if submission_id:
+            headers["Idempotency-Key"] = submission_id
         payload: dict[str, Any] = {
             "message": message,
             "deployment_id": deployment_id,
@@ -174,52 +182,47 @@ class BackendClient:
         if wrapper_hint:
             payload["wrapper_hint"] = wrapper_hint
 
-        # Retry once on RemoteProtocolError or TimeoutException — both can be
-        # transient: stale keep-alive connections (server already closed them)
-        # or slow cold-starts. httpx auto-retries idempotent methods (GET) but
-        # not POST, so we do it ourselves. Second attempt always gets a fresh
-        # connection.
-        resp: Optional[httpx.Response] = None
-        last_exc: Optional[Exception] = None
-        for attempt in range(2):
-            try:
-                resp = await self._http.post(url, json=payload, headers=headers)
-                last_exc = None
-                break
-            except (httpx.RemoteProtocolError, httpx.TimeoutException) as exc:
-                last_exc = exc
-                if attempt == 0:
-                    logger.debug(
-                        "init_chat: %s on attempt 1 (%s), retrying",
-                        type(exc).__name__,
-                        str(exc) or "<no message>",
-                    )
-                    continue
-            except httpx.RequestError as exc:
-                raise RuntimeError(
-                    f"init_chat network error ({type(exc).__name__}): "
-                    f"{str(exc) or '<no message>'}"
-                ) from exc
-
-        if last_exc is not None:
-            detail = str(last_exc) or "<no message>"
-            if isinstance(last_exc, httpx.TimeoutException):
-                raise RuntimeError(
-                    f"init_chat timed out after {REQUEST_TIMEOUT}s "
-                    f"({type(last_exc).__name__}: {detail})"
-                ) from last_exc
+        # Task creation is not known to be idempotent on all deployed backends.
+        # Retrying an ambiguous timeout can create two tasks in one workspace.
+        try:
+            resp = await self._http.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=INIT_CHAT_TIMEOUT,
+            )
+        except httpx.TimeoutException as exc:
+            detail = str(exc) or "<no message>"
+            raise AmbiguousSubmissionError(
+                f"init_chat timed out after {INIT_CHAT_TIMEOUT}s; outcome is unknown "
+                "and the request was not "
+                f"retried to avoid duplicate task creation (submission_id={submission_id}, "
+                f"{type(exc).__name__}: {detail})"
+            ) from exc
+        except httpx.RequestError as exc:
             raise RuntimeError(
-                f"init_chat network error ({type(last_exc).__name__}): {detail}"
-            ) from last_exc
-
-        assert resp is not None
+                f"init_chat network error ({type(exc).__name__}): "
+                f"{str(exc) or '<no message>'}"
+            ) from exc
         if resp.status_code == 401:
             raise RuntimeError("UNAUTHORIZED")
         if not resp.is_success:
             body = resp.json() if resp.content else {}
             raise RuntimeError(body.get("error") or f"HTTP {resp.status_code}")
 
-        return resp.json()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise AmbiguousSubmissionError(
+                "Malformed successful init_chat response: expected a JSON object; "
+                "the task may still have been created"
+            )
+        thread_id = data.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise AmbiguousSubmissionError(
+                "Malformed successful init_chat response: missing string 'thread_id'; "
+                "the task may still have been created"
+            )
+        return data
 
     async def get_thread_status(self, thread_id: str) -> dict[str, Any]:
         """GET /v2/thread/status/{thread_id}"""
@@ -237,7 +240,10 @@ class BackendClient:
         if not resp.is_success:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
 
-        return resp.json()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("Malformed status response: expected a JSON object")
+        return data
 
     async def get_thread_messages(
         self,

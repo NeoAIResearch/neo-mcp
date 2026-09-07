@@ -8,16 +8,17 @@
 import { randomUUID } from 'crypto';
 import {
   appendFileSync, closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync,
-  readFileSync, renameSync, unlinkSync, writeFileSync, writeSync,
+  readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync,
 } from 'fs';
 import { resolve } from 'path';
 import { deriveDeploymentId, getAuthToken } from './auth.js';
 import { NEO_API_URL, POLL_MAX_INTERVAL, POLL_MAX_MESSAGES } from './config.js';
 import { Command, dispatch, setExecutorLogger } from './executor.js';
 import { DaemonLogger } from './logger.js';
+import { getTaskStatus } from './neo-client.js';
 import {
   DAEMON_DIR, DAEMON_LOG, NEO_MCP_LOG, NPM_PID_FILE, STANDALONE_UUID_FILE,
-  WORKSPACES_FILE, pidFileForDeployment,
+  STATUSES_FILE, WORKSPACES_FILE, pidFileForDeployment,
 } from './paths.js';
 
 // Module-level logger — created lazily so getOrCreateDeploymentId() can run
@@ -60,23 +61,135 @@ const _cmdSemaphore = new _Semaphore(_MAX_CONCURRENT_COMMANDS);
 // Thread status gate — mirrors Python BackendPoller._thread_statuses
 // ---------------------------------------------------------------------------
 
-const _ACCEPTED_STATUSES = new Set(['RUNNING', 'PAUSED']);
+const _ALWAYS_ACCEPTED = new Set(['RUNNING']);
+const _DRAIN_ACCEPTED = new Set(['RUNNING', 'PAUSED']);
 const _threadStatuses = new Map<string, string>();
+let _statusMtime: number | undefined;
+let _draining = false;
+let _drainRemaining = 0;
+
+function parkTickMs(): number {
+  return Number(process.env['NEO_POLL_PARK_TICK_MS'] ?? 2000);
+}
+function drainEmptyPolls(): number {
+  return Number(process.env['NEO_POLL_DRAIN_EMPTY'] ?? 3);
+}
+function emptyStreakBeforeStatus(): number {
+  return Number(process.env['NEO_POLL_STATUS_CHECK_AFTER'] ?? 3);
+}
+
+export function loadThreadStatuses(): Record<string, string> {
+  try {
+    const raw = JSON.parse(readFileSync(STATUSES_FILE, 'utf8')) as Record<string, unknown>;
+    const out: Record<string, string> = {};
+    for (const [tid, val] of Object.entries(raw)) {
+      if (typeof val === 'string' && val) out[tid] = val;
+      else if (val && typeof val === 'object' && typeof (val as { status?: unknown }).status === 'string') {
+        out[tid] = (val as { status: string }).status;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function statusesMtime(): number | undefined {
+  try {
+    return statSync(STATUSES_FILE).mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+export function writeThreadStatus(threadId: string, status: string): void {
+  if (!threadId || !status) return;
+  let data: Record<string, { status: string; updated_at: number }> = {};
+  try {
+    const raw = JSON.parse(readFileSync(STATUSES_FILE, 'utf8')) as Record<string, unknown>;
+    for (const [tid, val] of Object.entries(raw)) {
+      if (typeof val === 'string' && val) {
+        data[tid] = { status: val, updated_at: 0 };
+      } else if (val && typeof val === 'object' && typeof (val as { status?: unknown }).status === 'string') {
+        const updated = (val as { updated_at?: unknown }).updated_at;
+        data[tid] = {
+          status: (val as { status: string }).status,
+          updated_at: typeof updated === 'number' ? updated : 0,
+        };
+      }
+    }
+  } catch {
+    data = {};
+  }
+  data[threadId] = { status, updated_at: Math.floor(Date.now() / 1000) };
+  mkdirSync(DAEMON_DIR, { recursive: true });
+  const tmpFile = `${STATUSES_FILE}.tmp-${process.pid}`;
+  writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+  renameSync(tmpFile, STATUSES_FILE);
+}
+
+function deploymentInUse(): boolean {
+  for (const status of _threadStatuses.values()) {
+    if (status === 'RUNNING') return true;
+  }
+  return false;
+}
+
+function beginDrain(): void {
+  _draining = true;
+  _drainRemaining = drainEmptyPolls();
+}
+
+function reloadStatusesIfChanged(): void {
+  const mtime = statusesMtime();
+  if (mtime === _statusMtime) return;
+  const wasInUse = deploymentInUse();
+  _threadStatuses.clear();
+  for (const [tid, status] of Object.entries(loadThreadStatuses())) {
+    _threadStatuses.set(tid, status);
+  }
+  _statusMtime = mtime;
+  if (deploymentInUse()) {
+    _draining = false;
+    _drainRemaining = 0;
+  } else if (wasInUse) {
+    beginDrain();
+  }
+}
 
 /**
  * Record a thread's lifecycle status so the command gate can allow/reject it.
- * Called by the MCP server on submit (RUNNING) and stop (TERMINATED).
- * Mirrors Python BackendPoller.set_thread_status().
+ * Persists to thread-statuses.json so a detached daemon (or a later restart)
+ * sees pause/stop/resume written by the MCP tools.
  */
 export function setThreadStatus(threadId: string, status: string): void {
+  const wasInUse = deploymentInUse();
   _threadStatuses.set(threadId, status);
+  writeThreadStatus(threadId, status);
+  _statusMtime = statusesMtime();
+  if (deploymentInUse()) {
+    _draining = false;
+    _drainRemaining = 0;
+  } else if (wasInUse) {
+    beginDrain();
+  }
+}
+
+/** Test helper — clear in-memory park/drain state between cases. */
+export function resetPollerStateForTests(): void {
+  _threadStatuses.clear();
+  _statusMtime = undefined;
+  _draining = false;
+  _drainRemaining = 0;
 }
 
 /** Returns false when the thread is known to be terminated/failed — new commands should be rejected. */
 function shouldAccept(threadId: string): boolean {
   const status = _threadStatuses.get(threadId);
   if (status === undefined) return true; // unknown → allow (backwards compat, mirrors Python)
-  return _ACCEPTED_STATUSES.has(status);
+  if (_ALWAYS_ACCEPTED.has(status)) return true;
+  if (_draining && _DRAIN_ACCEPTED.has(status)) return true;
+  return false;
 }
 
 /**
@@ -360,8 +473,16 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
   opts.signal?.addEventListener('abort', stop, { once: true });
 
   let lastCommandTime = 0;       // Date.now() ms, 0 = never
+  let emptyStreak = 0;
+  reloadStatusesIfChanged();
 
   while (running) {
+    reloadStatusesIfChanged();
+    if (!deploymentInUse() && !_draining) {
+      await sleep(parkTickMs());
+      continue;
+    }
+
     // During active execution use wait_time=1 so the poll returns quickly after the
     // backend queues the next command. wait_time=5 is fine when idle (reduces poll traffic).
     const recentlyActive = (Date.now() - lastCommandTime) < 60_000;
@@ -380,7 +501,31 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
     }
 
     if (commands.length === 0) {
-      if (recentlyActive) {
+      emptyStreak++;
+      if (_draining) {
+        _drainRemaining--;
+        if (_drainRemaining <= 0) {
+          _draining = false;
+          logger.info('Drain complete — parking v2/poll');
+        }
+      } else if (deploymentInUse() && emptyStreak >= emptyStreakBeforeStatus()) {
+        emptyStreak = 0;
+        const runningIds = [..._threadStatuses.entries()]
+          .filter(([, s]) => s === 'RUNNING')
+          .map(([tid]) => tid);
+        for (const tid of runningIds) {
+          try {
+            const data = await getTaskStatus(token, tid);
+            const newStatus = typeof data['status'] === 'string' ? data['status'] : '';
+            if (newStatus && newStatus !== 'RUNNING') {
+              setThreadStatus(tid, newStatus);
+            }
+          } catch {
+            // Transient status errors must not park the loop.
+          }
+        }
+      }
+      if (recentlyActive || _draining) {
         // Small yield so the event loop can process signals/timers before next poll.
         await sleep(100);
       } else {
@@ -392,6 +537,7 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
 
     backoffMs = 1_000;
     lastCommandTime = Date.now();
+    emptyStreak = 0;
 
     // Dispatch all commands in this batch concurrently — each runs in its own
     // thread's workspace so there is no ordering dependency between them.

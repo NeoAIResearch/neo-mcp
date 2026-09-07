@@ -279,6 +279,7 @@ export async function runMcpServer(opts: {
         const { headers: byokHeaders, error: byokError } = byok.resolveActiveHeaders();
         if (byokError) return ok({ error: byokError });
         await sendFeedback(token, thread_id, message, byokHeaders ?? undefined);
+        setThreadStatus(thread_id, 'RUNNING');
         return ok({ status: 'ok', thread_id });
       } catch (e) {
         return toolErr(e);
@@ -315,6 +316,7 @@ export async function runMcpServer(opts: {
     async ({ thread_id }: { thread_id: string }) => {
       try {
         await controlThread(token, thread_id, 'PAUSE');
+        setThreadStatus(thread_id, 'PAUSED');
         return ok({ status: 'paused', thread_id });
       } catch (e) {
         return toolErr(e);
@@ -352,6 +354,7 @@ export async function runMcpServer(opts: {
     async ({ thread_id }: { thread_id: string }) => {
       try {
         await controlThread(token, thread_id, 'RESUME');
+        setThreadStatus(thread_id, 'RUNNING');
         return ok({ status: 'resumed', thread_id });
       } catch (e) {
         return toolErr(e);

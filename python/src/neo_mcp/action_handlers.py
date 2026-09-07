@@ -14,13 +14,14 @@ or /tmp — no traversal outside those boundaries is allowed.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import shlex
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Optional, Union
 
 from .integrations import IntegrationManager
@@ -195,7 +196,7 @@ class ActionHandlers:
             ws_str = str(workspace)
             text = re.sub(
                 r'/app/project(?=[/\s\'"\)]|$)',
-                ws_str,
+                lambda _match, replacement=ws_str: replacement,
                 text,
             )
 
@@ -221,7 +222,7 @@ class ActionHandlers:
                     # `/app/my_proj_0001_backup` does not.
                     text = re.sub(
                         rf'{re.escape(root)}/{re.escape(wrapper)}(?=[/\s\'"\)]|$)',
-                        ws_str,
+                        lambda _match, replacement=ws_str: replacement,
                         text,
                     )
             # Step 2: strip leading "<wrapper>/" relative references. Lookbehind
@@ -390,13 +391,23 @@ class ActionHandlers:
         if file_path.suffix in (".sh", ".bash") or (isinstance(code, str) and code.startswith("#!")):
             code = self._apply_wrapper_rewrite(code, thread_id)
 
+        before_sha256 = None
+        if file_path.is_file():
+            before_sha256 = hashlib.sha256(file_path.read_bytes()).hexdigest()
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(code, encoding="utf-8")
+        encoded = code.encode("utf-8")
+        file_path.write_bytes(encoded)
+        after_sha256 = hashlib.sha256(encoded).hexdigest()
         logger.info("File written: %s", file_path)
         return {
             "request_id": request_id,
             "status": "success",
-            "data": {"file_path": str(file_path), "workdir": workdir or ""},
+            "data": {
+                "file_path": str(file_path),
+                "workdir": workdir or "",
+                "before_sha256": before_sha256,
+                "after_sha256": after_sha256,
+            },
         }
 
     async def _get_file(self, cmd: dict) -> dict:
@@ -444,7 +455,6 @@ class ActionHandlers:
         }
 
     async def _run_subprocess(self, cmd: dict) -> dict:
-        import asyncio
         import re
 
         request_id = cmd["request_id"]
@@ -513,17 +523,19 @@ class ActionHandlers:
         guarded_cmd = f"cd {shlex.quote(str(ws_path))} && {command_str}"
 
         if not detach:
-            # Blocking (synchronous) mode — mirrors npm executor.ts hRunSubprocess detach=false.
-            # Run command to completion and return stdout/stderr immediately in the response.
-            proc = await asyncio.create_subprocess_shell(
-                guarded_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=workspace,
-                env=child_env,
+            # Use the same bounded, process-group-aware lifecycle as detached jobs.
+            job_id = await self._job_manager.create_job(
+                guarded_cmd, workspace, thread_id or "unknown",
+                extra_env=extra_env or None,
             )
-            stdout_bytes, stderr_bytes = await proc.communicate()
-            exit_code = proc.returncode or 0
+            logs = await self._job_manager.wait_for_job(job_id)
+            if logs is None:  # defensive: the job was unexpectedly evicted
+                return {
+                    "request_id": request_id,
+                    "status": "error",
+                    "error": "Blocking job disappeared before completion",
+                }
+            exit_code = logs["exit_code"] if logs["exit_code"] is not None else -1
             logger.info(
                 "Subprocess (blocking) done: exit=%d cmd=%r", exit_code, command_str[:80]
             )
@@ -534,10 +546,19 @@ class ActionHandlers:
                     "detached": False,
                     "completed": True,
                     "exit_code": exit_code,
-                    "stdout": stdout_bytes.decode("utf-8", errors="replace"),
-                    "stderr": stderr_bytes.decode("utf-8", errors="replace"),
+                    "stdout": logs["stdout"],
+                    "stderr": logs["stderr"],
+                    "timed_out": logs["timed_out"],
+                    "stdout_truncated": logs["stdout_truncated"],
+                    "stderr_truncated": logs["stderr_truncated"],
+                    "stdout_sha256": logs["stdout_sha256"],
+                    "stderr_sha256": logs["stderr_sha256"],
                 },
-                **({"error": f"Command failed with exit code {exit_code}"} if exit_code != 0 else {}),
+                **(
+                    {"error": "Command timed out"}
+                    if logs["timed_out"]
+                    else ({"error": f"Command failed with exit code {exit_code}"} if exit_code != 0 else {})
+                ),
             }
 
         job_id = await self._job_manager.create_job(
@@ -570,6 +591,8 @@ class ActionHandlers:
                 "stderr": logs["stderr"],
                 "exit_code": logs["exit_code"],
                 "completed": is_completed,
+                "stdout_sha256": logs["stdout_sha256"],
+                "stderr_sha256": logs["stderr_sha256"],
             },
         }
 
@@ -615,6 +638,19 @@ class ActionHandlers:
                 logger.info("list_files: remapped %s → %s", directory, target)
         else:
             target = (ws_resolved / directory).resolve()
+        target_resolved = target.resolve()
+        relative_escaped = (
+            not os.path.isabs(directory)
+            and target_resolved != ws_resolved
+            and ws_resolved not in target_resolved.parents
+        )
+        if relative_escaped or not self._is_allowed_path(target_resolved, ws_resolved):
+            logger.warning("Path traversal blocked in list_files: %s", directory)
+            return {
+                "request_id": request_id,
+                "status": "error",
+                "error": "Path traversal detected",
+            }
 
         if not target.exists():
             return {"request_id": request_id, "status": "error", "error": f"Directory not found: {target}"}
@@ -632,6 +668,18 @@ class ActionHandlers:
                 return
             for entry in entries:
                 if not include_hidden and entry.name.startswith("."):
+                    continue
+                # Never follow directory/file symlinks during recursive discovery.
+                # A link can be replaced between listing and stat; resolving and
+                # checking every entry also closes that race for escaped targets.
+                try:
+                    if entry.is_symlink():
+                        continue
+                    resolved_entry = entry.resolve()
+                except OSError:
+                    continue
+                if not self._is_allowed_path(resolved_entry, ws_resolved):
+                    logger.warning("Skipping list_files entry outside allowed roots: %s", entry)
                     continue
                 if entry.is_dir():
                     lines.append(f"{entry}|d|0")
@@ -691,41 +739,43 @@ class ActionHandlers:
         Trailing slashes on matched paths are preserved.
         """
         roots = ['/app/project', '/workspace', '/project', '/app']
-        result = command
-        for root in roots:
-            # Lookahead prevents a root from matching as a substring of a longer
-            # filename. The character after the root must be either a path
-            # separator (continuation like /app/foo) or a token terminator
-            # (whitespace, quote, shell metachar, or end-of-string). Without
-            # this we got catastrophic rewrites:
-            #   /app/workspace_foo_0635  →  /workspace matched inside → corruption
-            #   /app-backup/data         →  /app matched, leaves "-backup/data"
-            #   /app_extra/foo           →  /app matched, leaves "_extra/foo"
-            pattern = (
-                re.escape(root)
-                + r'(?=/|[\s\'"`;|&<>(){}\[\]\\]|$)'
-                + r'(/[^\s\'"`;|&<>(){}\[\]\\]*)?'
-            )
-            root_path = Path(root)
+        # Match all roots in one pass. Sequential substitutions can accidentally
+        # treat a segment in the replacement workspace itself (for example a
+        # folder named "workspace") as another container root.
+        alternatives = "|".join(re.escape(root) for root in roots)
+        pattern = (
+            rf'(?:{alternatives})'
+            + r'(?=/|[\s\'"`;|&<>(){}\[\]]|$)'
+            + r'(/[^\s\'"`;|&<>(){}\[\]]*)?'
+        )
 
-            def _replace(m: re.Match, _root: Path = root_path, _ws: Path = workspace) -> str:
-                path_str = m.group(0)
-                trailing = path_str.endswith('/')
-                stripped = path_str.rstrip('/')
-                path = Path(stripped) if stripped else _root
-                # Mirror write_code's wrapper-stripping: Neo always wraps its files under
-                # <container_root>/<project-name>/, so `ls /app/<proj>/data/` must resolve
-                # to `<workspace>/data/` — not `<workspace>/<proj>/data/`. Without this,
-                # write_code lands at `<workspace>/data/x.txt` but Neo's verify subprocess
-                # looks at `<workspace>/<proj>/data/x.txt` (wrong) and retries forever.
-                remapped = self._remap_to_workspace(path, _ws, strip_project_wrapper=True)
-                result_str = str(remapped)
-                if trailing and not result_str.endswith('/'):
-                    result_str += '/'
-                return result_str
+        def _replace(m: re.Match, _ws: Path = workspace) -> str:
+            path_str = m.group(0)
+            trailing = path_str.endswith('/')
+            stripped = path_str.rstrip('/')
+            path = Path(stripped)
+            # Mirror write_code's wrapper-stripping: Neo always wraps its files under
+            # <container_root>/<project-name>/, so `ls /app/<proj>/data/` must resolve
+            # to `<workspace>/data/` — not `<workspace>/<proj>/data/`. Without this,
+            # write_code lands at `<workspace>/data/x.txt` but Neo's verify subprocess
+            # looks at `<workspace>/<proj>/data/x.txt` (wrong) and retries forever.
+            remapped = self._remap_to_workspace(path, _ws, strip_project_wrapper=True)
+            result_str = str(remapped)
+            quote_context = self._shell_quote_context(m.string, m.start())
+            if quote_context is None and re.search(r"[\s'\"`$;&|<>(){}\[\]*?!]", result_str):
+                raise ValueError(
+                    "Cannot safely remap an unquoted container path into a workspace "
+                    "containing shell-sensitive characters; quote the /app path."
+                )
+            if quote_context == "'" and "'" in result_str:
+                raise ValueError("Workspace contains a quote unsafe inside single-quoted path")
+            if quote_context == '"' and re.search(r'["`$\\]', result_str):
+                raise ValueError("Workspace contains characters unsafe inside double-quoted path")
+            if trailing and not result_str.endswith('/'):
+                result_str += '/'
+            return result_str
 
-            result = re.sub(pattern, _replace, result)
-        return result
+        return re.sub(pattern, _replace, command)
 
     def _remap_to_workspace(
         self,
@@ -749,18 +799,19 @@ class ActionHandlers:
         Default (False for both): strips only when the first segment matches the workspace
         folder name.  Used by _remap_command_paths where segments may be real subdirs.
         """
-        relative: Optional[Path] = None
+        posix_path = PurePosixPath(str(path))
+        relative: Optional[PurePosixPath] = None
         stripable_root = False
 
         if workdir_hint and os.path.isabs(workdir_hint):
             try:
-                relative = path.relative_to(Path(workdir_hint).resolve())
+                relative = posix_path.relative_to(PurePosixPath(workdir_hint))
             except ValueError:
                 pass
 
         if relative is None:
             try:
-                relative = path.relative_to(Path("/app/project"))
+                relative = posix_path.relative_to(PurePosixPath("/app/project"))
                 # /app/project/ is the workspace mount point — paths under it are
                 # real user paths, NOT wrapper-rooted. Don't auto-strip the first
                 # segment. Legacy workspace-name dedup still applies below.
@@ -769,9 +820,13 @@ class ActionHandlers:
                 pass
 
         if relative is None:
-            for root in [Path("/app"), Path("/workspace"), Path("/project")]:
+            for root in [
+                PurePosixPath("/app"),
+                PurePosixPath("/workspace"),
+                PurePosixPath("/project"),
+            ]:
                 try:
-                    relative = path.relative_to(root)
+                    relative = posix_path.relative_to(root)
                     stripable_root = True
                     break
                 except ValueError:
@@ -797,14 +852,33 @@ class ActionHandlers:
                     "Stripping project wrapper %r from %s (local workspace=%r)",
                     parts[0], path, ws_name,
                 )
-                relative = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+                relative = PurePosixPath(*parts[1:]) if len(parts) > 1 else PurePosixPath(".")
         elif parts and workspace.parts and workspace.parts[-1] == parts[0]:
             # Legacy dedup: strip only when workspace name matches the first segment.
-            relative = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+            relative = PurePosixPath(*parts[1:]) if len(parts) > 1 else PurePosixPath(".")
 
         if str(relative) == ".":
             return workspace
-        return workspace / relative
+        return workspace.joinpath(*relative.parts)
+
+    @staticmethod
+    def _shell_quote_context(text: str, position: int) -> Optional[str]:
+        """Return the active POSIX quote at position, or None when unquoted."""
+        quote: Optional[str] = None
+        index = 0
+        while index < position:
+            char = text[index]
+            if quote is None:
+                if char in {"'", '"'}:
+                    quote = char
+                elif char == "\\":
+                    index += 1
+            elif char == quote:
+                quote = None
+            elif quote == '"' and char == "\\":
+                index += 1
+            index += 1
+        return quote
 
     def _is_allowed_path(self, resolved: Path, workspace: Path) -> bool:
         ws = workspace.resolve()

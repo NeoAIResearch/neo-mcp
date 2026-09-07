@@ -80,8 +80,44 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _pid_cmdline(pid: int) -> Optional[str]:
+    proc_path = Path(f"/proc/{pid}/cmdline")
+    if proc_path.exists():
+        try:
+            return proc_path.read_bytes().replace(b"\x00", b" ").decode(
+                "utf-8", errors="replace"
+            ).strip()
+        except OSError:
+            return None
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _pid_matches_daemon(pid: int, deployment_id: str = "") -> bool:
+    """Fail closed unless PID identity matches our daemon command."""
+    if not _pid_alive(pid):
+        return False
+    cmdline = _pid_cmdline(pid)
+    if not cmdline:
+        return False
+    lowered = cmdline.lower()
+    is_neo = "neo-mcp" in lowered or "neo_mcp" in lowered
+    if not is_neo or " daemon" not in lowered:
+        return False
+    return not deployment_id or deployment_id in cmdline
+
+
 def running_daemon_pids(deployment_id: str = "") -> list[int]:
-    """Collect candidate daemon PIDs from the lock + pid files (deduped, alive)."""
+    """Collect candidate daemon PIDs after strict identity validation."""
     pids: set[int] = set()
     for path in (PID_FILE, _deployment_pid_file(deployment_id) if deployment_id else None):
         if path and path.exists():
@@ -96,7 +132,7 @@ def running_daemon_pids(deployment_id: str = "") -> list[int]:
                 pids.add(int(data["pid"]))
         except (OSError, ValueError, TypeError):
             pass
-    return [p for p in pids if _pid_alive(p)]
+    return [p for p in pids if _pid_matches_daemon(p, deployment_id)]
 
 
 def _neo_mcp_argv(deployment_id: str, workspace: Optional[str]) -> list[str]:

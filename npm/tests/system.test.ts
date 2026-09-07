@@ -48,9 +48,10 @@ import {
   registerThreadWorkspace, loadThreadWorkspaces, loadThreadWorkspacesWithMeta,
   saveThreadWorkspaces, setThreadStatus, runDaemon,
   pollBackend, sendResponse, AuthError,
+  resetPollerStateForTests, loadThreadStatuses, writeThreadStatus,
 } from '../src/daemon.js';
 import {
-  DAEMON_LOG, WORKSPACES_FILE, DAEMON_DIR,
+  DAEMON_LOG, WORKSPACES_FILE, DAEMON_DIR, STATUSES_FILE,
   pidFileForDeployment,
 } from '../src/paths.js';
 import {
@@ -87,6 +88,26 @@ function restoreWorkspacesFile(bak: string | null): void {
   if (existsSync(WORKSPACES_FILE)) rmSync(WORKSPACES_FILE);
   if (bak) {
     writeFileSync(WORKSPACES_FILE, readFileSync(bak));
+    rmSync(bak);
+  }
+}
+
+function backupStatusesFile(): string | null {
+  if (existsSync(STATUSES_FILE)) {
+    const bak = `${STATUSES_FILE}.bak-${process.pid}`;
+    writeFileSync(bak, readFileSync(STATUSES_FILE));
+    writeFileSync(STATUSES_FILE, '{}');
+    return bak;
+  }
+  mkdirSync(DAEMON_DIR, { recursive: true });
+  writeFileSync(STATUSES_FILE, '{}');
+  return null;
+}
+
+function restoreStatusesFile(bak: string | null): void {
+  if (existsSync(STATUSES_FILE)) rmSync(STATUSES_FILE);
+  if (bak) {
+    writeFileSync(STATUSES_FILE, readFileSync(bak));
     rmSync(bak);
   }
 }
@@ -1554,21 +1575,28 @@ describe('sendResponse retry', () => {
 describe('runDaemon integration', () => {
   let ws: string;
   let saved: Record<string, string | undefined>;
+  let statusBak: string | null;
 
   beforeEach(() => {
     ws = makeWs();
-    saved = envBackup('NEO_SECRET_KEY', 'NEO_API_URL', 'NEO_DEPLOYMENT_ID');
+    saved = envBackup('NEO_SECRET_KEY', 'NEO_API_URL', 'NEO_DEPLOYMENT_ID', 'NEO_POLL_PARK_TICK_MS');
     process.env['NEO_SECRET_KEY'] = 'sk-v1-test';
     process.env['NEO_API_URL'] = 'http://test.invalid';
     process.env['NEO_DEPLOYMENT_ID'] = 'test-dep-id-sys';
+    process.env['NEO_POLL_PARK_TICK_MS'] = '50';
+    statusBak = backupStatusesFile();
+    resetPollerStateForTests();
   });
 
   afterEach(() => {
     rmSync(ws, { recursive: true, force: true });
+    restoreStatusesFile(statusBak);
+    resetPollerStateForTests();
     envRestore(saved);
   });
 
   it('does not crash on empty poll response', async () => {
+    setThreadStatus('wake-empty', 'RUNNING');
     let polled = false;
     await runDaemonBriefly(ws, 250, async () => {
       polled = true;
@@ -1588,6 +1616,7 @@ describe('runDaemon integration', () => {
   });
 
   it('dispatches write_code command and POSTs success response', async () => {
+    setThreadStatus('wake-dispatch', 'RUNNING');
     let responseSent = false;
     let pollCount = 0;
 
@@ -1615,6 +1644,7 @@ describe('runDaemon integration', () => {
   });
 
   it('stops when 401 received — AuthError stops the daemon loop', async () => {
+    setThreadStatus('wake-401', 'RUNNING');
     let callCount = 0;
     await runDaemonBriefly(ws, 300, async (url) => {
       callCount++;
@@ -1627,6 +1657,7 @@ describe('runDaemon integration', () => {
   });
 
   it('abort signal stops the daemon loop gracefully', async () => {
+    setThreadStatus('wake-abort', 'RUNNING');
     let polled = false;
     await runDaemonBriefly(ws, 200, async () => {
       polled = true;
@@ -1643,22 +1674,29 @@ describe('runDaemon integration', () => {
 describe('thread status gate', () => {
   let ws: string;
   let saved: Record<string, string | undefined>;
+  let statusBak: string | null;
 
   beforeEach(() => {
     ws = makeWs();
-    saved = envBackup('NEO_SECRET_KEY', 'NEO_API_URL', 'NEO_DEPLOYMENT_ID');
+    saved = envBackup('NEO_SECRET_KEY', 'NEO_API_URL', 'NEO_DEPLOYMENT_ID', 'NEO_POLL_PARK_TICK_MS');
     process.env['NEO_SECRET_KEY'] = 'sk-v1-test';
     process.env['NEO_API_URL'] = 'http://test.invalid';
     process.env['NEO_DEPLOYMENT_ID'] = 'test-dep-id-gate';
+    process.env['NEO_POLL_PARK_TICK_MS'] = '50';
+    statusBak = backupStatusesFile();
+    resetPollerStateForTests();
   });
 
   afterEach(() => {
     rmSync(ws, { recursive: true, force: true });
+    restoreStatusesFile(statusBak);
+    resetPollerStateForTests();
     envRestore(saved);
   });
 
   it('TERMINATED thread: daemon sends error response, file is NOT written', async () => {
     const tid = `sys-gate-term-${Date.now()}`;
+    setThreadStatus('wake-term', 'RUNNING');
     setThreadStatus(tid, 'TERMINATED');
 
     let errorSent = false;
@@ -1719,7 +1757,9 @@ describe('thread status gate', () => {
 
   it('unknown thread (no status set): daemon executes commands — backwards compat', async () => {
     const tid = `sys-gate-unk-${Date.now()}`;
-    // Do NOT call setThreadStatus — thread is unknown
+    // Keep the deployment in use so we poll; the command thread itself is unknown.
+    setThreadStatus('wake-unk', 'RUNNING');
+    // Do NOT call setThreadStatus for tid — thread is unknown
 
     let commandExecuted = false;
     let pollCount = 0;
@@ -1747,9 +1787,10 @@ describe('thread status gate', () => {
     expect(commandExecuted).toBe(true);
   });
 
-  it('PAUSED thread: daemon executes commands (PAUSED ∈ accepted)', async () => {
+  it('PAUSED thread: daemon executes commands during drain', async () => {
     const tid = `sys-gate-paused-${Date.now()}`;
-    setThreadStatus(tid, 'PAUSED');
+    setThreadStatus(tid, 'RUNNING');
+    setThreadStatus(tid, 'PAUSED'); // last RUNNING left → drain, PAUSED still accepted
 
     let commandExecuted = false;
     let pollCount = 0;
@@ -1775,6 +1816,84 @@ describe('thread status gate', () => {
     });
 
     expect(commandExecuted).toBe(true);
+  });
+});
+
+// ===========================================================================
+// PART 21 — Park / wake v2/poll
+// ===========================================================================
+
+describe('park / wake v2/poll', () => {
+  let ws: string;
+  let saved: Record<string, string | undefined>;
+  let statusBak: string | null;
+
+  beforeEach(() => {
+    ws = makeWs();
+    saved = envBackup(
+      'NEO_SECRET_KEY', 'NEO_API_URL', 'NEO_DEPLOYMENT_ID',
+      'NEO_POLL_PARK_TICK_MS', 'NEO_POLL_DRAIN_EMPTY', 'NEO_POLL_STATUS_CHECK_AFTER',
+    );
+    process.env['NEO_SECRET_KEY'] = 'sk-v1-test';
+    process.env['NEO_API_URL'] = 'http://test.invalid';
+    process.env['NEO_DEPLOYMENT_ID'] = 'test-dep-id-park';
+    process.env['NEO_POLL_PARK_TICK_MS'] = '40';
+    process.env['NEO_POLL_DRAIN_EMPTY'] = '2';
+    process.env['NEO_POLL_STATUS_CHECK_AFTER'] = '1';
+    statusBak = backupStatusesFile();
+    resetPollerStateForTests();
+  });
+
+  afterEach(() => {
+    rmSync(ws, { recursive: true, force: true });
+    restoreStatusesFile(statusBak);
+    resetPollerStateForTests();
+    envRestore(saved);
+  });
+
+  it('parked at boot: never calls v2/poll', async () => {
+    let pollCount = 0;
+    await runDaemonBriefly(ws, 180, async (url) => {
+      if (String(url).includes('/v2/poll/')) pollCount++;
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+    expect(pollCount).toBe(0);
+  });
+
+  it('RUNNING thread: calls v2/poll', async () => {
+    setThreadStatus('t-run', 'RUNNING');
+    let pollCount = 0;
+    await runDaemonBriefly(ws, 200, async (url) => {
+      if (String(url).includes('/v2/poll/')) pollCount++;
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+    expect(pollCount).toBeGreaterThan(0);
+  });
+
+  it('WFF confirm parks after empty streak', async () => {
+    setThreadStatus('t-wff', 'RUNNING');
+    let pollCount = 0;
+    await runDaemonBriefly(ws, 800, async (url) => {
+      const urlStr = String(url);
+      if (urlStr.includes('/v2/thread/status/')) {
+        return new Response(JSON.stringify({ status: 'WAITING_FOR_FEEDBACK' }), { status: 200 });
+      }
+      if (urlStr.includes('/v2/poll/')) {
+        pollCount++;
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    });
+    expect(loadThreadStatuses()['t-wff']).toBe('WAITING_FOR_FEEDBACK');
+    expect(pollCount).toBeGreaterThan(0);
+    expect(pollCount).toBeLessThan(12);
+  });
+
+  it('thin-client writeThreadStatus is visible via loadThreadStatuses', () => {
+    writeThreadStatus('t-ipc', 'PAUSED');
+    expect(loadThreadStatuses()['t-ipc']).toBe('PAUSED');
+    writeThreadStatus('t-ipc', 'RUNNING');
+    expect(loadThreadStatuses()['t-ipc']).toBe('RUNNING');
   });
 });
 

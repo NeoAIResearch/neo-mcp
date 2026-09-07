@@ -7,7 +7,19 @@ subsequent disk write (daemon.log, thread-workspaces.json, integrations/)
 into a throwaway tmp dir unique to this test run.
 """
 
+import atexit
 import os
+import shutil
+import sys
 import tempfile
+from pathlib import Path
 
-os.environ.setdefault("NEO_HOME", tempfile.mkdtemp(prefix="neo-test-home-"))
+if "NEO_HOME" not in os.environ:
+    _test_home = tempfile.mkdtemp(prefix="neo-test-home-")
+    os.environ["NEO_HOME"] = _test_home
+    atexit.register(shutil.rmtree, _test_home, ignore_errors=True)
+
+# Always test the checkout, never an unrelated globally installed neo-mcp.
+src = str(Path(__file__).resolve().parents[1] / "src")
+if src not in sys.path:
+    sys.path.insert(0, src)

@@ -11,6 +11,8 @@ export const DAEMON_LOG = join(DAEMON_DIR, 'daemon.log');
 export const NEO_MCP_LOG = join(DAEMON_DIR, 'neo-mcp.log');
 export const NPM_PID_FILE = join(DAEMON_DIR, 'npm_daemon.pid');
 export const WORKSPACES_FILE = join(DAEMON_DIR, 'thread-workspaces.json');
+/** thread_id → lifecycle status. Shared by MCP tools and the live daemon. */
+export const STATUSES_FILE = join(DAEMON_DIR, 'thread-statuses.json');
 
 /** Per-deployment PID file — matches Python daemon's naming for compatibility. */
 export function pidFileForDeployment(deploymentId: string): string {

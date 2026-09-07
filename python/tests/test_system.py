@@ -118,10 +118,8 @@ class TestWriteCode(unittest.TestCase):
 
     def setUp(self):
         self.td = make_ws()
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
         self.h, self.ws = make_handlers(workspace=self.td, thread_workspaces={"t1": self.td})
-
-    def tearDown(self):
-        shutil.rmtree(self.td, ignore_errors=True)
 
     def cmd(self, **kw) -> dict:
         return {"action": "write_code", "request_id": "r", "thread_id": "t1", **kw}
@@ -1338,6 +1336,9 @@ class TestSafeSend(unittest.IsolatedAsyncioTestCase):
 class TestThreadStatusGate(unittest.TestCase):
 
     def setUp(self):
+        from neo_mcp.paths import THREAD_STATUSES_FILE
+
+        THREAD_STATUSES_FILE.unlink(missing_ok=True)
         self.p = make_poller_with_mock_send()
 
     def test_unknown_thread_accepted(self):
@@ -1347,9 +1348,16 @@ class TestThreadStatusGate(unittest.TestCase):
         self.p.set_thread_status("t1", "RUNNING")
         self.assertTrue(self.p._should_accept("t1"))
 
-    def test_paused_thread_accepted(self):
+    def test_paused_thread_accepted_during_drain(self):
+        self.p.set_thread_status("t2", "RUNNING")
         self.p.set_thread_status("t2", "PAUSED")
+        self.assertTrue(self.p._draining)
         self.assertTrue(self.p._should_accept("t2"))
+
+    def test_paused_thread_rejected_when_parked(self):
+        self.p.set_thread_status("t2", "PAUSED")
+        self.assertFalse(self.p._draining)
+        self.assertFalse(self.p._should_accept("t2"))
 
     def test_terminated_thread_rejected(self):
         self.p.set_thread_status("t3", "TERMINATED")
@@ -1491,6 +1499,9 @@ class TestThreadWrapperPersistence(unittest.TestCase):
     re-open the wrapper-learn race after a process bounce."""
 
     def setUp(self):
+        from neo_mcp.paths import THREAD_WORKSPACES_FILE
+
+        THREAD_WORKSPACES_FILE.unlink(missing_ok=True)
         self.td = make_ws()
         self.p = make_poller_with_mock_send()
 
@@ -1611,6 +1622,8 @@ class TestDeploymentId(unittest.TestCase):
         self.td = make_ws()
         self._orig_dep_id = os.environ.get("NEO_DEPLOYMENT_ID")
         self._orig_mode = os.environ.get("NEO_DEPLOYMENT_ID_MODE")
+        os.environ.pop("NEO_DEPLOYMENT_ID", None)
+        os.environ.pop("NEO_DEPLOYMENT_ID_MODE", None)
         self._uuid_file = os.path.join(self.td, "standalone_deployment_id")
         # Patch auth.STANDALONE_UUID_FILE — auth.py uses the imported binding,
         # so we must patch the name in the auth module directly.
@@ -3020,16 +3033,16 @@ class TestRunSubprocessEnvInjection(unittest.IsolatedAsyncioTestCase):
 # ===========================================================================
 
 class TestInitChatErrorMessages(unittest.IsolatedAsyncioTestCase):
-    """Fix #2: timeout error string should be actionable and retry once."""
+    """Task creation timeout errors must be actionable and never auto-retried."""
 
     async def test_timeout_error_string_is_descriptive(self):
         """Empty-message TimeoutException must still produce a useful error."""
         import httpx
         from neo_mcp.backend_client import BackendClient
-        from neo_mcp.config import REQUEST_TIMEOUT
+        from neo_mcp.config import INIT_CHAT_TIMEOUT
 
         client = BackendClient(auth_token="sk-v1-test")
-        # Both attempts raise timeout → retry is exhausted, error surfaces.
+        # A task-creation timeout is ambiguous, so only one request is allowed.
         client._http.post = AsyncMock(side_effect=httpx.ReadTimeout(""))
         try:
             await client.init_chat(message="hi", deployment_id="d")
@@ -3037,13 +3050,14 @@ class TestInitChatErrorMessages(unittest.IsolatedAsyncioTestCase):
         except RuntimeError as exc:
             msg = str(exc)
             self.assertIn("timed out", msg)
-            self.assertIn(f"{REQUEST_TIMEOUT}s", msg, f"timeout value missing: {msg}")
+            self.assertIn(f"{INIT_CHAT_TIMEOUT}s", msg, f"timeout value missing: {msg}")
             self.assertIn("ReadTimeout", msg, f"exception type missing: {msg}")
             # No naked trailing colon.
             self.assertFalse(msg.rstrip().endswith(":"), f"naked colon: {msg!r}")
+            self.assertEqual(client._http.post.await_count, 1)
 
-    async def test_timeout_is_retried_once(self):
-        """First-attempt timeout must retry and succeed on attempt 2."""
+    async def test_timeout_is_not_retried(self):
+        """A timed-out POST may have succeeded remotely."""
         import httpx
         from neo_mcp.backend_client import BackendClient
 
@@ -3056,9 +3070,9 @@ class TestInitChatErrorMessages(unittest.IsolatedAsyncioTestCase):
         client._http.post = AsyncMock(
             side_effect=[httpx.ReadTimeout(""), ok]
         )
-        result = await client.init_chat(message="hi", deployment_id="d")
-        self.assertEqual(result["thread_id"], "t-1")
-        self.assertEqual(client._http.post.await_count, 2)
+        with self.assertRaises(RuntimeError):
+            await client.init_chat(message="hi", deployment_id="d")
+        self.assertEqual(client._http.post.await_count, 1)
 
     async def test_network_error_string_handles_empty_exception(self):
         import httpx
@@ -3112,10 +3126,11 @@ class TestForgetThread(unittest.TestCase):
         self.assertIn("t1", self.p._thread_workspaces)
         self.assertIn("t2", self.p._thread_workspaces)
 
-    def test_forget_thread_also_clears_status_cache(self):
-        self.p.set_thread_status("t1", "RUNNING")
+    def test_forget_thread_keeps_terminated_status_for_gate(self):
+        self.p.set_thread_status("t1", "TERMINATED")
         self.p.forget_thread("t1")
-        self.assertNotIn("t1", self.p._thread_statuses)
+        self.assertEqual(self.p._thread_statuses.get("t1"), "TERMINATED")
+        self.assertFalse(self.p._should_accept("t1"))
 
     def test_forget_thread_also_evicts_wrappers(self):
         self.p.register_thread_wrapper("t1", "rag_system_langchain_0937")
@@ -3131,6 +3146,163 @@ class TestForgetThread(unittest.TestCase):
         self.p.forget_thread("t1")
         raw = json.loads(THREAD_WORKSPACES_FILE.read_text())
         self.assertNotIn("t1", raw)
+
+
+# ===========================================================================
+# PART 31b — Park / wake v2/poll + thin-client status file IPC
+# ===========================================================================
+
+class TestPollerParkWake(unittest.IsolatedAsyncioTestCase):
+    """v2/poll must not run unless some thread is RUNNING."""
+
+    def setUp(self):
+        self.td = make_ws()
+        self._status_file = Path(self.td) / "thread-statuses.json"
+        self._status_patch = patch(
+            "neo_mcp.thread_status.THREAD_STATUSES_FILE", self._status_file
+        )
+        self._interval_patch = patch("neo_mcp.backend_poller.POLL_BASE_INTERVAL", 0.02)
+        self._status_patch.start()
+        self._interval_patch.start()
+        self.p = make_poller_with_mock_send()
+        self.p._client.poll_deployment = AsyncMock(return_value=[])
+        self.p._client.get_thread_status = AsyncMock(return_value={"status": "RUNNING"})
+        self.p._park_tick = 0.02
+        self.p._drain_empty = 2
+        self.p._empty_streak_before_status = 2
+        self.p._current_interval = 0.02
+
+    def tearDown(self):
+        self._interval_patch.stop()
+        self._status_patch.stop()
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    async def _run_briefly(self, seconds: float = 0.12) -> None:
+        task = asyncio.create_task(self.p.run())
+        try:
+            await asyncio.sleep(seconds)
+        finally:
+            self.p.stop()
+            await asyncio.wait_for(task, timeout=1.0)
+
+    async def test_parked_at_boot_never_calls_poll(self):
+        await self._run_briefly()
+        self.p._client.poll_deployment.assert_not_called()
+
+    async def test_running_thread_polls(self):
+        self.p.set_thread_status("t-run", "RUNNING")
+        await self._run_briefly()
+        self.assertGreater(self.p._client.poll_deployment.await_count, 0)
+
+    async def test_wake_on_submit_status(self):
+        task = asyncio.create_task(self.p.run())
+        await asyncio.sleep(0.05)
+        self.p._client.poll_deployment.assert_not_called()
+        self.p.set_thread_status("t-wake", "RUNNING")
+        await asyncio.sleep(0.12)
+        self.p.stop()
+        await asyncio.wait_for(task, timeout=1.0)
+        self.assertGreater(self.p._client.poll_deployment.await_count, 0)
+
+    async def test_pause_parks_after_drain(self):
+        self.p.set_thread_status("t-pause", "RUNNING")
+        self.p.set_thread_status("t-pause", "PAUSED")
+        self.assertTrue(self.p._draining)
+        await self._run_briefly(0.2)
+        self.assertFalse(self.p._draining)
+        self.assertFalse(self.p._deployment_in_use())
+        # Drain allows a few polls, then park — not a tight forever loop.
+        self.assertLessEqual(self.p._client.poll_deployment.await_count, 6)
+
+    async def test_wff_confirm_parks(self):
+        self.p.set_thread_status("t-wff", "RUNNING")
+        self.p._client.get_thread_status = AsyncMock(
+            return_value={"status": "WAITING_FOR_FEEDBACK"}
+        )
+        await self._run_briefly(0.25)
+        self.assertEqual(self.p._thread_statuses.get("t-wff"), "WAITING_FOR_FEEDBACK")
+        self.assertFalse(self.p._deployment_in_use())
+
+    async def test_one_running_keeps_polling_when_other_is_wff(self):
+        self.p.set_thread_status("t-a", "RUNNING")
+        self.p.set_thread_status("t-b", "WAITING_FOR_FEEDBACK")
+        await self._run_briefly()
+        self.assertGreater(self.p._client.poll_deployment.await_count, 0)
+        self.assertTrue(self.p._deployment_in_use())
+
+    def test_thin_client_status_file_reaches_second_poller(self):
+        from neo_mcp.thread_status import write_thread_status
+
+        write_thread_status("t-ipc", "RUNNING")
+        other = make_poller_with_mock_send()
+        other._park_tick = 0.02
+        self.assertEqual(other._thread_statuses.get("t-ipc"), "RUNNING")
+        write_thread_status("t-ipc", "PAUSED")
+        other._status_mtime = None  # force reload (mtime granularity)
+        other._reload_statuses_if_changed()
+        self.assertEqual(other._thread_statuses.get("t-ipc"), "PAUSED")
+        self.assertFalse(other._deployment_in_use())
+
+    def test_write_thread_status_roundtrip(self):
+        from neo_mcp.thread_status import load_thread_statuses, write_thread_status
+
+        write_thread_status("t-rt", "RUNNING")
+        self.assertEqual(load_thread_statuses().get("t-rt"), "RUNNING")
+        write_thread_status("t-rt", "TERMINATED")
+        self.assertEqual(load_thread_statuses().get("t-rt"), "TERMINATED")
+
+
+class TestLifecycleToolsWriteStatus(unittest.IsolatedAsyncioTestCase):
+    """Pause/resume/feedback/stop persist status for the detached daemon."""
+
+    def setUp(self):
+        self.td = make_ws()
+        self._status_file = Path(self.td) / "thread-statuses.json"
+        self._status_patch = patch(
+            "neo_mcp.thread_status.THREAD_STATUSES_FILE", self._status_file
+        )
+        self._status_patch.start()
+
+    def tearDown(self):
+        self._status_patch.stop()
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    async def test_pause_writes_paused(self):
+        from neo_mcp.server import _pause_task
+        from neo_mcp.thread_status import load_thread_statuses
+
+        client = MagicMock()
+        client.control_thread = AsyncMock()
+        await _pause_task(client, {"thread_id": "tid-p"})
+        self.assertEqual(load_thread_statuses().get("tid-p"), "PAUSED")
+
+    async def test_resume_writes_running(self):
+        from neo_mcp.server import _resume_task
+        from neo_mcp.thread_status import load_thread_statuses
+
+        client = MagicMock()
+        client.control_thread = AsyncMock()
+        await _resume_task(client, {"thread_id": "tid-r"})
+        self.assertEqual(load_thread_statuses().get("tid-r"), "RUNNING")
+
+    async def test_stop_writes_terminated_before_forget(self):
+        from neo_mcp.server import _stop_task
+        from neo_mcp.thread_status import load_thread_statuses
+
+        client = MagicMock()
+        client.stop_thread = AsyncMock()
+        poller = make_poller_with_mock_send()
+        await _stop_task(client, poller, {"thread_id": "tid-s"})
+        self.assertEqual(load_thread_statuses().get("tid-s"), "TERMINATED")
+
+    async def test_send_feedback_writes_running(self):
+        from neo_mcp.server import _send_feedback
+        from neo_mcp.thread_status import load_thread_statuses
+
+        client = MagicMock()
+        client.send_feedback = AsyncMock()
+        await _send_feedback(client, _byok_noop(), {"thread_id": "tid-fb", "message": "go"})
+        self.assertEqual(load_thread_statuses().get("tid-fb"), "RUNNING")
 
 
 # ===========================================================================
@@ -3558,19 +3730,25 @@ class TestPollerDetectionPidReuse(unittest.TestCase):
         pid_file = self._daemon_dir / "daemon_12345678.pid"
         pid_file.write_text(str(real_pid))
         with patch.object(self._srv.os, "getpid", return_value=real_pid + 1), \
-             patch.object(self._srv, "_pid_cmdline", return_value="node /usr/bin/neo-mcp-daemon /ws"):
+             patch.object(
+                 self._srv,
+                 "_pid_cmdline",
+                 return_value=(
+                     "python -m neo_mcp daemon --deployment-id "
+                     "12345678-aaaa-bbbb-cccc-ddddeeeeffff /ws"
+                 ),
+             ):
             self.assertTrue(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
         # Live neo daemon's PID file must NOT be deleted.
         self.assertTrue(pid_file.exists())
 
-    def test_falls_back_to_liveness_when_cmdline_unknown(self):
+    def test_fails_closed_when_cmdline_unknown(self):
         real_pid = os.getpid()
         pid_file = self._daemon_dir / "daemon_12345678.pid"
         pid_file.write_text(str(real_pid))
         with patch.object(self._srv.os, "getpid", return_value=real_pid + 1), \
              patch.object(self._srv, "_pid_cmdline", return_value=None):
-            # cmdline unreadable → fall back to alive-only check → treat as live daemon.
-            self.assertTrue(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
+            self.assertFalse(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
 
     def test_dead_pid_file_is_removed(self):
         # Pick a PID that's almost certainly not alive.
