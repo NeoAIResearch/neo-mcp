@@ -513,6 +513,8 @@ async def test_pre_submit_intent_wakes_poller_and_records_readiness(
     readiness = read_json_object(ready_file)
     assert readiness["deployment_id"] == deployment_id
     assert intent in readiness["submission_intents"]
+    assert "version" in readiness
+    assert "observed_at" in readiness
 
 
 @async_test
@@ -545,6 +547,7 @@ async def test_submit_waits_for_matching_poller_readiness(tmp_path: Path) -> Non
             "neo_mcp.server.IntegrationManager.format_integrations_xml",
             return_value="",
         ),
+        patch("neo_mcp.server.ensure_current_daemon", return_value=True),
     ):
         result = await _submit_task(
             client,

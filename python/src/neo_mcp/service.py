@@ -38,8 +38,9 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .paths import (
     DAEMON_DIR,
@@ -49,7 +50,11 @@ from .paths import (
     NEO_DIR,
     PID_FILE,
     THREAD_WORKSPACES_FILE,
+    deployment_ready_file,
 )
+
+# Ready-file heartbeat older than this is not a live poller (park tick is 2s).
+HEARTBEAT_STALE_SECONDS = 10.0
 
 _ENV_FILE = DAEMON_DIR / "neo-mcp.env"
 _SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
@@ -59,11 +64,69 @@ _SKILL_FILE = Path.home() / ".claude" / "skills" / "neo.md"
 
 
 # ---------------------------------------------------------------------------
-# PID / liveness helpers
+# PID / identity helpers (single copy — server.py must not duplicate these)
 # ---------------------------------------------------------------------------
+
+def package_version() -> str:
+    """Installed neo-mcp version, or 'unknown' if metadata is missing."""
+    try:
+        from importlib.metadata import version
+        return version("neo-mcp")
+    except Exception:
+        return "unknown"
+
 
 def _deployment_pid_file(deployment_id: str) -> Path:
     return DAEMON_DIR / f"daemon_{deployment_id.replace('-', '')[:8]}.pid"
+
+
+def identity_payload(pid: int, deployment_id: str = "") -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "pid": pid,
+        "impl": "python",
+        "version": package_version(),
+        "executable": sys.executable,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if deployment_id:
+        payload["deployment_id"] = deployment_id
+    return payload
+
+
+def write_identity(path: Path, pid: int, deployment_id: str = "") -> None:
+    """Write the daemon self-report document (VS Code /health analogue on disk)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(identity_payload(pid, deployment_id)) + "\n")
+
+
+def read_identity(path: Path) -> dict[str, Any]:
+    """Parse a pid/lock document. A bare integer is foreign/legacy (no version)."""
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        return {}
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and data.get("pid") is not None:
+            return data
+        if isinstance(data, int):
+            return {"pid": data}
+    except json.JSONDecodeError:
+        pass
+    try:
+        return {"pid": int(raw)}
+    except ValueError:
+        return {}
+
+
+def _pid_from_identity(data: dict[str, Any]) -> Optional[int]:
+    try:
+        pid = int(data["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -103,7 +166,7 @@ def _pid_cmdline(pid: int) -> Optional[str]:
 
 
 def _pid_matches_daemon(pid: int, deployment_id: str = "") -> bool:
-    """Fail closed unless PID identity matches our daemon command."""
+    """Fail closed unless PID identity matches a neo daemon command."""
     if not _pid_alive(pid):
         return False
     cmdline = _pid_cmdline(pid)
@@ -111,35 +174,170 @@ def _pid_matches_daemon(pid: int, deployment_id: str = "") -> bool:
         return False
     lowered = cmdline.lower()
     is_neo = "neo-mcp" in lowered or "neo_mcp" in lowered
-    if not is_neo or " daemon" not in lowered:
+    is_daemon = (
+        " daemon" in lowered
+        or "neo-mcp-daemon" in lowered
+        or "-m neo_mcp" in lowered
+    )
+    if not is_neo or not is_daemon:
         return False
-    return not deployment_id or deployment_id in cmdline
+    if deployment_id and deployment_id not in cmdline and "neo-mcp-daemon" not in lowered:
+        return False
+    return True
 
 
 def running_daemon_pids(deployment_id: str = "") -> list[int]:
     """Collect candidate daemon PIDs after strict identity validation."""
     pids: set[int] = set()
-    for path in (PID_FILE, _deployment_pid_file(deployment_id) if deployment_id else None):
-        if path and path.exists():
-            try:
-                pids.add(int(path.read_text().strip()))
-            except (OSError, ValueError):
-                pass
-    if LOCK_FILE.exists():
-        try:
-            data = json.loads(LOCK_FILE.read_text())
-            if isinstance(data, dict) and data.get("pid"):
-                pids.add(int(data["pid"]))
-        except (OSError, ValueError, TypeError):
-            pass
+    for path in _identity_paths(deployment_id):
+        pid = _pid_from_identity(read_identity(path))
+        if pid:
+            pids.add(pid)
     return [p for p in pids if _pid_matches_daemon(p, deployment_id)]
 
 
+def _identity_paths(deployment_id: str = "") -> list[Path]:
+    paths = [PID_FILE, LOCK_FILE]
+    if deployment_id:
+        paths.append(_deployment_pid_file(deployment_id))
+        paths.append(DAEMON_DIR / f"daemon_{deployment_id}.pid")
+    paths += [DAEMON_DIR / "npm_daemon.pid", DAEMON_DIR / "python_daemon.pid"]
+    return paths
+
+
+def probe_daemon(deployment_id: str = "") -> dict[str, Any]:
+    """Identity from pid/lock files; capability from a fresh ready-file heartbeat.
+
+    ``liveness_ok`` — a live neo daemon pid for this deployment.
+    ``identity_ok`` — that pid is *this* Python install (version + executable).
+    Missing version means foreign/legacy, not stale.
+    ``heartbeat_ok`` — ready file names this deployment and ``observed_at`` is fresh.
+    ``ok`` is capability (``heartbeat_ok``): any impl that heartbeats is current.
+    """
+    installed_version = package_version()
+    result: dict[str, Any] = {
+        "ok": False,
+        "liveness_ok": False,
+        "identity_ok": False,
+        "heartbeat_ok": False,
+        "pid": None,
+        "impl": None,
+        "version": None,
+        "executable": None,
+        "installed_version": installed_version,
+        "installed_executable": sys.executable,
+        "observed_at": None,
+        "ready_file": str(deployment_ready_file(deployment_id)) if deployment_id else "",
+        "detail": "no daemon identity document",
+    }
+    identity: dict[str, Any] = {}
+    pid: Optional[int] = None
+    for path in _identity_paths(deployment_id):
+        data = read_identity(path)
+        candidate = _pid_from_identity(data)
+        if not candidate or candidate == os.getpid():
+            continue
+        if not _pid_matches_daemon(candidate, deployment_id):
+            continue
+        identity = data
+        pid = candidate
+        break
+    if pid is None:
+        return result
+
+    result["pid"] = pid
+    result["liveness_ok"] = True
+    reported_version = identity.get("version")
+    reported_executable = identity.get("executable")
+    reported_impl = identity.get("impl")
+    result["version"] = reported_version
+    result["executable"] = reported_executable
+    result["impl"] = reported_impl
+    version_ok = isinstance(reported_version, str) and bool(reported_version)
+    if (
+        version_ok
+        and reported_version == installed_version
+        and reported_executable == sys.executable
+    ):
+        result["identity_ok"] = True
+        result["detail"] = f"pid {pid} python {reported_version}"
+    elif not version_ok:
+        result["detail"] = f"pid {pid} is foreign/legacy (no version in pid/lock file)"
+    elif reported_impl == "npm" or (
+        reported_executable and reported_executable != sys.executable
+    ):
+        result["detail"] = (
+            f"pid {pid} is foreign impl={reported_impl!r} version={reported_version!r}"
+        )
+    else:
+        result["detail"] = (
+            f"pid {pid} reports version {reported_version!r}, "
+            f"this process is {installed_version!r}"
+        )
+
+    if deployment_id:
+        try:
+            ready = json.loads(deployment_ready_file(deployment_id).read_text())
+        except (OSError, json.JSONDecodeError):
+            ready = {}
+        if not isinstance(ready, dict):
+            ready = {}
+        observed = ready.get("observed_at")
+        result["observed_at"] = observed
+        heartbeat_ok = (
+            ready.get("deployment_id") == deployment_id
+            and isinstance(observed, (int, float))
+            and (time.time() - float(observed)) < HEARTBEAT_STALE_SECONDS
+        )
+        result["heartbeat_ok"] = heartbeat_ok
+        if heartbeat_ok:
+            result["ok"] = True
+            result["detail"] = f"{result['detail']}, heartbeat fresh"
+        else:
+            result["detail"] = (
+                f"{result['detail']}, ready file missing or stale "
+                f"({result['ready_file']})"
+            )
+    elif result["liveness_ok"]:
+        result["ok"] = True
+    return result
+
+
+def is_current_daemon(deployment_id: str = "") -> bool:
+    """True when a capable daemon (fresh ready-file heartbeat) owns this deployment."""
+    return bool(probe_daemon(deployment_id)["heartbeat_ok"] if deployment_id else probe_daemon(deployment_id)["ok"])
+
+
+def daemon_startable(secret_key: str) -> bool:
+    """True when this process can spawn a replacement daemon."""
+    if not secret_key or not str(secret_key).strip():
+        return False
+    if not sys.executable:
+        return False
+    return True
+
+
+def ensure_current_daemon(
+    secret_key: str,
+    deployment_id: str,
+    workspace: Optional[str] = None,
+    wait: bool = True,
+    force: bool = False,
+) -> bool:
+    """Keep a capable daemon. Never stop a live owner until spawn is startable."""
+    _ = force  # capability (heartbeat), not caller force, decides replacement
+    probe = probe_daemon(deployment_id)
+    if probe.get("heartbeat_ok"):
+        return True
+    if not daemon_startable(secret_key):
+        return False
+    stop_daemon(deployment_id)
+    return spawn_detached_daemon(secret_key, deployment_id, workspace, wait=wait)
+
+
 def _neo_mcp_argv(deployment_id: str, workspace: Optional[str]) -> list[str]:
-    """Argv to launch the daemon: prefer the console script, fall back to ``-m``."""
-    neo_bin = shutil.which("neo-mcp")
-    base = [neo_bin] if neo_bin else [sys.executable, "-m", "neo_mcp"]
-    argv = base + ["daemon", "--deployment-id", deployment_id]
+    """Argv to launch the daemon from this interpreter (VS Code process.execPath)."""
+    argv = [sys.executable, "-m", "neo_mcp", "daemon", "--deployment-id", deployment_id]
     if workspace:
         argv.append(workspace)
     return argv
@@ -183,7 +381,7 @@ def spawn_detached_daemon(
         return True
     for _ in range(20):  # up to 10s
         time.sleep(0.5)
-        if running_daemon_pids(deployment_id):
+        if is_current_daemon(deployment_id):
             return True
     return False
 

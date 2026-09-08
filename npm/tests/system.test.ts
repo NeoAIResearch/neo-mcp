@@ -51,8 +51,8 @@ import {
   resetPollerStateForTests, loadThreadStatuses, writeThreadStatus,
 } from '../src/daemon.js';
 import {
-  DAEMON_LOG, WORKSPACES_FILE, DAEMON_DIR, STATUSES_FILE,
-  pidFileForDeployment,
+  DAEMON_LOG, WORKSPACES_FILE, DAEMON_DIR, STATUSES_FILE, NPM_PID_FILE,
+  deploymentReadyFile, pidFileForDeployment,
 } from '../src/paths.js';
 import {
   ByokManager, normalizeModelId, isSupportedProvider, BYOK_PROVIDERS,
@@ -1339,6 +1339,11 @@ describe('deployment ID policy', () => {
     expect(id1).toBe(id2);
   });
 
+  it('pidFileForDeployment strips hyphens and slices 8 chars', () => {
+    expect(pidFileForDeployment('contract-test')).toContain('daemon_contract.pid');
+    expect(pidFileForDeployment('12345678-aaaa-bbbb-cccc-ddddeeeeffff')).toContain('daemon_12345678.pid');
+  });
+
   it('uses deterministic key-derived UUID when mode=key-derived', () => {
     delete process.env['NEO_DEPLOYMENT_ID'];
     process.env['NEO_DEPLOYMENT_ID_MODE'] = 'key-derived';
@@ -1664,6 +1669,93 @@ describe('runDaemon integration', () => {
       return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
     });
     expect(polled).toBe(true);
+  });
+
+  it('writes JSON identity and a parked ready-file heartbeat', async () => {
+    const ac = new AbortController();
+    const savedFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    ) as typeof fetch;
+    const done = runDaemon({ workspace: ws, signal: ac.signal });
+    const deadline = Date.now() + 1000;
+    let ident: Record<string, unknown> | null = null;
+    while (Date.now() < deadline) {
+      if (existsSync(NPM_PID_FILE)) {
+        try {
+          ident = JSON.parse(readFileSync(NPM_PID_FILE, 'utf8')) as Record<string, unknown>;
+          if (ident['impl'] === 'npm') break;
+        } catch { /* not json yet */ }
+      }
+      await new Promise(r => setTimeout(r, 40));
+    }
+    ac.abort();
+    await done;
+    global.fetch = savedFetch;
+    expect(ident).not.toBeNull();
+    expect(ident!['impl']).toBe('npm');
+    expect(typeof ident!['version']).toBe('string');
+    expect(ident!['pid']).toBe(process.pid);
+  });
+
+  it('ready file appears within 1s while parked', async () => {
+    const ac = new AbortController();
+    const savedFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    ) as typeof fetch;
+    const done = runDaemon({ workspace: ws, signal: ac.signal });
+    const readyPath = deploymentReadyFile('test-dep-id-sys');
+    const deadline = Date.now() + 1000;
+    let seen = false;
+    while (Date.now() < deadline) {
+      if (existsSync(readyPath)) {
+        const ready = JSON.parse(readFileSync(readyPath, 'utf8')) as Record<string, unknown>;
+        if (ready['impl'] === 'npm' && ready['deployment_id'] === 'test-dep-id-sys') {
+          seen = true;
+          break;
+        }
+      }
+      await new Promise(r => setTimeout(r, 50));
+    }
+    ac.abort();
+    await done;
+    global.fetch = savedFetch;
+    expect(seen).toBe(true);
+  });
+
+  it('heartbeat observed_at advances during a long mocked command', async () => {
+    setThreadStatus('wake-heartbeat', 'RUNNING');
+    const readyPath = deploymentReadyFile('test-dep-id-sys');
+    const samples: number[] = [];
+    const ac = new AbortController();
+    const savedFetch = global.fetch;
+    global.fetch = (async (url: string | URL | Request) => {
+      if (String(url).includes('/v2/poll/response')) {
+        return new Response('{}', { status: 200 });
+      }
+      if (String(url).includes('/v2/poll/')) {
+        await new Promise(r => setTimeout(r, 800));
+        return new Response(JSON.stringify([{
+          action: 'noop', request_id: 'req-hb',
+        }]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{}', { status: 404 });
+    }) as typeof fetch;
+    const done = runDaemon({ workspace: ws, signal: ac.signal });
+    const start = Date.now();
+    while (Date.now() - start < 1400) {
+      if (existsSync(readyPath)) {
+        const ready = JSON.parse(readFileSync(readyPath, 'utf8')) as { observed_at?: number };
+        if (typeof ready.observed_at === 'number') samples.push(ready.observed_at);
+      }
+      await new Promise(r => setTimeout(r, 200));
+    }
+    ac.abort();
+    await done;
+    global.fetch = savedFetch;
+    expect(samples.length).toBeGreaterThan(1);
+    expect(Math.max(...samples) - Math.min(...samples)).toBeGreaterThan(0.15);
   });
 });
 

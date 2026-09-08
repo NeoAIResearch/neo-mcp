@@ -11,8 +11,9 @@
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:dist": "node -e \"require('./dist/daemon.js')\"",
     "postinstall": "node scripts/postinstall.js",
-    "prepublishOnly": "npm run build && npm test"
+    "prepublishOnly": "npm run build && npm test && npm run test:dist"
   },
   "engines": {
     "node": ">=18"

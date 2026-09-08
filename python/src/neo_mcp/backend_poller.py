@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -45,6 +46,7 @@ from .paths import (
     THREAD_WORKSPACES_FILE,
     deployment_ready_file,
 )
+from .service import package_version
 from .thread_status import (
     any_running,
     load_thread_statuses,
@@ -125,6 +127,7 @@ class BackendPoller:
 
         self._write_daemon_log()
         self._reload_statuses_if_changed()
+        self._write_readiness()
 
         logger.info(
             "BackendPoller started: deployment_id=%s interval=%.1fs parked=%s",
@@ -142,6 +145,7 @@ class BackendPoller:
             self._reload_statuses_if_changed()
             if not self._deployment_in_use() and not self._draining:
                 # Parked — no v2/poll while the deployment has no RUNNING thread.
+                self._write_readiness()
                 await asyncio.sleep(self._park_tick)
                 continue
 
@@ -302,21 +306,7 @@ class BackendPoller:
     async def _poll(self, wait_time: int = POLL_WAIT_TIME) -> bool:
         """Poll for commands and process them. Returns True if any commands were received."""
         commands = await self._client.poll_deployment(self._deployment_id, wait_time=wait_time)
-        submission_intents = sorted(
-            thread_id
-            for thread_id, status in self._thread_statuses.items()
-            if thread_id.startswith("__submission__:") and status == "RUNNING"
-        )
-        if submission_intents:
-            replace_json_object(
-                deployment_ready_file(self._deployment_id),
-                {
-                    "deployment_id": self._deployment_id,
-                    "pid": os.getpid(),
-                    "observed_at": time.time(),
-                    "submission_intents": submission_intents,
-                },
-            )
+        self._write_readiness()
         if not commands:
             return False
         logger.info("Received %d command(s)", len(commands))
@@ -503,11 +493,36 @@ class BackendPoller:
             self._drain_remaining = 0
         elif was_in_use:
             self._begin_drain()
+        self._write_readiness()
+
+    def _write_readiness(self) -> None:
+        """Local handshake document — written on the loop, not after a backend poll."""
+        submission_intents = sorted(
+            thread_id
+            for thread_id, status in self._thread_statuses.items()
+            if thread_id.startswith("__submission__:") and status == "RUNNING"
+        )
+        replace_json_object(
+            deployment_ready_file(self._deployment_id),
+            {
+                "deployment_id": self._deployment_id,
+                "pid": os.getpid(),
+                "impl": "python",
+                "version": package_version(),
+                "executable": sys.executable,
+                "observed_at": time.time(),
+                "submission_intents": submission_intents,
+            },
+        )
 
     async def _watch_status_file(self) -> None:
-        """Observe thin-client stop requests even while a blocking command runs."""
+        """Observe thin-client stop requests even while a blocking command runs.
+
+        Heartbeat is written every tick so a long handler cannot freeze readiness.
+        """
         while self._running:
             self._reload_statuses_if_changed()
+            self._write_readiness()
             await asyncio.sleep(min(max(self._park_tick / 4, 0.05), 0.5))
 
     async def _confirm_running_thread_statuses(self) -> None:

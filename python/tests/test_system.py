@@ -3699,15 +3699,15 @@ class TestPollerDetectionPidReuse(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
         self._patches = []
-        from neo_mcp import server as _srv
-        # Redirect DAEMON_DIR / LOCK_FILE into a sandboxed tmp directory.
+        from neo_mcp import service
         self._daemon_dir = Path(self._tmp) / "daemon"
         self._daemon_dir.mkdir(parents=True, exist_ok=True)
-        self._patches.append(patch.object(_srv, "DAEMON_DIR", self._daemon_dir))
-        self._patches.append(patch.object(_srv, "LOCK_FILE", self._daemon_dir / "neo-mcp.lock"))
+        self._patches.append(patch.object(service, "DAEMON_DIR", self._daemon_dir))
+        self._patches.append(patch.object(service, "LOCK_FILE", self._daemon_dir / "neo-mcp.lock"))
+        self._patches.append(patch.object(service, "PID_FILE", self._daemon_dir / "neo-mcp.pid"))
         for p in self._patches:
             p.start()
-        self._srv = _srv
+        self._svc = service
 
     def tearDown(self):
         for p in self._patches:
@@ -3715,47 +3715,46 @@ class TestPollerDetectionPidReuse(unittest.TestCase):
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_returns_false_when_pid_is_not_a_neo_daemon(self):
-        # Use our own PID but mask os.getpid() so the suite doesn't short-circuit.
         real_pid = os.getpid()
         pid_file = self._daemon_dir / "daemon_12345678.pid"
         pid_file.write_text(str(real_pid))
-        with patch.object(self._srv.os, "getpid", return_value=real_pid + 1), \
-             patch.object(self._srv, "_pid_cmdline", return_value="/bin/bash"):
-            self.assertFalse(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
-        # Stale file must be cleaned up so next startup doesn't re-trip.
-        self.assertFalse(pid_file.exists())
+        with patch.object(self._svc.os, "getpid", return_value=real_pid + 1), \
+             patch.object(self._svc, "_pid_cmdline", return_value="/bin/bash"):
+            self.assertFalse(self._svc.is_current_daemon("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
 
-    def test_returns_true_when_cmdline_matches_neo_mcp(self):
+    def test_integer_pid_file_without_ready_is_not_current(self):
+        from neo_mcp.paths import deployment_ready_file
+
+        dep = "12345678-aaaa-bbbb-cccc-ddddeeeeffff"
+        deployment_ready_file(dep).unlink(missing_ok=True)
         real_pid = os.getpid()
         pid_file = self._daemon_dir / "daemon_12345678.pid"
         pid_file.write_text(str(real_pid))
-        with patch.object(self._srv.os, "getpid", return_value=real_pid + 1), \
+        with patch.object(self._svc.os, "getpid", return_value=real_pid + 1), \
              patch.object(
-                 self._srv,
+                 self._svc,
                  "_pid_cmdline",
                  return_value=(
                      "python -m neo_mcp daemon --deployment-id "
-                     "12345678-aaaa-bbbb-cccc-ddddeeeeffff /ws"
+                     f"{dep} /ws"
                  ),
-             ):
-            self.assertTrue(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
-        # Live neo daemon's PID file must NOT be deleted.
+             ), \
+             patch.object(self._svc, "_pid_alive", return_value=True):
+            self.assertFalse(self._svc.is_current_daemon(dep))
         self.assertTrue(pid_file.exists())
 
     def test_fails_closed_when_cmdline_unknown(self):
         real_pid = os.getpid()
         pid_file = self._daemon_dir / "daemon_12345678.pid"
         pid_file.write_text(str(real_pid))
-        with patch.object(self._srv.os, "getpid", return_value=real_pid + 1), \
-             patch.object(self._srv, "_pid_cmdline", return_value=None):
-            self.assertFalse(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
+        with patch.object(self._svc.os, "getpid", return_value=real_pid + 1), \
+             patch.object(self._svc, "_pid_cmdline", return_value=None):
+            self.assertFalse(self._svc.is_current_daemon("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
 
-    def test_dead_pid_file_is_removed(self):
-        # Pick a PID that's almost certainly not alive.
+    def test_dead_pid_is_not_current(self):
         pid_file = self._daemon_dir / "daemon_12345678.pid"
         pid_file.write_text("9999999")
-        self.assertFalse(self._srv._poller_already_running("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
-        self.assertFalse(pid_file.exists())
+        self.assertFalse(self._svc.is_current_daemon("12345678-aaaa-bbbb-cccc-ddddeeeeffff"))
 
 
 # ---------------------------------------------------------------------------

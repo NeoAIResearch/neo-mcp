@@ -57,16 +57,13 @@ second submission would collide.**
 
 ## Daemon auto-start — your responsibility
 
-The MCP server already auto-spawns a **detached** daemon on startup, so this should be rare. If `neo_submit_task` still returns `DAEMON_NOT_RUNNING`, start a **detached** daemon yourself and retry — without involving the user:
+The MCP server already auto-spawns a **detached** daemon on startup, so this should be rare. If `neo_submit_task` returns `SANDBOX_NOT_READY` or `DAEMON_NOT_RUNNING`, do **not** start a daemon from this shell — it does not have `NEO_SECRET_KEY`. Stop the stale daemon (this deletes pid and lock files) and reconnect the MCP server so it auto-spawns from its own config:
 
 ```bash
-# pip — detached, immune to terminal/Ctrl-Z:
-setsid neo-mcp daemon >/dev/null 2>&1 < /dev/null &
-# npm equivalent:
-setsid npx --yes neo-mcp-daemon /path/to/workspace >/dev/null 2>&1 < /dev/null &
+neo-mcp stop
 ```
 
-**Never** run `neo-mcp daemon` in the foreground (it blocks forever) or with a bare `&` (it stays attached to your shell session and gets suspended/killed when the editor is backgrounded or its session ends). For a permanent, reboot-surviving daemon the user can run `neo-mcp install-service`. Then immediately retry `neo_submit_task` — handle this yourself, don't hand it back to the user.
+Then reconnect/reload the MCP server and retry `neo_submit_task`. For a permanent, reboot-surviving daemon the user can run `neo-mcp install-service`.
 
 ---
 

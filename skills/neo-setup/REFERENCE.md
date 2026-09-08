@@ -255,17 +255,20 @@ only the server name, command, arguments, and whether the key variable exists.
 ## Detached daemon recovery
 
 The MCP server normally starts the daemon when the first task is submitted.
-Only use recovery after diagnostics show auto-start failed. Keep the daemon
-detached from the editor terminal:
+Only use recovery after diagnostics show auto-start failed. If the daemon is
+stale or unresponsive, stop it first (which cleans up pid and lock files), then
+reconnect the MCP server so it auto-spawns from its own configuration:
 
 ```bash
-setsid neo-mcp daemon >/dev/null 2>&1 < /dev/null &
+neo-mcp stop
 ```
 
-On macOS, if `setsid` is unavailable, use a detached process mechanism native
-to the user's shell and preserve the same properties: no foreground blocking,
-no inherited terminal, and no secret in visible arguments. Prefer the built-in
-MCP auto-start first.
+For permanent, reboot-surviving background execution, the user can install a
+systemd user service:
+
+```bash
+neo-mcp install-service
+```
 
 After recovery, check:
 

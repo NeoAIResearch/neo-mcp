@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import signal
-import subprocess
 import sys
 import threading
 import tempfile
@@ -95,19 +94,17 @@ from .paths import (
 )
 from .workspace_leases import acquire_workspace, bind_workspace, release_workspace
 from .verification_state import get_verification, set_verification
+from .service import (
+    _deployment_pid_file,
+    ensure_current_daemon,
+    package_version,
+    probe_daemon,
+    write_identity,
+)
 
 
 def _package_version() -> str:
-    """Return the installed neo-mcp package version, or 'unknown' if undetectable.
-
-    Surfaced in MCP `serverInfo.version` so Inspector / `claude mcp logs` / editor
-    tool panels all show the same version users see from `pip show neo-mcp`.
-    """
-    try:
-        from importlib.metadata import version
-        return version("neo-mcp")
-    except Exception:
-        return "unknown"
+    return package_version()
 
 logger = logging.getLogger(__name__)
 
@@ -195,11 +192,9 @@ async def _check_for_pypi_update() -> None:
 # Lock file helpers
 # ---------------------------------------------------------------------------
 
-def _write_lock(pid: int) -> None:
-    DAEMON_DIR.mkdir(parents=True, exist_ok=True)
-    LOCK_FILE.write_text(
-        json.dumps({"pid": pid, "started_at": datetime.now(timezone.utc).isoformat()})
-    )
+def _write_lock(pid: int, deployment_id: str = "") -> None:
+    write_identity(LOCK_FILE, pid, deployment_id)
+
 
 def _remove_lock() -> None:
     try:
@@ -209,13 +204,8 @@ def _remove_lock() -> None:
         pass
 
 
-def _deployment_pid_file(deployment_id: str) -> Path:
-    return DAEMON_DIR / f"daemon_{deployment_id.replace('-', '')[:8]}.pid"
-
-
 def _write_deployment_pid(deployment_id: str, pid: int) -> None:
-    DAEMON_DIR.mkdir(parents=True, exist_ok=True)
-    _deployment_pid_file(deployment_id).write_text(str(pid))
+    write_identity(_deployment_pid_file(deployment_id), pid, deployment_id)
 
 
 def _remove_deployment_pid(deployment_id: str) -> None:
@@ -265,126 +255,6 @@ def _resolve_deployment_id(secret_key: Optional[str]) -> str:
         except OSError:
             pass
     return ""
-
-def _pid_is_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def _pid_cmdline(pid: int) -> Optional[str]:
-    """Return the process command line for pid, or None if we can't read it.
-
-    Tries /proc/{pid}/cmdline first (Linux), then `ps -p pid -o args=`
-    (macOS/BSD/Windows-WSL). None means "don't know" — caller should fall
-    back to the liveness-only check rather than assume dead.
-    """
-    proc_cmdline = Path(f"/proc/{pid}/cmdline")
-    if proc_cmdline.exists():
-        try:
-            raw = proc_cmdline.read_bytes()
-            return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
-        except OSError:
-            return None
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "args="],
-            capture_output=True, text=True, timeout=2, check=False,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return None
-
-
-def _pid_is_neo_daemon(pid: int, deployment_id: str = "") -> bool:
-    """Return True if pid is alive AND its cmdline looks like a neo daemon.
-
-    Guards against PID reuse: a dead daemon's PID can be recycled by the OS
-    and handed to an unrelated process (bash, node, etc.). A plain os.kill
-    liveness check would then misidentify that unrelated process as a live
-    neo daemon and wrongly suppress our in-process poller.
-
-    Unverifiable identities fail closed.
-    """
-    if not _pid_is_alive(pid):
-        return False
-    cmdline = _pid_cmdline(pid)
-    if not cmdline:
-        return False
-    lowered = cmdline.lower()
-    is_neo = "neo-mcp" in lowered or "neo_mcp" in lowered
-    return (
-        is_neo
-        and " daemon" in lowered
-        and (not deployment_id or deployment_id in cmdline)
-    )
-
-
-def _poller_already_running(deployment_id: str = "") -> bool:
-    """Return True if any daemon with the same deployment ID is already polling.
-
-    Checks (in order):
-    1. Our own lock file (neo-mcp.lock)
-    2. npm daemon PID file: daemon_{deployment_id}.pid
-    3. Generic fallback PID files: npm_daemon.pid / python_daemon.pid
-
-    Stale PID files pointing at reused, non-neo PIDs are deleted so the
-    next startup doesn't trip on them again.
-    """
-    # 1. Our own lock file
-    if LOCK_FILE.exists():
-        try:
-            data = json.loads(LOCK_FILE.read_text())
-            pid = data.get("pid")
-            if pid and int(pid) != os.getpid():
-                if _pid_is_neo_daemon(int(pid), deployment_id):
-                    return True
-                if _pid_is_alive(int(pid)) is False:
-                    try:
-                        LOCK_FILE.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-        except (OSError, ValueError, TypeError):
-            pass
-
-    # 2–3. Any other daemon writing a PID file under ~/.neo/daemon/
-    candidates = []
-    if deployment_id:
-        candidates.append(DAEMON_DIR / f"daemon_{deployment_id.replace('-', '')[:8]}.pid")
-        candidates.append(DAEMON_DIR / f"daemon_{deployment_id}.pid")
-    candidates += [
-        DAEMON_DIR / "npm_daemon.pid",
-        DAEMON_DIR / "python_daemon.pid",
-    ]
-    for pid_file in candidates:
-        if not pid_file.exists():
-            continue
-        try:
-            pid = int(pid_file.read_text().strip())
-        except (OSError, ValueError):
-            continue
-        if pid == os.getpid():
-            continue
-        if _pid_is_neo_daemon(pid, deployment_id):
-            logger.info("Existing daemon detected via %s (pid=%d) — skipping poller start", pid_file.name, pid)
-            return True
-        # Stale: either the PID is dead, or it's been reused by an unrelated
-        # process. Remove the file so this MCP start (and future ones) don't
-        # suppress our in-process poller.
-        logger.info(
-            "Stale PID file %s (pid=%d not a neo daemon) — removing",
-            pid_file.name, pid,
-        )
-        try:
-            pid_file.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    return False
 
 
 def _load_thread_workspaces() -> dict[str, str]:
@@ -1450,17 +1320,34 @@ async def _submit_task(
     submission_intent = f"__submission__:{submission_id}"
     if require_poller_ready:
         write_thread_status(submission_intent, "RUNNING")
-        if not await _wait_for_submission_ready(deployment_id, submission_intent):
+        secret = get_secret_key() or ""
+        await asyncio.to_thread(
+            ensure_current_daemon, secret, deployment_id, ws, True, False,
+        )
+        ready = await _wait_for_submission_ready(deployment_id, submission_intent)
+        if not ready:
+            await asyncio.to_thread(
+                ensure_current_daemon, secret, deployment_id, ws, True, True,
+            )
+            ready = await _wait_for_submission_ready(deployment_id, submission_intent)
+        if not ready:
             forget_thread_status(submission_intent)
             release_workspace(workspace=ws, submission_id=submission_id)
+            probe = probe_daemon(deployment_id)
+            ready_path = probe.get("ready_file") or str(deployment_ready_file(deployment_id))
             return {
                 "error": "SANDBOX_NOT_READY",
                 "code": "SANDBOX_NOT_READY",
+                "retryable": False,
+                "permanent": True,
                 "detail": (
-                    "The local daemon did not establish a backend poll connection "
-                    "within the readiness window."
+                    f"Local poller ready file was not updated for this submission "
+                    f"({ready_path}). Running daemon: pid={probe.get('pid')} "
+                    f"version={probe.get('version')!r} "
+                    f"(installed {probe.get('installed_version')!r}). "
+                    "This will not succeed on retry. Run `neo-mcp stop` and retry "
+                    "submit, or reconnect the MCP server."
                 ),
-                "submission_id": submission_id,
             }
     try:
         data = await client.init_chat(
@@ -2132,22 +2019,20 @@ async def run(secret_key: str, workspace: str) -> None:
     server, client, _poller = build_server(secret_key=secret_key, workspace=workspace)
 
     deployment_id = get_or_create_deployment_id(secret_key)
-    if _poller_already_running(deployment_id):
+    if await asyncio.to_thread(
+        ensure_current_daemon, secret_key, deployment_id, workspace, False, False,
+    ):
         logger.info(
-            "Backend daemon already running for deployment %s — serving as thin client.",
+            "Backend daemon ready for deployment %s — serving as thin client.",
             deployment_id,
         )
     else:
-        from .service import spawn_detached_daemon
-        if spawn_detached_daemon(secret_key, deployment_id, workspace=workspace):
-            logger.info("Spawned detached backend daemon for deployment %s.", deployment_id)
-        else:
-            logger.warning(
-                "Could not spawn a detached backend daemon for deployment %s — sandbox "
-                "command execution may be unavailable. Start one with "
-                "`neo-mcp install-service` (preferred) or `neo-mcp daemon`.",
-                deployment_id,
-            )
+        logger.warning(
+            "Could not spawn a detached backend daemon for deployment %s — sandbox "
+            "command execution may be unavailable. Start one with "
+            "`neo-mcp install-service` (preferred) or `neo-mcp daemon`.",
+            deployment_id,
+        )
 
     def _shutdown(signum: int, frame: Any) -> None:
         logger.info("Received signal %d — MCP stdio server shutting down", signum)
@@ -2240,17 +2125,9 @@ def _json_print(payload: dict[str, Any]) -> None:
 def _cmd_status(json_mode: bool = False) -> int:
     secret_key = get_secret_key() or ""
     dep_id, source = _deployment_id_source(secret_key)
-    daemon_pid = None
-    daemon_running = False
-    if dep_id:
-        pid_file = _deployment_pid_file(dep_id)
-        if pid_file.exists():
-            try:
-                daemon_pid = int(pid_file.read_text().strip())
-                daemon_running = _pid_is_alive(daemon_pid)
-            except (OSError, ValueError):
-                daemon_pid = None
-                daemon_running = False
+    probe = probe_daemon(dep_id) if dep_id else {}
+    daemon_pid = probe.get("pid")
+    daemon_running = bool(probe.get("heartbeat_ok") or probe.get("liveness_ok"))
 
     thread_count = 0
     if THREAD_WORKSPACES_FILE.exists():
@@ -2323,28 +2200,41 @@ def _cmd_doctor(json_mode: bool = False) -> int:
         "detail": f"{dep_id or 'none'} ({source})",
     })
 
-    daemon_ok = False
-    if dep_id:
-        pf = _deployment_pid_file(dep_id)
-        if pf.exists():
-            try:
-                daemon_ok = _pid_is_alive(int(pf.read_text().strip()))
-            except (OSError, ValueError):
-                daemon_ok = False
+    probe = probe_daemon(dep_id) if dep_id else {}
     checks.append({
-        "name": "daemon_running_for_deployment",
-        "ok": daemon_ok,
-        "detail": dep_id or "no deployment id",
+        "name": "daemon_liveness",
+        "ok": bool(probe.get("liveness_ok")),
+        "detail": (
+            f"pid {probe.get('pid')}"
+            if probe.get("liveness_ok")
+            else (probe.get("detail") or (dep_id or "no deployment id"))
+        ),
+    })
+    checks.append({
+        "name": "daemon_identity",
+        "ok": bool(probe.get("identity_ok") or probe.get("heartbeat_ok")),
+        "detail": probe.get("detail") or (dep_id or "no deployment id"),
+    })
+    checks.append({
+        "name": "daemon_capability",
+        "ok": bool(probe.get("heartbeat_ok")),
+        "detail": (
+            f"heartbeat fresh observed_at={probe.get('observed_at')}"
+            if probe.get("heartbeat_ok")
+            else (probe.get("detail") or (dep_id or "no deployment id"))
+        ),
     })
 
+    required = [c for c in checks if c["name"] != "daemon_identity"]
     payload = {
         "mode": "stdio-daemon-first",
         "http_mode": "obsolete-not-used",
-        "all_ok": all(c["ok"] for c in checks),
+        "all_ok": all(c["ok"] for c in required),
         "checks": checks,
         "hints": [
             "Set NEO_SECRET_KEY=sk-v1-... if missing",
-            "Run `neo-mcp daemon` in a separate terminal for local execution",
+            "Run `neo-mcp stop` then reconnect the MCP server if the daemon is stale",
+            "Python poller logs: ~/.neo/daemon/neo-mcp.log (daemon.log is shared with the editor extension)",
             "Use default machine deployment ID unless you explicitly need deterministic key-derived mode",
         ],
     }
@@ -2483,8 +2373,8 @@ async def run_daemon(secret_key: str, workspace: str, deployment_id: Optional[st
         )
 
         pid = os.getpid()
-        _write_lock(pid)
-        PID_FILE.write_text(str(pid))
+        _write_lock(pid, dep)
+        write_identity(PID_FILE, pid, dep)
         _write_deployment_pid(dep, pid)
         def _shutdown(signum: int, frame: Any) -> None:
             logger.info("Daemon received signal %d — shutting down", signum)

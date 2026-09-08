@@ -18,8 +18,13 @@ import { DaemonLogger } from './logger.js';
 import { getTaskStatus } from './neo-client.js';
 import {
   DAEMON_DIR, DAEMON_LOG, NEO_MCP_LOG, NPM_PID_FILE, STANDALONE_UUID_FILE,
-  STATUSES_FILE, WORKSPACES_FILE, pidFileForDeployment,
+  STATUSES_FILE, WORKSPACES_FILE, deploymentReadyFile, pidFileForDeployment,
 } from './paths.js';
+
+const NPM_VERSION = String(
+  (JSON.parse(readFileSync(resolve(__dirname, '..', 'package.json'), 'utf8')) as { version?: string })
+    .version ?? 'unknown',
+);
 
 // Module-level logger — created lazily so getOrCreateDeploymentId() can run
 // even when nothing is going to be logged (e.g. setThreadStatus from tests).
@@ -208,15 +213,48 @@ function writeSandboxLog(deploymentId: string): void {
   appendFileSync(DAEMON_LOG, `[${ts}] [INFO] npm-daemon started ${meta}\n`);
 }
 
+function identityPayload(deploymentId: string): Record<string, unknown> {
+  return {
+    pid: process.pid,
+    impl: 'npm',
+    version: NPM_VERSION,
+    started_at: new Date().toISOString(),
+    deployment_id: deploymentId,
+  };
+}
+
 function writePidFiles(deploymentId: string): void {
   mkdirSync(DAEMON_DIR, { recursive: true });
-  writeFileSync(NPM_PID_FILE, String(process.pid));
-  writeFileSync(pidFileForDeployment(deploymentId), String(process.pid));
+  const body = JSON.stringify(identityPayload(deploymentId)) + '\n';
+  writeFileSync(NPM_PID_FILE, body);
+  writeFileSync(pidFileForDeployment(deploymentId), body);
+}
+
+function writeReadiness(deploymentId: string): void {
+  reloadStatusesIfChanged();
+  const submissionIntents = [..._threadStatuses.entries()]
+    .filter(([tid, status]) => tid.startsWith('__submission__:') && status === 'RUNNING')
+    .map(([tid]) => tid)
+    .sort();
+  const payload = {
+    deployment_id: deploymentId,
+    pid: process.pid,
+    impl: 'npm',
+    version: NPM_VERSION,
+    observed_at: Date.now() / 1000,
+    submission_intents: submissionIntents,
+  };
+  mkdirSync(DAEMON_DIR, { recursive: true });
+  const readyPath = deploymentReadyFile(deploymentId);
+  const tmpFile = `${readyPath}.tmp-${process.pid}`;
+  writeFileSync(tmpFile, JSON.stringify(payload));
+  renameSync(tmpFile, readyPath);
 }
 
 function cleanupPidFiles(deploymentId: string): void {
   try { unlinkSync(NPM_PID_FILE); } catch { /* ignore */ }
   try { unlinkSync(pidFileForDeployment(deploymentId)); } catch { /* ignore */ }
+  try { unlinkSync(deploymentReadyFile(deploymentId)); } catch { /* ignore */ }
 }
 
 export function getOrCreateDeploymentId(): string {
@@ -449,6 +487,10 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
   mkdirSync(DAEMON_DIR, { recursive: true });
   writePidFiles(depId);
   writeSandboxLog(depId);
+  writeReadiness(depId);
+  const readyTicker = setInterval(() => {
+    try { writeReadiness(depId); } catch { /* ignore */ }
+  }, 500);
 
   // Initialise the runtime logger now that we know deploymentId. Every line
   // it writes carries deploymentId in the meta automatically.
@@ -467,7 +509,11 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
   let backoffMs = 1_000;
   let running = true;
 
-  const stop = (): void => { running = false; cleanupPidFiles(depId); };
+  const stop = (): void => {
+    running = false;
+    clearInterval(readyTicker);
+    cleanupPidFiles(depId);
+  };
   process.on('SIGTERM', () => { stop(); process.exit(0); });
   process.on('SIGINT',  () => { stop(); process.exit(0); });
   opts.signal?.addEventListener('abort', stop, { once: true });
