@@ -12,6 +12,7 @@ survives if the in-memory buffer is truncated.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import signal
@@ -25,9 +26,9 @@ from .paths import JOBS_LOG_DIR
 
 logger = logging.getLogger(__name__)
 
-MAX_LOG_BYTES = 10 * 1024 * 1024  # 10 MB per stream
+MAX_LOG_BYTES = int(os.environ.get("NEO_JOB_MAX_LOG_BYTES", str(10 * 1024 * 1024)))
 JOB_TTL = 24 * 60 * 60            # 24 hours in seconds
-JOB_MAX_RUNTIME = 30 * 60         # 30 minutes — kill hung subprocesses
+JOB_MAX_RUNTIME = float(os.environ.get("NEO_JOB_MAX_RUNTIME_SECONDS", str(30 * 60)))
 
 
 @dataclass
@@ -42,6 +43,12 @@ class _Job:
     exit_code: Optional[int] = None
     stdout: str = ""
     stderr: str = ""
+    timed_out: bool = False
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    stdout_sha256: Optional[str] = None
+    stderr_sha256: Optional[str] = None
+    _proc: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
     _task: Optional[asyncio.Task] = field(default=None, repr=False)
 
 
@@ -99,6 +106,11 @@ class JobManager:
             "completed_at": (
                 job.completed_at.isoformat() if job.completed_at else None
             ),
+            "timed_out": job.timed_out,
+            "stdout_truncated": job.stdout_truncated,
+            "stderr_truncated": job.stderr_truncated,
+            "stdout_sha256": job.stdout_sha256,
+            "stderr_sha256": job.stderr_sha256,
         }
 
     def terminate_job(self, job_id: str) -> bool:
@@ -113,22 +125,34 @@ class JobManager:
         if job.completed_at is not None:
             return True  # already done
 
-        if job.pid is not None:
-            try:
-                os.kill(job.pid, signal.SIGTERM)
-                logger.info("Sent SIGTERM to job %s pid %s", job_id, job.pid)
-                asyncio.get_event_loop().call_later(
-                    5.0, self._force_kill, job
-                )
-            except ProcessLookupError:
-                pass  # process already gone
-
-        if job._task and not job._task.done():
-            job._task.cancel()
-
-        job.completed_at = datetime.now(timezone.utc)
-        job.exit_code = -1
+        if job._proc is None:
+            if job._task and not job._task.done():
+                job._task.cancel()
+            job.completed_at = datetime.now(timezone.utc)
+            job.exit_code = -1
+            return True
+        self._signal_process_group(job, signal.SIGTERM)
+        logger.info("Sent SIGTERM to job %s pid %s", job_id, job.pid)
+        asyncio.get_event_loop().call_later(5.0, self._force_kill, job)
         return True
+
+    def terminate_thread_jobs(self, thread_id: str) -> int:
+        """Terminate all active jobs owned by ``thread_id``."""
+        count = 0
+        for job in list(self._jobs.values()):
+            if job.thread_id == thread_id and job.completed_at is None:
+                if self.terminate_job(job.job_id):
+                    count += 1
+        return count
+
+    async def wait_for_job(self, job_id: str) -> Optional[dict]:
+        """Wait for a managed job and return its final bounded log snapshot."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        if job._task is not None:
+            await asyncio.shield(job._task)
+        return self.get_job_logs(job_id)
 
     def cleanup_old_jobs(self) -> None:
         """Remove completed jobs older than JOB_TTL from memory."""
@@ -171,7 +195,9 @@ class JobManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                start_new_session=True,
             )
+            job._proc = proc
             job.pid = proc.pid
 
             # Stream stdout and stderr concurrently into memory + log files,
@@ -186,27 +212,26 @@ class JobManager:
                             self._stream_output(proc.stderr, job, "stderr", stderr_path)
                         )
             except TimeoutError:
+                job.timed_out = True
                 logger.warning(
                     "Job %s exceeded max runtime (%ds) — killing", job.job_id, JOB_MAX_RUNTIME
                 )
-                job.stderr += f"\n[Killed: exceeded {JOB_MAX_RUNTIME}s max runtime]"
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+                self._append_capped(
+                    job, "stderr",
+                    f"\n[Killed: exceeded {JOB_MAX_RUNTIME}s max runtime]",
+                )
+                self._signal_process_group(job, signal.SIGKILL)
 
             job.exit_code = await proc.wait()
         except asyncio.CancelledError:
             # Kill the subprocess so the asyncio event loop doesn't wait for it.
             if proc is not None:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+                self._signal_process_group(job, signal.SIGKILL)
+                await proc.wait()
             job.exit_code = -1
         except Exception as exc:  # noqa: BLE001
             logger.error("Job %s crashed: %s", job.job_id, exc)
-            job.stderr += f"\n[Error: {exc}]"
+            self._append_capped(job, "stderr", f"\n[Error: {exc}]")
             job.exit_code = -1
         finally:
             job.completed_at = datetime.now(timezone.utc)
@@ -227,6 +252,7 @@ class JobManager:
     ) -> None:
         if stream is None:
             return
+        digest = hashlib.sha256()
         try:
             with open(log_path, "ab") as fh:
                 while True:
@@ -234,29 +260,45 @@ class JobManager:
                     if not chunk:
                         break
                     text = chunk.decode("utf-8", errors="replace")
+                    digest.update(chunk)
                     fh.write(chunk)
                     fh.flush()
-                    # Append to in-memory buffer with size cap
-                    buf = getattr(job, name) + text
-                    if len(buf) > MAX_LOG_BYTES:
-                        keep = int(MAX_LOG_BYTES * 0.8)
-                        buf = buf[-keep:]
-                    setattr(job, name, buf)
+                    self._append_capped(job, name, text)
         except Exception as exc:  # noqa: BLE001
             logger.debug("_stream_output %s error: %s", name, exc)
+        finally:
+            setattr(job, f"{name}_sha256", digest.hexdigest())
 
     def _stop_log_tailing(self, job: _Job) -> None:
         if job._task and not job._task.done():
             job._task.cancel()
 
     def _force_kill(self, job: _Job) -> None:
-        if job.completed_at is not None and job.exit_code != -1:
+        if job.completed_at is not None:
             return  # exited cleanly already
-        if job.pid is not None:
-            try:
-                os.kill(job.pid, signal.SIGKILL)
-                logger.warning("Sent SIGKILL to job %s pid %s", job.job_id, job.pid)
-            except ProcessLookupError:
-                pass
-        job.completed_at = datetime.now(timezone.utc)
-        job.exit_code = -1
+        self._signal_process_group(job, signal.SIGKILL)
+        logger.warning("Sent SIGKILL to job %s pid %s", job.job_id, job.pid)
+
+    @staticmethod
+    def _signal_process_group(job: _Job, sig: signal.Signals) -> None:
+        """Signal the job's dedicated process group, never a reused bare PID."""
+        proc = job._proc
+        if proc is None or proc.returncode is not None or job.pid is None:
+            return
+        try:
+            os.killpg(job.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
+    def _append_capped(job: _Job, name: str, text: str) -> None:
+        """Append text while enforcing a UTF-8 byte cap per stream."""
+        current = (getattr(job, name) + text).encode("utf-8", errors="replace")
+        if len(current) > MAX_LOG_BYTES:
+            current = current[-int(MAX_LOG_BYTES * 0.8):]
+            # Avoid beginning in the middle of a UTF-8 sequence.
+            value = current.decode("utf-8", errors="ignore")
+            setattr(job, f"{name}_truncated", True)
+        else:
+            value = current.decode("utf-8", errors="replace")
+        setattr(job, name, value)

@@ -1,14 +1,16 @@
 [build-system]
-requires = ["setuptools>=42"]
+# Cap setuptools so a future breaking major cannot sneak into isolated builds;
+# floor is high enough for pyproject/package-data support used by this package.
+requires = ["setuptools>=68,<90"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "neo-mcp"
-version = "0.5.9"
+version = "0.5.15"
 description = "Neo MCP server — bring Neo, the autonomous AI engineer for ML, LLM, GenAI & data workflows, into Claude Code, Cursor, Codex & other editors. Describe a task; Neo builds it and writes results to your repo."
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.11"
+requires-python = ">=3.11,<4"
 keywords = [
     "mcp", "model-context-protocol", "mcp-server", "neo",
     "claude-code", "cursor", "codex", "windsurf",
@@ -27,18 +29,27 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "mcp>=1.26.0",
-    "httpx>=0.27.0",
-    "anyio>=4.0.0",
+    # Major caps on every direct dep so open floors cannot pull breaking majors
+    # (e.g. mcp 2.0.0 broke the v1 Server/stdio API this package imports).
+    # Floors track the mcp 1.28+ support line and that package's own mins.
+    "mcp>=1.28,<2",
+    "httpx>=0.28.0,<1",
+    "anyio>=4.5,<5",
+    # pydantic + typing_inspection are pulled in transitively by `mcp`, but we
+    # declare them explicitly so a partial/resolver-skipped install can't leave
+    # pydantic importable-but-broken (missing typing_inspection) — which crashes
+    # the stdio server at import time and surfaces as "-32000 / Connection closed".
+    "pydantic>=2.11,<3",
+    "typing_inspection>=0.4.1,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0",
-    "keyring>=24.0",
+    "pytest>=8.0,<10",
+    "keyring>=25.0,<26",
 ]
 keyring = [
-    "keyring>=24.0",
+    "keyring>=25.0,<26",
 ]
 
 [tool.pytest.ini_options]

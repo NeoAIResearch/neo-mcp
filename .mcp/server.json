@@ -1,12 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.NeoAIResearch/neo-mcp",
+  "name": "io.github.NeoResearchAI/MCPServer",
   "title": "Neo — AI/ML Engineering",
   "description": "AI/ML engineering MCP server for Neo — submit tasks, track execution, and retrieve outputs.",
-  "version": "0.5.9",
+  "version": "0.5.13",
   "websiteUrl": "https://heyneo.com",
   "repository": {
-    "url": "https://github.com/NeoAIResearch/neo-mcp",
+    "url": "https://github.com/NeoResearchAI/MCPServer",
     "source": "github",
     "subfolder": "python"
   },
@@ -15,7 +15,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "neo-mcp",
-      "version": "0.5.9",
+      "version": "0.5.13",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

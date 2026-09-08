@@ -1,6 +1,6 @@
 # Postman MCP Collection Guide
 
-Use this guide to configure and test Neo MCP in Postman after installing `neo-mcp` 0.5.9+.
+Use this guide to configure and test Neo MCP in Postman after installing `neo-mcp` 0.5.13+.
 
 ## Prerequisites
 
@@ -27,7 +27,7 @@ Paste into the Postman MCP request command field:
   "mcpServers": {
     "neo": {
       "command": "uvx",
-      "args": ["neo-mcp@0.5.9"],
+      "args": ["neo-mcp@0.5.13"],
       "env": {
         "NEO_SECRET_KEY": "{{NEO_SECRET_KEY}}",
         "NEO_WORKSPACE_DIR": "{{NEO_WORKSPACE_DIR}}"
@@ -98,8 +98,8 @@ NEO MCP
 
 | Issue | Fix |
 |-------|-----|
-| Empty Prompts/Resources tabs | Upgrade to neo-mcp 0.5.9+ and **Load Capabilities** again |
-| Resource read error (`TextResourceContents`) | Upgrade to 0.5.9+ (uses `ReadResourceContents`) |
+| Empty Prompts/Resources tabs | Upgrade to neo-mcp 0.5.13+ and **Load Capabilities** again |
+| Resource read error (`TextResourceContents`) | Upgrade to 0.5.13+ (uses `ReadResourceContents`) |
 | Files land in wrong folder | Set `NEO_WORKSPACE_DIR` to absolute git root |
 | `neo_list_tasks` works but submit fails | Check `NEO_SECRET_KEY` and daemon (see `neo-mcp doctor`) |
 

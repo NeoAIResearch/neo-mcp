@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -11,8 +12,16 @@ export const DAEMON_LOG = join(DAEMON_DIR, 'daemon.log');
 export const NEO_MCP_LOG = join(DAEMON_DIR, 'neo-mcp.log');
 export const NPM_PID_FILE = join(DAEMON_DIR, 'npm_daemon.pid');
 export const WORKSPACES_FILE = join(DAEMON_DIR, 'thread-workspaces.json');
+/** thread_id → lifecycle status. Shared by MCP tools and the live daemon. */
+export const STATUSES_FILE = join(DAEMON_DIR, 'thread-statuses.json');
 
 /** Per-deployment PID file — matches Python daemon's naming for compatibility. */
 export function pidFileForDeployment(deploymentId: string): string {
-  return join(DAEMON_DIR, `daemon_${deploymentId.slice(0, 8)}.pid`);
+  return join(DAEMON_DIR, `daemon_${deploymentId.replace(/-/g, '').slice(0, 8)}.pid`);
+}
+
+/** Same path as Python ``deployment_ready_file`` (sha256 hex[:24]). */
+export function deploymentReadyFile(deploymentId: string): string {
+  const digest = createHash('sha256').update(deploymentId, 'utf8').digest('hex').slice(0, 24);
+  return join(DAEMON_DIR, `poller-ready-${digest}.json`);
 }

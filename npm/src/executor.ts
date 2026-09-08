@@ -123,9 +123,14 @@ export function realResolve(p: string): string {
 export function safeResolve(workspace: string, pathStr: string): string | null {
   const home = homedir();
   const tmp = tmpdir();
-  // On macOS, /tmp is a symlink to /private/tmp — include both so resolve() never surprises us.
-  // Use realResolve so the allowed-roots list also has symlinks followed.
-  const allowed = [workspace, home, tmp, resolve(tmp)].filter(Boolean).map(p => realResolve(resolve(p)));
+  // Allowed temp roots mirror Python's _TMP_DIRS: the OS temp dir (tmpdir() — on
+  // macOS this is /var/folders/..., on Linux /tmp) PLUS the literal /tmp and its
+  // macOS real path /private/tmp. Without the literal entries, a /tmp/... path
+  // (e.g. Neo's /tmp/bash_exec_*.sh preflight scripts) would be rejected on macOS
+  // where tmpdir() !== /tmp. Use realResolve so each allowed root has symlinks followed.
+  const allowed = [workspace, home, tmp, resolve(tmp), '/tmp', '/private/tmp']
+    .filter(Boolean)
+    .map(p => realResolve(resolve(p)));
 
   function isWithin(root: string, target: string): boolean {
     const rel = relative(root, target);

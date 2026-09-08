@@ -1,6 +1,6 @@
 # Neo MCP — AI engineering, without leaving your editor
 
-<!-- mcp-name: io.github.NeoAIResearch/neo-mcp -->
+<!-- mcp-name: io.github.NeoResearchAI/MCPServer -->
 
 [![PyPI](https://img.shields.io/pypi/v/neo-mcp.svg)](https://pypi.org/project/neo-mcp/)
 [![Python](https://img.shields.io/pypi/pyversions/neo-mcp.svg)](https://pypi.org/project/neo-mcp/)
@@ -38,7 +38,9 @@ Because Neo is purpose-optimized for AI engineering — not a general-purpose co
 pip install neo-mcp
 ```
 
-Requires Python 3.11+.
+Requires Python 3.11+ on Linux, macOS, or Windows through WSL. Native
+Windows `cmd.exe`/PowerShell execution is intentionally unsupported because
+Neo commands use POSIX shell and container-path semantics.
 
 > **Tip:** use `pipx install neo-mcp` to install in an isolated environment and avoid conflicts with your project's virtualenv.
 
@@ -200,9 +202,9 @@ Restart Windsurf after editing.
 
 | Tool | Description |
 |---|---|
-| `neo_submit_task` | Submit an AI/ML task. Returns `thread_id` immediately. |
+| `neo_submit_task` | Submit a locally destructive AI/ML task; one active owner per workspace. |
 | `neo_list_tasks` | List running and recent tasks — reconnects pollers automatically. |
-| `neo_task_status` | Check status: RUNNING / COMPLETED / WAITING_FOR_FEEDBACK / PAUSED / TERMINATED. |
+| `neo_task_status` | Compact live backend-reported status; telemetry is not independent proof. |
 | `neo_get_messages` | Read full task output when COMPLETED. Capped at ~20 000 tokens. |
 | `neo_send_feedback` | Reply when Neo asks a question (WAITING_FOR_FEEDBACK). |
 | `neo_pause_task` | Pause a running task. |
@@ -212,8 +214,10 @@ Restart Windsurf after editing.
 | `neo_add_integration` | Register a GitHub PAT / HuggingFace token / Anthropic key / OpenRouter key so Neo tasks can use it as an env var. |
 | `neo_test_integration` | Call the provider's API to confirm a stored key is still valid. |
 | `neo_remove_integration` | Delete a stored key from this machine. |
+| `neo_get_execution_evidence` | Read bounded, hash-chained local execution observations. |
+| `neo_verify_task` | Verify local artifacts with explicit file assertions and acceptance commands. |
 
-> **Integration tools** store credentials locally (file `0o600` under `~/.neo/integrations/`, or OS keyring with `NEO_INTEGRATIONS_BACKEND=keyring`). Keys never leave your machine. See the full guide at [docs/INTEGRATIONS.md](https://github.com/NeoAIResearch/neo-mcp/blob/main/docs/INTEGRATIONS.md).
+> **Integration tools** store credentials locally (file `0o600` under `~/.neo/integrations/`, or OS keyring with `NEO_INTEGRATIONS_BACKEND=keyring`). Keys never leave your machine. See the full guide at [docs/INTEGRATIONS.md](https://github.com/NeoResearchAI/MCPServer/blob/main/docs/INTEGRATIONS.md).
 
 ---
 
@@ -224,7 +228,9 @@ Restart Windsurf after editing.
 | `NEO_SECRET_KEY` | **Yes** | Your Neo API key (`sk-v1-...`) from the [Neo dashboard](https://heyneo.com/dashboard?section=settings#access-keys) |
 | `NEO_DEPLOYMENT_ID` | No | Pin a specific deployment UUID (auto-generated and persisted by default) |
 | `NEO_WORKSPACE_DIR` | No | Override working directory (useful in Docker) |
-| `NEO_READ_ONLY` | No | `true` — expose only status/message tools, disable submit/stop/pause |
+| `NEO_READ_ONLY` | No | `true` — expose only status, messages, task/evidence reads, integration-test/list, and BYOK-list tools; reject every mutation and verification command |
+| `NEO_INIT_CHAT_TIMEOUT_SECONDS` | No | Submit timeout in seconds; defaults to `60` to match the production VS Code client |
+| `NEO_POLLER_READY_TIMEOUT_SECONDS` | No | Maximum pre-submit wait for the local daemon to establish its backend poll connection; defaults to `15` |
 
 ---
 

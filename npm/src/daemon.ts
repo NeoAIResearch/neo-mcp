@@ -8,17 +8,23 @@
 import { randomUUID } from 'crypto';
 import {
   appendFileSync, closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync,
-  readFileSync, renameSync, unlinkSync, writeFileSync, writeSync,
+  readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync,
 } from 'fs';
 import { resolve } from 'path';
 import { deriveDeploymentId, getAuthToken } from './auth.js';
-import { NEO_API_URL, POLL_MAX_INTERVAL, POLL_MAX_MESSAGES, getTaskTimeoutMs, TASK_TIMEOUT_CHECK_INTERVAL_MS } from './config.js';
+import { NEO_API_URL, POLL_MAX_INTERVAL, POLL_MAX_MESSAGES } from './config.js';
 import { Command, dispatch, setExecutorLogger } from './executor.js';
 import { DaemonLogger } from './logger.js';
+import { getTaskStatus } from './neo-client.js';
 import {
   DAEMON_DIR, DAEMON_LOG, NEO_MCP_LOG, NPM_PID_FILE, STANDALONE_UUID_FILE,
-  WORKSPACES_FILE, pidFileForDeployment,
+  STATUSES_FILE, WORKSPACES_FILE, deploymentReadyFile, pidFileForDeployment,
 } from './paths.js';
+
+const NPM_VERSION = String(
+  (JSON.parse(readFileSync(resolve(__dirname, '..', 'package.json'), 'utf8')) as { version?: string })
+    .version ?? 'unknown',
+);
 
 // Module-level logger — created lazily so getOrCreateDeploymentId() can run
 // even when nothing is going to be logged (e.g. setThreadStatus from tests).
@@ -60,23 +66,135 @@ const _cmdSemaphore = new _Semaphore(_MAX_CONCURRENT_COMMANDS);
 // Thread status gate — mirrors Python BackendPoller._thread_statuses
 // ---------------------------------------------------------------------------
 
-const _ACCEPTED_STATUSES = new Set(['RUNNING', 'PAUSED']);
+const _ALWAYS_ACCEPTED = new Set(['RUNNING']);
+const _DRAIN_ACCEPTED = new Set(['RUNNING', 'PAUSED']);
 const _threadStatuses = new Map<string, string>();
+let _statusMtime: number | undefined;
+let _draining = false;
+let _drainRemaining = 0;
+
+function parkTickMs(): number {
+  return Number(process.env['NEO_POLL_PARK_TICK_MS'] ?? 2000);
+}
+function drainEmptyPolls(): number {
+  return Number(process.env['NEO_POLL_DRAIN_EMPTY'] ?? 3);
+}
+function emptyStreakBeforeStatus(): number {
+  return Number(process.env['NEO_POLL_STATUS_CHECK_AFTER'] ?? 3);
+}
+
+export function loadThreadStatuses(): Record<string, string> {
+  try {
+    const raw = JSON.parse(readFileSync(STATUSES_FILE, 'utf8')) as Record<string, unknown>;
+    const out: Record<string, string> = {};
+    for (const [tid, val] of Object.entries(raw)) {
+      if (typeof val === 'string' && val) out[tid] = val;
+      else if (val && typeof val === 'object' && typeof (val as { status?: unknown }).status === 'string') {
+        out[tid] = (val as { status: string }).status;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function statusesMtime(): number | undefined {
+  try {
+    return statSync(STATUSES_FILE).mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+export function writeThreadStatus(threadId: string, status: string): void {
+  if (!threadId || !status) return;
+  let data: Record<string, { status: string; updated_at: number }> = {};
+  try {
+    const raw = JSON.parse(readFileSync(STATUSES_FILE, 'utf8')) as Record<string, unknown>;
+    for (const [tid, val] of Object.entries(raw)) {
+      if (typeof val === 'string' && val) {
+        data[tid] = { status: val, updated_at: 0 };
+      } else if (val && typeof val === 'object' && typeof (val as { status?: unknown }).status === 'string') {
+        const updated = (val as { updated_at?: unknown }).updated_at;
+        data[tid] = {
+          status: (val as { status: string }).status,
+          updated_at: typeof updated === 'number' ? updated : 0,
+        };
+      }
+    }
+  } catch {
+    data = {};
+  }
+  data[threadId] = { status, updated_at: Math.floor(Date.now() / 1000) };
+  mkdirSync(DAEMON_DIR, { recursive: true });
+  const tmpFile = `${STATUSES_FILE}.tmp-${process.pid}`;
+  writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+  renameSync(tmpFile, STATUSES_FILE);
+}
+
+function deploymentInUse(): boolean {
+  for (const status of _threadStatuses.values()) {
+    if (status === 'RUNNING') return true;
+  }
+  return false;
+}
+
+function beginDrain(): void {
+  _draining = true;
+  _drainRemaining = drainEmptyPolls();
+}
+
+function reloadStatusesIfChanged(): void {
+  const mtime = statusesMtime();
+  if (mtime === _statusMtime) return;
+  const wasInUse = deploymentInUse();
+  _threadStatuses.clear();
+  for (const [tid, status] of Object.entries(loadThreadStatuses())) {
+    _threadStatuses.set(tid, status);
+  }
+  _statusMtime = mtime;
+  if (deploymentInUse()) {
+    _draining = false;
+    _drainRemaining = 0;
+  } else if (wasInUse) {
+    beginDrain();
+  }
+}
 
 /**
  * Record a thread's lifecycle status so the command gate can allow/reject it.
- * Called by the MCP server on submit (RUNNING) and stop (TERMINATED).
- * Mirrors Python BackendPoller.set_thread_status().
+ * Persists to thread-statuses.json so a detached daemon (or a later restart)
+ * sees pause/stop/resume written by the MCP tools.
  */
 export function setThreadStatus(threadId: string, status: string): void {
+  const wasInUse = deploymentInUse();
   _threadStatuses.set(threadId, status);
+  writeThreadStatus(threadId, status);
+  _statusMtime = statusesMtime();
+  if (deploymentInUse()) {
+    _draining = false;
+    _drainRemaining = 0;
+  } else if (wasInUse) {
+    beginDrain();
+  }
+}
+
+/** Test helper — clear in-memory park/drain state between cases. */
+export function resetPollerStateForTests(): void {
+  _threadStatuses.clear();
+  _statusMtime = undefined;
+  _draining = false;
+  _drainRemaining = 0;
 }
 
 /** Returns false when the thread is known to be terminated/failed — new commands should be rejected. */
 function shouldAccept(threadId: string): boolean {
   const status = _threadStatuses.get(threadId);
   if (status === undefined) return true; // unknown → allow (backwards compat, mirrors Python)
-  return _ACCEPTED_STATUSES.has(status);
+  if (_ALWAYS_ACCEPTED.has(status)) return true;
+  if (_draining && _DRAIN_ACCEPTED.has(status)) return true;
+  return false;
 }
 
 /**
@@ -95,15 +213,48 @@ function writeSandboxLog(deploymentId: string): void {
   appendFileSync(DAEMON_LOG, `[${ts}] [INFO] npm-daemon started ${meta}\n`);
 }
 
+function identityPayload(deploymentId: string): Record<string, unknown> {
+  return {
+    pid: process.pid,
+    impl: 'npm',
+    version: NPM_VERSION,
+    started_at: new Date().toISOString(),
+    deployment_id: deploymentId,
+  };
+}
+
 function writePidFiles(deploymentId: string): void {
   mkdirSync(DAEMON_DIR, { recursive: true });
-  writeFileSync(NPM_PID_FILE, String(process.pid));
-  writeFileSync(pidFileForDeployment(deploymentId), String(process.pid));
+  const body = JSON.stringify(identityPayload(deploymentId)) + '\n';
+  writeFileSync(NPM_PID_FILE, body);
+  writeFileSync(pidFileForDeployment(deploymentId), body);
+}
+
+function writeReadiness(deploymentId: string): void {
+  reloadStatusesIfChanged();
+  const submissionIntents = [..._threadStatuses.entries()]
+    .filter(([tid, status]) => tid.startsWith('__submission__:') && status === 'RUNNING')
+    .map(([tid]) => tid)
+    .sort();
+  const payload = {
+    deployment_id: deploymentId,
+    pid: process.pid,
+    impl: 'npm',
+    version: NPM_VERSION,
+    observed_at: Date.now() / 1000,
+    submission_intents: submissionIntents,
+  };
+  mkdirSync(DAEMON_DIR, { recursive: true });
+  const readyPath = deploymentReadyFile(deploymentId);
+  const tmpFile = `${readyPath}.tmp-${process.pid}`;
+  writeFileSync(tmpFile, JSON.stringify(payload));
+  renameSync(tmpFile, readyPath);
 }
 
 function cleanupPidFiles(deploymentId: string): void {
   try { unlinkSync(NPM_PID_FILE); } catch { /* ignore */ }
   try { unlinkSync(pidFileForDeployment(deploymentId)); } catch { /* ignore */ }
+  try { unlinkSync(deploymentReadyFile(deploymentId)); } catch { /* ignore */ }
 }
 
 export function getOrCreateDeploymentId(): string {
@@ -260,53 +411,6 @@ export function saveThreadWorkspaces(workspaces: Record<string, string>): void {
   renameSync(tmpFile, WORKSPACES_FILE);
 }
 
-async function checkAndPauseStale(token: string): Promise<void> {
-  const timeoutMs = getTaskTimeoutMs();
-  if (timeoutMs <= 0) return;
-
-  const cutoffMs = Date.now() - timeoutMs;
-  const meta = loadThreadWorkspacesWithMeta();
-  const stale: string[] = [];
-
-  for (const [tid, { updated_at }] of Object.entries(meta)) {
-    const ts = typeof updated_at === 'number' ? updated_at * 1_000
-      : typeof updated_at === 'string' ? Date.parse(updated_at) : NaN;
-    if (!isNaN(ts) && ts < cutoffMs) stale.push(tid);
-  }
-
-  for (const tid of stale) {
-    let status: string;
-    try {
-      const res = await fetchWithTimeout(
-        `${NEO_API_URL}/v2/thread/status/${tid}`,
-        { headers: { 'Authorization': `Bearer ${token}` } },
-        10_000,
-      );
-      if (!res.ok) continue;
-      const data = await res.json() as { status?: string };
-      status = data.status ?? '';
-    } catch {
-      continue;
-    }
-    if (status !== 'RUNNING' && status !== 'WAITING_FOR_FEEDBACK') continue;
-    try {
-      await fetchWithTimeout(
-        `${NEO_API_URL}/v2/thread/control/${tid}`,
-        {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ signal: 'PAUSE' }),
-        },
-        10_000,
-      );
-      setThreadStatus(tid, 'PAUSED');
-      if (_logger) _logger.info('Auto-paused stale task', { tid, previousStatus: status, ageHours: timeoutMs / 3_600_000 });
-    } catch (err) {
-      if (_logger) _logger.warn('Could not auto-pause stale task', { tid, error: String(err) });
-    }
-  }
-}
-
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -383,6 +487,10 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
   mkdirSync(DAEMON_DIR, { recursive: true });
   writePidFiles(depId);
   writeSandboxLog(depId);
+  writeReadiness(depId);
+  const readyTicker = setInterval(() => {
+    try { writeReadiness(depId); } catch { /* ignore */ }
+  }, 500);
 
   // Initialise the runtime logger now that we know deploymentId. Every line
   // it writes carries deploymentId in the meta automatically.
@@ -401,15 +509,26 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
   let backoffMs = 1_000;
   let running = true;
 
-  const stop = (): void => { running = false; cleanupPidFiles(depId); };
+  const stop = (): void => {
+    running = false;
+    clearInterval(readyTicker);
+    cleanupPidFiles(depId);
+  };
   process.on('SIGTERM', () => { stop(); process.exit(0); });
   process.on('SIGINT',  () => { stop(); process.exit(0); });
   opts.signal?.addEventListener('abort', stop, { once: true });
 
   let lastCommandTime = 0;       // Date.now() ms, 0 = never
-  let lastTimeoutCheck = 0;      // Date.now() ms, 0 = never
+  let emptyStreak = 0;
+  reloadStatusesIfChanged();
 
   while (running) {
+    reloadStatusesIfChanged();
+    if (!deploymentInUse() && !_draining) {
+      await sleep(parkTickMs());
+      continue;
+    }
+
     // During active execution use wait_time=1 so the poll returns quickly after the
     // backend queues the next command. wait_time=5 is fine when idle (reduces poll traffic).
     const recentlyActive = (Date.now() - lastCommandTime) < 60_000;
@@ -428,23 +547,43 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
     }
 
     if (commands.length === 0) {
-      if (recentlyActive) {
+      emptyStreak++;
+      if (_draining) {
+        _drainRemaining--;
+        if (_drainRemaining <= 0) {
+          _draining = false;
+          logger.info('Drain complete — parking v2/poll');
+        }
+      } else if (deploymentInUse() && emptyStreak >= emptyStreakBeforeStatus()) {
+        emptyStreak = 0;
+        const runningIds = [..._threadStatuses.entries()]
+          .filter(([, s]) => s === 'RUNNING')
+          .map(([tid]) => tid);
+        for (const tid of runningIds) {
+          try {
+            const data = await getTaskStatus(token, tid);
+            const newStatus = typeof data['status'] === 'string' ? data['status'] : '';
+            if (newStatus && newStatus !== 'RUNNING') {
+              setThreadStatus(tid, newStatus);
+            }
+          } catch {
+            // Transient status errors must not park the loop.
+          }
+        }
+      }
+      if (recentlyActive || _draining) {
         // Small yield so the event loop can process signals/timers before next poll.
         await sleep(100);
       } else {
         await sleep(backoffMs);
         backoffMs = Math.min(Math.floor(backoffMs * 1.5), POLL_MAX_INTERVAL);
       }
-      // Periodic stale-task auto-pause — every 5 minutes while idle
-      if (getTaskTimeoutMs() > 0 && Date.now() - lastTimeoutCheck >= TASK_TIMEOUT_CHECK_INTERVAL_MS) {
-        lastTimeoutCheck = Date.now();
-        checkAndPauseStale(token).catch(() => { /* silent — non-critical */ });
-      }
       continue;
     }
 
     backoffMs = 1_000;
     lastCommandTime = Date.now();
+    emptyStreak = 0;
 
     // Dispatch all commands in this batch concurrently — each runs in its own
     // thread's workspace so there is no ordering dependency between them.

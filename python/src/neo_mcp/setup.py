@@ -100,7 +100,7 @@ def _setup_deployment_id(secret_key: str) -> str:
 
 
 def _daemon_pid_file(deployment_id: str) -> str:
-    return os.path.join(_DAEMON_DIR, f"daemon_{deployment_id[:8]}.pid")
+    return os.path.join(_DAEMON_DIR, f"daemon_{deployment_id.replace('-', '')[:8]}.pid")
 
 
 def _vscode_extension_running() -> bool:
@@ -145,17 +145,12 @@ def _daemon_running(deployment_id: str) -> bool:
 
 def _start_daemon(secret_key: str, deployment_id: str) -> bool:
     """Start neo-mcp daemon in the background. Returns True when PID file appears."""
-    neo_mcp_bin = shutil.which("neo-mcp")
-    if not neo_mcp_bin:
-        print("  neo-mcp not found on PATH — cannot start daemon.", file=sys.stderr)
-        return False
-
     env = os.environ.copy()
     env["NEO_SECRET_KEY"] = secret_key
 
     try:
         subprocess.Popen(
-            [neo_mcp_bin, "daemon", "--deployment-id", deployment_id],
+            [sys.executable, "-m", "neo_mcp", "daemon", "--deployment-id", deployment_id],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

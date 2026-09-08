@@ -2,10 +2,10 @@ name: Publish to MCP Registry
 
 # Publishes .mcp/server.json to registry.modelcontextprotocol.io on a v* tag.
 # Auth uses GitHub OIDC (no secrets) — valid because this repo lives under the
-# NeoAIResearch org, which owns the io.github.NeoAIResearch/* namespace.
+# NeoResearchAI org, which owns the io.github.NeoResearchAI/* namespace.
 #
 # The registry validates that the referenced PyPI package + version exists and
-# carries the `mcp-name: io.github.NeoAIResearch/neo-mcp` token, so this job
+# carries the `mcp-name: io.github.NeoResearchAI/MCPServer` token, so this job
 # first waits for the matching PyPI release (published by publish-pypi.yml).
 
 on:

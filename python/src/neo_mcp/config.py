@@ -66,8 +66,11 @@ POLL_BACKOFF_FACTOR: float = 1.5  # multiplier per consecutive error
 # Request timeout for poll calls (must exceed POLL_WAIT_TIME)
 POLL_TIMEOUT: float = 12.0        # seconds
 REQUEST_TIMEOUT: float = 30.0     # seconds for all other requests
+INIT_CHAT_TIMEOUT: float = float(
+    os.environ.get("NEO_INIT_CHAT_TIMEOUT_SECONDS", "60")
+)  # backend thread creation can legitimately take longer
 
-# Auto-pause: threads still RUNNING or WAITING_FOR_FEEDBACK after this many hours
-# are automatically paused. Set NEO_TASK_TIMEOUT_HOURS=0 to disable.
-TASK_TIMEOUT_HOURS: float = float(os.environ.get("NEO_TASK_TIMEOUT_HOURS", "6"))
-TASK_TIMEOUT_CHECK_INTERVAL: float = 300.0  # seconds between checks (5 min)
+# Park / drain — skip v2/poll when no thread is RUNNING
+POLL_PARK_TICK: float = float(os.environ.get("NEO_POLL_PARK_TICK", "2.0"))
+POLL_DRAIN_EMPTY: int = int(os.environ.get("NEO_POLL_DRAIN_EMPTY", "3"))
+POLL_EMPTY_STREAK_BEFORE_STATUS: int = int(os.environ.get("NEO_POLL_STATUS_CHECK_AFTER", "3"))

@@ -283,7 +283,7 @@ The MCP server also exposes four local-only tools for managing user API keys:
 | `neo_test_integration` | Verify a stored key still works. |
 | `neo_remove_integration` | Delete a stored key. |
 
-Wire them into your MCP client exactly like the task tools above; each takes `{ provider }` (and `neo_add_integration` takes `{ provider, credentials }`). Full behavioural spec: [docs/INTEGRATIONS.md](https://github.com/NeoAIResearch/neo-mcp/blob/main/docs/INTEGRATIONS.md).
+Wire them into your MCP client exactly like the task tools above; each takes `{ provider }` (and `neo_add_integration` takes `{ provider, credentials }`). Full behavioural spec: [docs/INTEGRATIONS.md](https://github.com/NeoResearchAI/MCPServer/blob/main/docs/INTEGRATIONS.md).
 
 ---
 

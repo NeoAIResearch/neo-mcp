@@ -45,7 +45,9 @@ Always follow this sequence. Do not skip steps.
 
 ## One task per workspace — merge, never split
 
-**Bundle all related work for a project into a SINGLE `neo_submit_task`, and never run more than one Neo task at a time in the same workspace/project directory.**
+**Bundle related work into one task. The server enforces one active owner per
+canonical workspace and returns `WORKSPACE_BUSY` with the owning thread when a
+second submission would collide.**
 
 - If a request has several parts (e.g. "build the API, add tests, and write a Dockerfile"), put the entire scope in ONE task prompt — Neo handles multi-step work within a single thread. Splitting it into back-to-back submissions in the same directory makes the tasks collide on the shared workspace (and `.tmp`), duplicate effort, and stay blind to each other's state.
 - If a task is already running for the workspace and the user adds or changes scope, extend it with `neo_send_feedback` — do NOT submit a second task.
@@ -55,16 +57,13 @@ Always follow this sequence. Do not skip steps.
 
 ## Daemon auto-start — your responsibility
 
-The MCP server already auto-spawns a **detached** daemon on startup, so this should be rare. If `neo_submit_task` still returns `DAEMON_NOT_RUNNING`, start a **detached** daemon yourself and retry — without involving the user:
+The MCP server already auto-spawns a **detached** daemon on startup, so this should be rare. If `neo_submit_task` returns `SANDBOX_NOT_READY` or `DAEMON_NOT_RUNNING`, do **not** start a daemon from this shell — it does not have `NEO_SECRET_KEY`. Stop the stale daemon (this deletes pid and lock files) and reconnect the MCP server so it auto-spawns from its own config:
 
 ```bash
-# pip — detached, immune to terminal/Ctrl-Z:
-setsid neo-mcp daemon >/dev/null 2>&1 < /dev/null &
-# npm equivalent:
-setsid npx --yes neo-mcp-daemon /path/to/workspace >/dev/null 2>&1 < /dev/null &
+neo-mcp stop
 ```
 
-**Never** run `neo-mcp daemon` in the foreground (it blocks forever) or with a bare `&` (it stays attached to your shell session and gets suspended/killed when the editor is backgrounded or its session ends). For a permanent, reboot-surviving daemon the user can run `neo-mcp install-service`. Then immediately retry `neo_submit_task` — handle this yourself, don't hand it back to the user.
+Then reconnect/reload the MCP server and retry `neo_submit_task`. For a permanent, reboot-surviving daemon the user can run `neo-mcp install-service`.
 
 ---
 
@@ -78,10 +77,12 @@ When invoked as `/neo <task>`, call `neo_submit_task` with the provided text and
 
 | Tool | When to call | Notes |
 |---|---|---|
-| `neo_submit_task` | Starting any AI/ML task | Returns `thread_id` immediately; use `wait_for_completion: true` only for tasks under ~3 min |
+| `neo_submit_task` | Starting any AI/ML task | Returns `thread_id` immediately; poll with `neo_task_status` |
 | `neo_list_tasks` | User closed a window / lost track of a task | Lists all running/recent tasks; reconnects pollers automatically |
-| `neo_task_status` | Checking if still running | Reads from in-memory cache — fast, no API call if poller is active |
+| `neo_task_status` | Checking if still running | Compact live backend telemetry; not independent proof |
 | `neo_get_messages` | Reading output when COMPLETED | Paginated; capped at ~20 000 tokens |
+| `neo_get_execution_evidence` | Inspecting locally observed command/file hashes | Read-only; local provenance |
+| `neo_verify_task` | Verifying artifacts and bounded acceptance commands | Only this can produce `VERIFIED` |
 | `neo_send_feedback` | Neo is WAITING_FOR_FEEDBACK, or to course-correct a digressing task mid-run | Call `neo_task_status` after sending to confirm resume |
 | `neo_pause_task` | User asks to pause | — |
 | `neo_resume_task` | User asks to resume | — |
@@ -99,11 +100,13 @@ When invoked as `/neo <task>`, call `neo_submit_task` with the provided text and
 - **When Neo reports `/app/project/...`, the actual local path is `<workspace>/...`** — e.g. `/app/project/src/main.py` → `<workspace>/src/main.py`. Use this mapping when telling the user where their files are.
 - **Never manually recreate files from Neo's output.** The daemon writes them. Use `neo_get_messages` to read — do not copy-paste output into files yourself.
 - **`workspace` — ALWAYS pass the git/project ROOT, never a subdirectory, never ask the user.** Priority: (1) user gave an explicit path → use it; (2) project in context → use its git root (`git rev-parse --show-toplevel`); (3) fallback → `os.getcwd()`. Passing a subdirectory causes duplicate nested folders (e.g. `project/project/`).
-- **`thread_id` is optional** — the server auto-recovers the last active thread from `~/.neo/active_thread_id`. Omit it unless addressing a specific older thread.
-- **`wait_for_completion: true`** blocks until done and returns output directly. Only use for short tasks (< 3 min). For anything longer, leave it `false` and poll with `neo_task_status`.
-- **Prefer `neo_task_status` over `neo_get_messages`** for mid-run checks — it reads from cache.
+- **`thread_id` is required** for status, messages, evidence, and verification.
+- `neo_submit_task` always returns immediately. Poll with `neo_task_status`, then call `neo_get_messages` after completion.
+- **Prefer `neo_task_status` over `neo_get_messages`** for mid-run checks; it returns a compact live backend view.
 - **Never poll in a tight loop** — call `neo_task_status` once per user turn. The background poller handles the rest.
-- **Verify external IDs before delegating.** When the task references real-world identifiers (model IDs, Hugging Face repos, PyPI packages, dataset names, API SKUs, etc.), either confirm the exact IDs yourself via WebSearch / official docs first, or include this instruction verbatim in the task prompt to Neo: *"Research and confirm every referenced ID against its canonical source before using it. Do NOT fall back to guessed, shortened, or substitute IDs. If any ID is ambiguous or unverifiable, halt and ask for clarification via WAITING_FOR_FEEDBACK — do not proceed."* Silent fallback to fabricated IDs is the single most common way Neo tasks go off-rails.
+- **Model and ID fidelity — never substitute.** When the user names a model, API, package, dataset, or other discrete ID:
+  - **Default mode (no BYOK):** copy it **verbatim into `message`** on `neo_submit_task` and `neo_send_feedback`. Do not upgrade, downgrade, shorten, or swap for a "similar" or default model (e.g. do not replace `gemini 3.1 pro` with `gpt-4o` or an older gemini). Either confirm exact IDs via WebSearch / official docs first, or include this in the task prompt: *"Research and confirm every referenced ID against its canonical source before using it. Do NOT fall back to guessed, shortened, or substitute IDs. If any ID is ambiguous or unverifiable, halt and ask for clarification via WAITING_FOR_FEEDBACK — do not proceed."*
+  - **BYOK mode (only when user explicitly wants Neo's brain on their key):** use `neo_add_byok_profile` with the exact model slug they named. Still pass the same ID verbatim in `message` for in-task work. Do NOT call `neo_list_byok_models` to pick a default when the user already named a model.
 - **Correcting a digressing task — feedback first, stop only as last resort.** If Neo has started work but is drifting from the user's intent, call `neo_send_feedback` with a short correction — this preserves all in-flight state and context. Only call `neo_stop_task` (and submit a fresh task) when the original premise was wrong or the run has gone too far to salvage with a nudge. Either way, tell the user verbatim what you are doing: *"Sending feedback to correct X"* or *"Stopping task N and resubmitting with corrected Y because Z."* Never terminate and restart silently.
 
 ---

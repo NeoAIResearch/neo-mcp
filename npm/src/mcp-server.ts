@@ -163,8 +163,11 @@ export async function runMcpServer(opts: {
         'Get the current status of a Neo task. Returns one of:\n' +
         'RUNNING (still executing — call again; use neo_task_plan for step details),\n' +
         'COMPLETED (done — call neo_get_messages for output),\n' +
-        'WAITING_FOR_FEEDBACK (Neo has a question — call neo_send_feedback),\n' +
-        'PAUSED (frozen — call neo_resume_task to continue),\n' +
+        'WAITING_FOR_FEEDBACK (Neo is frozen, waiting on you — this is also the ' +
+        'status neo_task_status reports after neo_pause_task): call ' +
+        'neo_send_feedback if you have new instructions, a correction, or an ' +
+        'answer (it resumes and delivers the message in one step), otherwise ' +
+        'call neo_resume_task to continue unchanged,\n' +
         'TERMINATED or FAILED (ended — call neo_get_messages to read what happened).\n\n' +
         'Reads from in-memory cache backed by an adaptive poller (3s–60s). ' +
         'Fast and safe to call once per turn. Do NOT poll in a tight loop.',
@@ -235,16 +238,29 @@ export async function runMcpServer(opts: {
     {
       title: 'Send Neo Task Feedback',
       description:
-        'Reply to Neo when it is waiting for user input. ' +
-        'Only call when neo_task_status returns WAITING_FOR_FEEDBACK — Neo has paused and ' +
-        'needs a decision or clarification before continuing. ' +
-        'After sending, call neo_task_status again to confirm the task resumed.\n\n' +
+        'Reply to Neo, or hand it new instructions before it continues. ' +
+        'Call when neo_task_status returns WAITING_FOR_FEEDBACK — Neo is frozen ' +
+        'and waiting on you. This is also the status reported after ' +
+        'neo_pause_task. Either way, this single call delivers your message AND ' +
+        'resumes the task. After sending, call neo_task_status again to confirm.\n\n' +
+        'State requirement: feedback is accepted when the task state is ' +
+        'WAITING_FOR_FEEDBACK — not while RUNNING. To course-correct a task that ' +
+        'is currently RUNNING, call neo_pause_task first, then call ' +
+        'neo_send_feedback right away once neo_task_status reports ' +
+        'WAITING_FOR_FEEDBACK.\n\n' +
+        'neo_resume_task is a different tool for a different case: use it only ' +
+        'when the task is WAITING_FOR_FEEDBACK and you want it to continue ' +
+        'exactly as before, with nothing new to say. If you have any ' +
+        'instructions, correction, or clarification, use neo_send_feedback ' +
+        'instead — calling neo_resume_task resumes silently and whatever you ' +
+        'wanted to say is lost.\n\n' +
         'Do NOT use to submit a new task — use neo_submit_task for that.\n\n' +
         'Model and ID fidelity: when correcting or clarifying which model or external ID to use, ' +
         "pass the user's exact wording in message. Do not override a user-specified model with a " +
-        "default or 'better' alternative.",
+        "default or 'better' alternative. If the user left the choice open, keep it open — do not " +
+        'inject a model id from your own (possibly outdated) knowledge; let Neo pick a verified one.',
       inputSchema: {
-        thread_id: z.string().describe('Thread ID of the waiting task.'),
+        thread_id: z.string().describe('Thread ID of the task that is WAITING_FOR_FEEDBACK.'),
         message: z.string().describe(
           "Your reply to Neo's question, or additional instructions. " +
           'Example: "Yes, use PyTorch. Target accuracy is 90%." ' +
@@ -263,6 +279,7 @@ export async function runMcpServer(opts: {
         const { headers: byokHeaders, error: byokError } = byok.resolveActiveHeaders();
         if (byokError) return ok({ error: byokError });
         await sendFeedback(token, thread_id, message, byokHeaders ?? undefined);
+        setThreadStatus(thread_id, 'RUNNING');
         return ok({ status: 'ok', thread_id });
       } catch (e) {
         return toolErr(e);
@@ -278,8 +295,13 @@ export async function runMcpServer(opts: {
     {
       title: 'Pause Neo Task',
       description:
-        'Pause a running Neo task mid-execution. The task freezes at its current step and ' +
-        'can be resumed later with neo_resume_task. Safe to call on an already-paused task (no-op). ' +
+        'Pause a running Neo task mid-execution. ' +
+        'The task freezes at its current step — neo_task_status will then report ' +
+        'WAITING_FOR_FEEDBACK. Safe to call on an already-paused task (no-op). ' +
+        'After pausing: if you have new instructions or a correction, call ' +
+        'neo_send_feedback right away — it resumes the task and delivers the ' +
+        'message in one step. Call neo_resume_task instead only if you want it ' +
+        'to continue exactly as before, with nothing new to say. ' +
         'To cancel permanently, use neo_stop_task instead.',
       inputSchema: {
         thread_id: z.string().describe('Thread ID of the running task to pause.'),
@@ -294,6 +316,7 @@ export async function runMcpServer(opts: {
     async ({ thread_id }: { thread_id: string }) => {
       try {
         await controlThread(token, thread_id, 'PAUSE');
+        setThreadStatus(thread_id, 'PAUSED');
         return ok({ status: 'paused', thread_id });
       } catch (e) {
         return toolErr(e);
@@ -309,8 +332,15 @@ export async function runMcpServer(opts: {
     {
       title: 'Resume Neo Task',
       description:
-        'Resume a paused Neo task from where it stopped. Has no effect if already running. ' +
-        'Only works after neo_pause_task — to start a new task use neo_submit_task.',
+        'Resume a paused Neo task from exactly where it stopped, with NO new ' +
+        'input — use only when there is nothing to add or correct. Works after ' +
+        'neo_task_status reports WAITING_FOR_FEEDBACK following the pause. ' +
+        'Has no effect if the task is already running. ' +
+        'Only works after neo_pause_task — to start a new task use neo_submit_task. ' +
+        'If you have any instructions, correction, or clarification to give, use ' +
+        'neo_send_feedback instead — it resumes the task AND delivers your message in one ' +
+        'call; calling neo_resume_task would resume it silently and that message would ' +
+        'never reach Neo.',
       inputSchema: {
         thread_id: z.string().describe('Thread ID of the paused task to resume.'),
       },
@@ -324,6 +354,7 @@ export async function runMcpServer(opts: {
     async ({ thread_id }: { thread_id: string }) => {
       try {
         await controlThread(token, thread_id, 'RESUME');
+        setThreadStatus(thread_id, 'RUNNING');
         return ok({ status: 'resumed', thread_id });
       } catch (e) {
         return toolErr(e);

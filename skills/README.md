@@ -9,18 +9,18 @@ These are installed into `~/.claude/skills/` and become `/slash-commands` in Cla
 | Folder | Command | What it does |
 |---|---|---|
 | [`claude-code/`](claude-code/SKILL.md) | `/neo` | Auto-routes AI/ML tasks to Neo, manages full lifecycle. Also exposes `neo_add_integration` / `neo_list_integrations` / `neo_test_integration` / `neo_remove_integration` for registering GitHub / HuggingFace / Anthropic / OpenRouter keys locally — see [docs/INTEGRATIONS.md](../docs/INTEGRATIONS.md). |
-| [`neo-setup/`](neo-setup/SKILL.md) | `/neo-setup` | Interactive installation and configuration wizard |
-
-**Install automatically** (npm):
-```bash
-npm install -g neo-mcp   # copies skills to ~/.claude/skills/ automatically
-```
+| [`neo-setup/`](neo-setup/SKILL.md) | `/neo-setup` | Pip-only installation, cross-agent configuration, verification, and debugging workflow for Linux, macOS, and WSL |
 
 **Install manually** (pip or manual update):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NeoAIResearch/neo-mcp/main/skills/claude-code/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/NeoResearchAI/MCPServer/main/skills/claude-code/SKILL.md \
   -o ~/.claude/skills/neo.md
 ```
+
+The setup skill itself is available at
+[`neo-setup/SKILL.md`](neo-setup/SKILL.md), with detailed diagnostics in
+[`neo-setup/REFERENCE.md`](neo-setup/REFERENCE.md). It configures the Python
+`neo-mcp` package only; native Windows requires WSL.
 
 ---
 

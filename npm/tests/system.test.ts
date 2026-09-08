@@ -27,7 +27,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync,
+  existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync,
   symlinkSync, unlinkSync, writeFileSync,
 } from 'fs';
 import { tmpdir } from 'os';
@@ -48,10 +48,11 @@ import {
   registerThreadWorkspace, loadThreadWorkspaces, loadThreadWorkspacesWithMeta,
   saveThreadWorkspaces, setThreadStatus, runDaemon,
   pollBackend, sendResponse, AuthError,
+  resetPollerStateForTests, loadThreadStatuses, writeThreadStatus,
 } from '../src/daemon.js';
 import {
-  DAEMON_LOG, WORKSPACES_FILE, DAEMON_DIR,
-  pidFileForDeployment,
+  DAEMON_LOG, WORKSPACES_FILE, DAEMON_DIR, STATUSES_FILE, NPM_PID_FILE,
+  deploymentReadyFile, pidFileForDeployment,
 } from '../src/paths.js';
 import {
   ByokManager, normalizeModelId, isSupportedProvider, BYOK_PROVIDERS,
@@ -63,7 +64,10 @@ import { submitTask, sendFeedback } from '../src/neo-client.js';
 // ---------------------------------------------------------------------------
 
 function makeWs(): string {
-  return mkdtempSync(join(tmpdir(), 'neo-sys-test-'));
+  // realpathSync() so the baseline matches what the implementation produces:
+  // safeResolve()/realResolve() canonicalize symlinks, and on macOS tmpdir()
+  // returns /var/folders/... which canonicalizes to /private/var/folders/...
+  return realpathSync(mkdtempSync(join(tmpdir(), 'neo-sys-test-')));
 }
 
 function makeCmd(overrides: Partial<Command>): Command {
@@ -84,6 +88,26 @@ function restoreWorkspacesFile(bak: string | null): void {
   if (existsSync(WORKSPACES_FILE)) rmSync(WORKSPACES_FILE);
   if (bak) {
     writeFileSync(WORKSPACES_FILE, readFileSync(bak));
+    rmSync(bak);
+  }
+}
+
+function backupStatusesFile(): string | null {
+  if (existsSync(STATUSES_FILE)) {
+    const bak = `${STATUSES_FILE}.bak-${process.pid}`;
+    writeFileSync(bak, readFileSync(STATUSES_FILE));
+    writeFileSync(STATUSES_FILE, '{}');
+    return bak;
+  }
+  mkdirSync(DAEMON_DIR, { recursive: true });
+  writeFileSync(STATUSES_FILE, '{}');
+  return null;
+}
+
+function restoreStatusesFile(bak: string | null): void {
+  if (existsSync(STATUSES_FILE)) rmSync(STATUSES_FILE);
+  if (bak) {
+    writeFileSync(STATUSES_FILE, readFileSync(bak));
     rmSync(bak);
   }
 }
@@ -149,7 +173,9 @@ describe('realResolve', () => {
   });
 
   it('resolves /etc which exists', () => {
-    expect(realResolve('/etc')).toBe('/etc');
+    // On macOS /etc is itself a symlink to /private/etc, so compare against the
+    // canonical form rather than the literal input.
+    expect(realResolve('/etc')).toBe(realpathSync('/etc'));
   });
 });
 
@@ -172,7 +198,9 @@ describe('safeResolve', () => {
 
   it('allows absolute /tmp path', () => {
     const r = safeResolve(ws, '/tmp/script.sh');
-    expect(r).toBe('/tmp/script.sh');
+    // /tmp is an allowed root; the result is the canonical resolution of it
+    // (/private/tmp/script.sh on macOS, /tmp/script.sh on Linux).
+    expect(r).toBe(realResolve('/tmp/script.sh'));
   });
 
   it('allows workspace root itself', () => {
@@ -1311,6 +1339,11 @@ describe('deployment ID policy', () => {
     expect(id1).toBe(id2);
   });
 
+  it('pidFileForDeployment strips hyphens and slices 8 chars', () => {
+    expect(pidFileForDeployment('contract-test')).toContain('daemon_contract.pid');
+    expect(pidFileForDeployment('12345678-aaaa-bbbb-cccc-ddddeeeeffff')).toContain('daemon_12345678.pid');
+  });
+
   it('uses deterministic key-derived UUID when mode=key-derived', () => {
     delete process.env['NEO_DEPLOYMENT_ID'];
     process.env['NEO_DEPLOYMENT_ID_MODE'] = 'key-derived';
@@ -1547,21 +1580,28 @@ describe('sendResponse retry', () => {
 describe('runDaemon integration', () => {
   let ws: string;
   let saved: Record<string, string | undefined>;
+  let statusBak: string | null;
 
   beforeEach(() => {
     ws = makeWs();
-    saved = envBackup('NEO_SECRET_KEY', 'NEO_API_URL', 'NEO_DEPLOYMENT_ID');
+    saved = envBackup('NEO_SECRET_KEY', 'NEO_API_URL', 'NEO_DEPLOYMENT_ID', 'NEO_POLL_PARK_TICK_MS');
     process.env['NEO_SECRET_KEY'] = 'sk-v1-test';
     process.env['NEO_API_URL'] = 'http://test.invalid';
     process.env['NEO_DEPLOYMENT_ID'] = 'test-dep-id-sys';
+    process.env['NEO_POLL_PARK_TICK_MS'] = '50';
+    statusBak = backupStatusesFile();
+    resetPollerStateForTests();
   });
 
   afterEach(() => {
     rmSync(ws, { recursive: true, force: true });
+    restoreStatusesFile(statusBak);
+    resetPollerStateForTests();
     envRestore(saved);
   });
 
   it('does not crash on empty poll response', async () => {
+    setThreadStatus('wake-empty', 'RUNNING');
     let polled = false;
     await runDaemonBriefly(ws, 250, async () => {
       polled = true;
@@ -1581,6 +1621,7 @@ describe('runDaemon integration', () => {
   });
 
   it('dispatches write_code command and POSTs success response', async () => {
+    setThreadStatus('wake-dispatch', 'RUNNING');
     let responseSent = false;
     let pollCount = 0;
 
@@ -1608,6 +1649,7 @@ describe('runDaemon integration', () => {
   });
 
   it('stops when 401 received — AuthError stops the daemon loop', async () => {
+    setThreadStatus('wake-401', 'RUNNING');
     let callCount = 0;
     await runDaemonBriefly(ws, 300, async (url) => {
       callCount++;
@@ -1620,12 +1662,100 @@ describe('runDaemon integration', () => {
   });
 
   it('abort signal stops the daemon loop gracefully', async () => {
+    setThreadStatus('wake-abort', 'RUNNING');
     let polled = false;
     await runDaemonBriefly(ws, 200, async () => {
       polled = true;
       return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
     });
     expect(polled).toBe(true);
+  });
+
+  it('writes JSON identity and a parked ready-file heartbeat', async () => {
+    const ac = new AbortController();
+    const savedFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    ) as typeof fetch;
+    const done = runDaemon({ workspace: ws, signal: ac.signal });
+    const deadline = Date.now() + 1000;
+    let ident: Record<string, unknown> | null = null;
+    while (Date.now() < deadline) {
+      if (existsSync(NPM_PID_FILE)) {
+        try {
+          ident = JSON.parse(readFileSync(NPM_PID_FILE, 'utf8')) as Record<string, unknown>;
+          if (ident['impl'] === 'npm') break;
+        } catch { /* not json yet */ }
+      }
+      await new Promise(r => setTimeout(r, 40));
+    }
+    ac.abort();
+    await done;
+    global.fetch = savedFetch;
+    expect(ident).not.toBeNull();
+    expect(ident!['impl']).toBe('npm');
+    expect(typeof ident!['version']).toBe('string');
+    expect(ident!['pid']).toBe(process.pid);
+  });
+
+  it('ready file appears within 1s while parked', async () => {
+    const ac = new AbortController();
+    const savedFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    ) as typeof fetch;
+    const done = runDaemon({ workspace: ws, signal: ac.signal });
+    const readyPath = deploymentReadyFile('test-dep-id-sys');
+    const deadline = Date.now() + 1000;
+    let seen = false;
+    while (Date.now() < deadline) {
+      if (existsSync(readyPath)) {
+        const ready = JSON.parse(readFileSync(readyPath, 'utf8')) as Record<string, unknown>;
+        if (ready['impl'] === 'npm' && ready['deployment_id'] === 'test-dep-id-sys') {
+          seen = true;
+          break;
+        }
+      }
+      await new Promise(r => setTimeout(r, 50));
+    }
+    ac.abort();
+    await done;
+    global.fetch = savedFetch;
+    expect(seen).toBe(true);
+  });
+
+  it('heartbeat observed_at advances during a long mocked command', async () => {
+    setThreadStatus('wake-heartbeat', 'RUNNING');
+    const readyPath = deploymentReadyFile('test-dep-id-sys');
+    const samples: number[] = [];
+    const ac = new AbortController();
+    const savedFetch = global.fetch;
+    global.fetch = (async (url: string | URL | Request) => {
+      if (String(url).includes('/v2/poll/response')) {
+        return new Response('{}', { status: 200 });
+      }
+      if (String(url).includes('/v2/poll/')) {
+        await new Promise(r => setTimeout(r, 800));
+        return new Response(JSON.stringify([{
+          action: 'noop', request_id: 'req-hb',
+        }]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{}', { status: 404 });
+    }) as typeof fetch;
+    const done = runDaemon({ workspace: ws, signal: ac.signal });
+    const start = Date.now();
+    while (Date.now() - start < 1400) {
+      if (existsSync(readyPath)) {
+        const ready = JSON.parse(readFileSync(readyPath, 'utf8')) as { observed_at?: number };
+        if (typeof ready.observed_at === 'number') samples.push(ready.observed_at);
+      }
+      await new Promise(r => setTimeout(r, 200));
+    }
+    ac.abort();
+    await done;
+    global.fetch = savedFetch;
+    expect(samples.length).toBeGreaterThan(1);
+    expect(Math.max(...samples) - Math.min(...samples)).toBeGreaterThan(0.15);
   });
 });
 
@@ -1636,22 +1766,29 @@ describe('runDaemon integration', () => {
 describe('thread status gate', () => {
   let ws: string;
   let saved: Record<string, string | undefined>;
+  let statusBak: string | null;
 
   beforeEach(() => {
     ws = makeWs();
-    saved = envBackup('NEO_SECRET_KEY', 'NEO_API_URL', 'NEO_DEPLOYMENT_ID');
+    saved = envBackup('NEO_SECRET_KEY', 'NEO_API_URL', 'NEO_DEPLOYMENT_ID', 'NEO_POLL_PARK_TICK_MS');
     process.env['NEO_SECRET_KEY'] = 'sk-v1-test';
     process.env['NEO_API_URL'] = 'http://test.invalid';
     process.env['NEO_DEPLOYMENT_ID'] = 'test-dep-id-gate';
+    process.env['NEO_POLL_PARK_TICK_MS'] = '50';
+    statusBak = backupStatusesFile();
+    resetPollerStateForTests();
   });
 
   afterEach(() => {
     rmSync(ws, { recursive: true, force: true });
+    restoreStatusesFile(statusBak);
+    resetPollerStateForTests();
     envRestore(saved);
   });
 
   it('TERMINATED thread: daemon sends error response, file is NOT written', async () => {
     const tid = `sys-gate-term-${Date.now()}`;
+    setThreadStatus('wake-term', 'RUNNING');
     setThreadStatus(tid, 'TERMINATED');
 
     let errorSent = false;
@@ -1712,7 +1849,9 @@ describe('thread status gate', () => {
 
   it('unknown thread (no status set): daemon executes commands — backwards compat', async () => {
     const tid = `sys-gate-unk-${Date.now()}`;
-    // Do NOT call setThreadStatus — thread is unknown
+    // Keep the deployment in use so we poll; the command thread itself is unknown.
+    setThreadStatus('wake-unk', 'RUNNING');
+    // Do NOT call setThreadStatus for tid — thread is unknown
 
     let commandExecuted = false;
     let pollCount = 0;
@@ -1740,9 +1879,10 @@ describe('thread status gate', () => {
     expect(commandExecuted).toBe(true);
   });
 
-  it('PAUSED thread: daemon executes commands (PAUSED ∈ accepted)', async () => {
+  it('PAUSED thread: daemon executes commands during drain', async () => {
     const tid = `sys-gate-paused-${Date.now()}`;
-    setThreadStatus(tid, 'PAUSED');
+    setThreadStatus(tid, 'RUNNING');
+    setThreadStatus(tid, 'PAUSED'); // last RUNNING left → drain, PAUSED still accepted
 
     let commandExecuted = false;
     let pollCount = 0;
@@ -1768,6 +1908,84 @@ describe('thread status gate', () => {
     });
 
     expect(commandExecuted).toBe(true);
+  });
+});
+
+// ===========================================================================
+// PART 21 — Park / wake v2/poll
+// ===========================================================================
+
+describe('park / wake v2/poll', () => {
+  let ws: string;
+  let saved: Record<string, string | undefined>;
+  let statusBak: string | null;
+
+  beforeEach(() => {
+    ws = makeWs();
+    saved = envBackup(
+      'NEO_SECRET_KEY', 'NEO_API_URL', 'NEO_DEPLOYMENT_ID',
+      'NEO_POLL_PARK_TICK_MS', 'NEO_POLL_DRAIN_EMPTY', 'NEO_POLL_STATUS_CHECK_AFTER',
+    );
+    process.env['NEO_SECRET_KEY'] = 'sk-v1-test';
+    process.env['NEO_API_URL'] = 'http://test.invalid';
+    process.env['NEO_DEPLOYMENT_ID'] = 'test-dep-id-park';
+    process.env['NEO_POLL_PARK_TICK_MS'] = '40';
+    process.env['NEO_POLL_DRAIN_EMPTY'] = '2';
+    process.env['NEO_POLL_STATUS_CHECK_AFTER'] = '1';
+    statusBak = backupStatusesFile();
+    resetPollerStateForTests();
+  });
+
+  afterEach(() => {
+    rmSync(ws, { recursive: true, force: true });
+    restoreStatusesFile(statusBak);
+    resetPollerStateForTests();
+    envRestore(saved);
+  });
+
+  it('parked at boot: never calls v2/poll', async () => {
+    let pollCount = 0;
+    await runDaemonBriefly(ws, 180, async (url) => {
+      if (String(url).includes('/v2/poll/')) pollCount++;
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+    expect(pollCount).toBe(0);
+  });
+
+  it('RUNNING thread: calls v2/poll', async () => {
+    setThreadStatus('t-run', 'RUNNING');
+    let pollCount = 0;
+    await runDaemonBriefly(ws, 200, async (url) => {
+      if (String(url).includes('/v2/poll/')) pollCount++;
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+    expect(pollCount).toBeGreaterThan(0);
+  });
+
+  it('WFF confirm parks after empty streak', async () => {
+    setThreadStatus('t-wff', 'RUNNING');
+    let pollCount = 0;
+    await runDaemonBriefly(ws, 800, async (url) => {
+      const urlStr = String(url);
+      if (urlStr.includes('/v2/thread/status/')) {
+        return new Response(JSON.stringify({ status: 'WAITING_FOR_FEEDBACK' }), { status: 200 });
+      }
+      if (urlStr.includes('/v2/poll/')) {
+        pollCount++;
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    });
+    expect(loadThreadStatuses()['t-wff']).toBe('WAITING_FOR_FEEDBACK');
+    expect(pollCount).toBeGreaterThan(0);
+    expect(pollCount).toBeLessThan(12);
+  });
+
+  it('thin-client writeThreadStatus is visible via loadThreadStatuses', () => {
+    writeThreadStatus('t-ipc', 'PAUSED');
+    expect(loadThreadStatuses()['t-ipc']).toBe('PAUSED');
+    writeThreadStatus('t-ipc', 'RUNNING');
+    expect(loadThreadStatuses()['t-ipc']).toBe('RUNNING');
   });
 });
 

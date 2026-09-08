@@ -12,7 +12,6 @@ test_project/
 neo_artifacts/
 node_modules/
 *.pid
-CLAUDE.md
 
 # Local build artifacts
 neo-agent/neo-agent
@@ -37,7 +36,3 @@ skills-lock.json
 
 # vscode_extension is tracked separately
 VSCode_extension/
-
-# stray literal-tilde dir from tasks writing to ~
-~/
-**/~/
