@@ -3223,6 +3223,13 @@ class TestPollerParkWake(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p._thread_statuses.get("t-wff"), "WAITING_FOR_FEEDBACK")
         self.assertFalse(self.p._deployment_in_use())
 
+    async def test_confirm_status_skips_submission_intent(self):
+        intent = "__submission__:10000000-0000-4000-8000-000000000099"
+        self.p.set_thread_status(intent, "RUNNING")
+        self.p._client.get_thread_status = AsyncMock()
+        await self._run_briefly(0.2)
+        self.p._client.get_thread_status.assert_not_called()
+
     async def test_one_running_keeps_polling_when_other_is_wff(self):
         self.p.set_thread_status("t-a", "RUNNING")
         self.p.set_thread_status("t-b", "WAITING_FOR_FEEDBACK")

@@ -557,7 +557,7 @@ export async function runDaemon(opts: { workspace?: string; deploymentId?: strin
       } else if (deploymentInUse() && emptyStreak >= emptyStreakBeforeStatus()) {
         emptyStreak = 0;
         const runningIds = [..._threadStatuses.entries()]
-          .filter(([, s]) => s === 'RUNNING')
+          .filter(([tid, s]) => s === 'RUNNING' && !tid.startsWith('__submission__:'))
           .map(([tid]) => tid);
         for (const tid of runningIds) {
           try {
