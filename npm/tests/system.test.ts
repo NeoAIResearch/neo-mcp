@@ -1981,6 +1981,24 @@ describe('park / wake v2/poll', () => {
     expect(pollCount).toBeLessThan(12);
   });
 
+  it('confirm status check never calls /v2/thread/status for __submission__ intents', async () => {
+    const intent = '__submission__:10000000-0000-4000-8000-000000000099';
+    setThreadStatus(intent, 'RUNNING');
+    let statusCallCount = 0;
+    await runDaemonBriefly(ws, 500, async (url) => {
+      const urlStr = String(url);
+      if (urlStr.includes('/v2/thread/status/')) {
+        statusCallCount++;
+        return new Response(JSON.stringify({ status: 'RUNNING' }), { status: 200 });
+      }
+      if (urlStr.includes('/v2/poll/')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    });
+    expect(statusCallCount).toBe(0);
+  });
+
   it('thin-client writeThreadStatus is visible via loadThreadStatuses', () => {
     writeThreadStatus('t-ipc', 'PAUSED');
     expect(loadThreadStatuses()['t-ipc']).toBe('PAUSED');

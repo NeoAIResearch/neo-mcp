@@ -532,7 +532,10 @@ class BackendPoller:
         second tight v2/poll loop. Transient errors leave the local status
         unchanged so we do not park on a blip.
         """
-        running = [tid for tid, status in self._thread_statuses.items() if status == "RUNNING"]
+        running = [
+            tid for tid, status in self._thread_statuses.items()
+            if status == "RUNNING" and not tid.startswith("__submission__:")
+        ]
         for tid in running:
             try:
                 data = await self._client.get_thread_status(tid)
